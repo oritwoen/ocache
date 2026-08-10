@@ -7,3 +7,5 @@ allowBuilds:
   esbuild: true
   "@parcel/watcher": true
   vue-demi: false
+minimumReleaseAgeExclude:
+  - undocs-nightly@0.10.1-20260810-080950-9339f88
