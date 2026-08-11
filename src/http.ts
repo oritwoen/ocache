@@ -371,14 +371,30 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       if (value.status >= 400) {
         return false;
       }
+      // Null-body statuses are never a servable stored representation. A 204/205 carries
+      // nothing to replay, and a 304 is an *answer to a conditional request*, not a
+      // representation at all — yet a handler doing its own conditional handling (h3
+      // `serveStatic`, nitro public assets, any route proxying `If-Modified-Since`
+      // upstream) returns one on request. Stored, it would be served to every later
+      // *unconditional* request for the rest of the TTL, so a single crafted
+      // `If-Modified-Since: <far future>` takes the route down until the entry dies (the
+      // handler is never re-invoked, so nothing self-heals). Rejecting on read as well as
+      // on write means an entry written by an older ocache heals on first access.
+      if (_nullBodyStatuses.has(value.status)) {
+        return false;
+      }
       // Only a *missing* body (`serialize` never ran / a malformed foreign entry) is
       // rejected — an empty string is a legitimate entry and stays cacheable. A zero-byte
-      // 200 is a valid GET response, so rejecting `""` would only cost hit rate. The one
-      // dangerous empty body — a body-less HEAD response replayed to GET clients — is
-      // handled where it belongs, in `getKey`'s method component: an empty entry is now
-      // only ever readable by requests of the method that produced it (h3#1524 audit,
-      // finding #3). Rejecting `""` here would neither have closed that hole (the poisoned
-      // entry would just be re-poisoned on the next HEAD) nor be the right layer for it.
+      // 200 is a valid GET response, so rejecting `""` would only cost hit rate. The two
+      // dangerous empty bodies are each handled on their own axis, not here: a body-less
+      // HEAD response replayed to GET clients is prevented by `getKey`'s method component
+      // (an empty entry is only ever readable by requests of the method that produced it —
+      // h3#1524 audit, finding #3), and a body-less *status* (204/205/304, where `""` is
+      // not just useless but illegal to reconstruct a `Response` from) is prevented by the
+      // status check directly above. Rejecting `""` here would have closed neither (the
+      // HEAD entry would just be re-poisoned on the next HEAD; the status crash also fires
+      // on the MISS, which is served before `validate` can refuse storage) nor be the right
+      // layer for either.
       if (value.body === undefined) {
         return false;
       }
@@ -526,10 +542,17 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       });
     }
 
-    // Send Response. Binary bodies were stored base64-encoded; decode them back to raw
-    // bytes so the Response carries the original payload untouched (no UTF-8 mangling).
-    const body =
-      response.base64 && typeof response.body === "string"
+    // Send Response. A null-body status must be reconstructed with a literally `null`
+    // body — `new Response("", { status: 204 })` throws — and `serialize` stores a
+    // body-less response as `""` (or as empty base64), neither of which is nullish, so
+    // this is an explicit status check rather than a `?? null`. `validate` refuses to
+    // *store* these statuses, but the MISS path serves the freshly serialized entry
+    // regardless of that verdict, so the guard belongs here too. Binary bodies were
+    // stored base64-encoded; decode them back to raw bytes so the Response carries the
+    // original payload untouched (no UTF-8 mangling).
+    const body = _nullBodyStatuses.has(response.status)
+      ? null
+      : response.base64 && typeof response.body === "string"
         ? _base64ToBytes(response.body)
         : (response.body ?? null);
     return _createResponse(body, {
@@ -604,6 +627,11 @@ const _transportHeaders = ["content-encoding", "content-length", "transfer-encod
 // under (see the revalidation helpers). Making a further method cacheable is a one-line
 // addition here; the key scheme below already accommodates it.
 const _cacheableMethods = ["GET", "HEAD"];
+
+// Statuses whose responses must carry no body at all: the `Response` constructor throws
+// for any non-null body on these. Used on both sides — `validate` refuses to store them,
+// and the read path forces the body to `null` (see each site for why both are needed).
+const _nullBodyStatuses = new Set([204, 205, 304]);
 
 /**
  * Prefixes a resource key with its method component. GET is the implicit default and

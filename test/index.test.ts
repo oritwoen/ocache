@@ -3919,6 +3919,90 @@ describe("defineCachedHandler", () => {
       expect(await testStorage.get(key)).toMatchObject({ stale: true });
     }
   });
+
+  // --- Null-body statuses (204 / 205 / 304) ---
+
+  // `serialize` stores a body-less response as `""`, which is not nullish, so replaying it
+  // as `new Response("", { status: 204 })` used to throw — on the MISS too, since the miss
+  // is served through the freshly serialized entry. Two guards: the read path forces the
+  // body to `null` for these statuses, and `validate` refuses to store them at all.
+  for (const status of [204, 205, 304]) {
+    it(`serves a ${status} response without throwing and never stores it`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(null, { status });
+        },
+        { maxAge: 100 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(r1.status).toBe(status);
+      expect(r1.body).toBeNull();
+
+      const r2 = (await handler(makeEvent(path))) as Response;
+      expect(r2.status).toBe(status);
+      expect(r2.body).toBeNull();
+
+      // Not a servable stored representation: nothing is kept, so every request re-resolves.
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+      expect(callCount).toBe(2);
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+    });
+  }
+
+  it("does not let a handler's own 304 poison the unconditional path", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        // A handler doing its own conditional handling (h3 `serveStatic`, nitro public
+        // assets, any route proxying the conditional headers upstream).
+        return event.req.headers.get("if-modified-since")
+          ? new Response(null, { status: 304 })
+          : new Response("fresh body", { status: 200 });
+      },
+      { maxAge: 100 },
+    );
+
+    // One crafted conditional request used to store a 304 that every later unconditional
+    // request was then served (and crashed on).
+    const attacker = (await handler(
+      makeEvent(path, { headers: { "if-modified-since": "Fri, 31 Dec 2999 23:59:59 GMT" } }),
+    )) as Response;
+    expect(attacker.status).toBe(304);
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+
+    // The unconditional path still reaches the handler and gets the real representation.
+    const victim = (await handler(makeEvent(path))) as Response;
+    expect(victim.status).toBe(200);
+    expect(await victim.text()).toBe("fresh body");
+    expect(callCount).toBe(2);
+  });
+
+  it("serves HEAD against a 204 route", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response(null, { status: 204 }), {
+      maxAge: 100,
+      // A spec-compliant host nulls a HEAD body — the same shape a 204 already has.
+      toResponse: headStrippingToResponse,
+    });
+
+    const r1 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(r1.status).toBe(204);
+    expect(r1.body).toBeNull();
+
+    const r2 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(r2.status).toBe(204);
+    expect(r2.body).toBeNull();
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+  });
 });
 
 describe("resolveCacheKeys", () => {
