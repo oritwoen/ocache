@@ -65,9 +65,15 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   // Deduplicates concurrent resolutions for the same key. The shared result carries
   // the storable (post-`serialize`) value plus any dynamic TTL, so `getMaxAge` and
   // `serialize` run exactly once and every caller observes the same value.
-  const pending: {
-    [key: string]: Promise<{ value: T; maxAge?: number; staleMaxAge?: number }>;
-  } = {};
+  //
+  // A `Map`, never a plain object: keys are caller-controlled (a documented `getKey`
+  // may return an arbitrary string, e.g. `getKey: (id) => id`), and a plain object
+  // inherits from `Object.prototype`, so `pending["constructor"]` / `"toString"` /
+  // `"__proto__"` / … read truthy with nothing in flight. The call would then be
+  // treated as a deduplicated follower, `await` the inherited member (not a thenable,
+  // so it resolves to itself), and skip the resolver entirely — silently caching
+  // `undefined`.
+  const pending = new Map<string, Promise<{ value: T; maxAge?: number; staleMaxAge?: number }>>();
 
   // Normalize cache params
   const group = opts.group || "functions";
@@ -187,7 +193,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
             : "revalidated";
 
     const _resolve = async () => {
-      const isPending = pending[key];
+      const isPending = pending.has(key);
       if (!isPending) {
         if (entry.value !== undefined && (opts.staleMaxAge || 0) >= 0 && opts.swr === false) {
           // Remove cached entry to prevent using expired cache on concurrent requests
@@ -200,7 +206,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         // storable form) with all concurrent callers. `getMaxAge` and `serialize`
         // run exactly once here — critical for `serialize`, which may consume a
         // one-shot source (e.g. a `ReadableStream`).
-        pending[key] = (async () => {
+        const pendingPromise = (async () => {
           const value = await resolver();
           // Throwaway entry so the hooks can inspect resolution metadata.
           const resolvedEntry: CacheEntry<T> = { value, mtime: Date.now(), integrity };
@@ -227,15 +233,16 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           const stored = opts.serialize ? await opts.serialize(resolvedEntry, validateCtx) : value;
           return { value: stored, maxAge, staleMaxAge };
         })();
+        pending.set(key, pendingPromise);
       }
 
       let resolved: { value: T; maxAge?: number; staleMaxAge?: number };
       try {
-        resolved = await pending[key]!;
+        resolved = await pending.get(key)!;
       } catch (error) {
         // Make sure entries that reject get removed.
         if (!isPending) {
-          delete pending[key];
+          pending.delete(key);
           // Evict stale entry from storage so SWR doesn't keep serving it
           const evictPromise = _evictFromStorage(_useStorage(), key, bases, group, name).catch(
             (error) => {
@@ -257,7 +264,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         entry.mtime = Date.now();
         entry.integrity = integrity;
         entry.stale = undefined;
-        delete pending[key];
+        pending.delete(key);
         // Persist the per-entry lifetime derived by `getMaxAge` above, overriding static options for this write.
         if (opts.getMaxAge) {
           entry.maxAge = resolved.maxAge;

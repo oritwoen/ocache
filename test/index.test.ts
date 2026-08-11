@@ -4451,3 +4451,81 @@ describe("multi-tier base", () => {
     expect(callCount).toBe(0);
   });
 });
+
+// The in-flight dedup registry used to be a plain object, so a caller-controlled key that
+// happened to name an `Object.prototype` member read truthy with nothing in flight: the call
+// was treated as a deduplicated follower, `await`ed the inherited member (not a thenable, so
+// it resolved to itself), skipped the resolver entirely and cached `undefined`. Reachable
+// through the *documented* `getKey: (id) => id`. Fixed by making the registry a `Map`.
+describe("getKey returning Object.prototype member names", () => {
+  const protoNames = [
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__proto__",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+  ];
+
+  it.each(protoNames)("cachedFunction resolves and caches key %s", async (id) => {
+    let calls = 0;
+    const fn = defineCachedFunction(
+      (key: string) => {
+        calls++;
+        return { id: key, name: `user-${key}` };
+      },
+      { maxAge: 10, name: "protoFn", getKey: (key: string) => key },
+    );
+
+    // Miss: the resolver must actually run.
+    expect(await fn(id)).toEqual({ id, name: `user-${id}` });
+    expect(calls).toBe(1);
+
+    // Hit: served from storage, resolver not called again.
+    expect(await fn(id)).toEqual({ id, name: `user-${id}` });
+    expect(calls).toBe(1);
+  });
+
+  it("cachedFunction deduplicates concurrent calls for a prototype-named key", async () => {
+    let calls = 0;
+    const fn = defineCachedFunction(
+      async (key: string) => {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return `value-${key}`;
+      },
+      { maxAge: 10, name: "protoConcurrentFn", getKey: (key: string) => key },
+    );
+
+    const results = await Promise.all([fn("__proto__"), fn("__proto__"), fn("__proto__")]);
+    expect(results).toEqual(["value-__proto__", "value-__proto__", "value-__proto__"]);
+    expect(calls).toBe(1);
+  });
+
+  it.each(protoNames)("defineCachedHandler serves bare-word key %s", async (word) => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`page for /${word}`, { status: 200 });
+      },
+      { maxAge: 10, name: "protoHandler", getKey: () => word },
+    );
+
+    const event = { req: new Request(`http://localhost/${word}`) };
+
+    const r1 = (await handler(event)) as Response;
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toBe(`page for /${word}`);
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(calls).toBe(1);
+
+    const r2 = (await handler(event)) as Response;
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toBe(`page for /${word}`);
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(calls).toBe(1);
+  });
+});
