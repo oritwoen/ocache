@@ -230,6 +230,9 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * Request header names that should vary the cache key (e.g., `["accept-language"]`).
    * These names are also merged into the response's `Vary` header so downstream
    * caches/CDNs/browsers store a separate variant per value.
+   *
+   * Varying headers stay visible to the handler: their value is part of the cache key,
+   * so the handler can safely render from them (a per-value entry is stored for each).
    */
   varies?: string[] | readonly string[];
 
@@ -278,6 +281,33 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * Supersedes `varies: ["cookie"]` (which hashes the entire raw `Cookie` header).
    */
   allowCookies?: string[] | readonly string[];
+
+  /**
+   * Whether the `Authorization` / `Proxy-Authorization` request headers may participate
+   * in caching. Defaults to `false`.
+   *
+   * **By default credentials are stripped** before the handler runs (secure default,
+   * exactly like a non-allowlisted cookie): they never vary the cache key, and because
+   * the handler cannot read them it cannot render per-user content that would then be
+   * stored under the shared, anonymous key and replayed to every other caller — and,
+   * via the synthesized `Cache-Control`, to shared CDNs as well.
+   *
+   * When `true`, both header names are folded into {@link varies}: their values vary the
+   * cache key, they are advertised in the response `Vary` header, and they stay visible
+   * to the handler. Listing either name in {@link varies} yourself has the same effect.
+   *
+   * ⚠️ Opting in means the response **is cached per credential value**: every caller
+   * presenting the same token shares one entry (concurrent requests are coalesced into a
+   * single handler call). It is the caller's responsibility to ensure that is correct —
+   * one entry per distinct token, so a token that maps to more than one user's view, or
+   * a rotating/short-lived token, still needs a user-specific `getKey`. When the response
+   * is genuinely per-user and shouldn't be shared, don't opt in: bypass those requests
+   * instead (`shouldBypassCache: (event) => event.req.headers.has("authorization")`).
+   *
+   * Only cacheable requests (`GET`/`HEAD`) are affected: methods that bypass caching
+   * (e.g. `POST`) reach the handler with their credentials untouched.
+   */
+  allowAuthorization?: boolean;
 
   /**
    * Whether to synthesize a `Cache-Control` response header. Defaults to `true`.

@@ -50,9 +50,24 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   ];
   const allowedCookieNames = _cookieNames.length > 0 ? _cookieNames : undefined;
 
-  const variableHeaderNames = (opts.varies || [])
-    .filter(Boolean)
-    .map((h) => h.toLowerCase())
+  // Credential headers are stripped from the handler-visible request by default, exactly
+  // like a non-allowlisted cookie. Without this a token-authenticated route fails *open*:
+  // the handler renders per-user content from a bearer token that is not part of the cache
+  // key, so the first caller's response is stored under the anonymous key, replayed to
+  // everyone, and (via the synthesized `public, s-maxage=N`) propagated by shared CDNs —
+  // whereas the same route behind a cookie fails safe. `allowAuthorization` opts them back
+  // in by folding both names into `variableHeaderNames` below, which is what makes them
+  // key-varying, `Vary`-advertised and handler-visible all at once.
+  const _authHeaderNames = ["authorization", "proxy-authorization"];
+
+  const variableHeaderNames = [
+    ...new Set([
+      ...(opts.varies || []).filter(Boolean).map((h) => h.toLowerCase()),
+      // Deduped against `varies`: a caller who already listed a credential header has
+      // opted into keying on it, so `allowAuthorization` must not add it twice.
+      ...(opts.allowAuthorization ? _authHeaderNames : []),
+    ]),
+  ]
     // `allowCookies` supersedes `varies: ["cookie"]`: when set, cookie key-scoping and
     // handler-visibility are driven by the allowlist, so drop the coarse full-header vary.
     .filter((h) => !(allowedCookieNames && h === "cookie"))
@@ -347,17 +362,26 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     // the handler untouched (cookies, varied headers, full query, body — the rewritten
     // Request below carries no body).
     if (!_shouldBypassCache(event)) {
-      // Filter non variable headers, and narrow the Cookie header to the allowlist so
-      // the handler can't depend on cookies outside the cache key (mirrors allowQuery).
-      const filteredHeaders = [...event.req.headers.entries()]
-        .filter(([key]) => !variableHeaderNames.includes(key.toLowerCase()))
-        .flatMap(([key, value]) => {
-          if (key.toLowerCase() !== "cookie") {
-            return [[key, value] as [string, string]];
-          }
-          const cookie = allowedCookieNames ? _filterCookie(value, allowedCookieNames) : "";
-          return cookie ? [["cookie", cookie] as [string, string]] : [];
-        });
+      // Strip the credential headers the handler didn't opt into, and narrow the Cookie
+      // header to the allowlist, so the handler can't depend on credentials outside the
+      // cache key (mirrors allowQuery). Everything else — including the `varies` headers —
+      // is forwarded as-is: those values *are* in the cache key, so letting the handler
+      // read them is both safe and the whole point of declaring them (previously they were
+      // filtered out, so e.g. `varies: ["accept-language"]` keyed per language but every
+      // entry held the default rendering).
+      const filteredHeaders = [...event.req.headers.entries()].flatMap(([key, value]) => {
+        const name = key.toLowerCase();
+        // Not in `variableHeaderNames` (neither `allowAuthorization` nor `varies`) means
+        // the credential can't vary the key, so the handler must not see it either.
+        if (_authHeaderNames.includes(name) && !variableHeaderNames.includes(name)) {
+          return [];
+        }
+        if (name !== "cookie") {
+          return [[key, value] as [string, string]];
+        }
+        const cookie = allowedCookieNames ? _filterCookie(value, allowedCookieNames) : "";
+        return cookie ? [["cookie", cookie] as [string, string]] : [];
+      });
 
       // Narrow the query the handler sees to the allowlist, so it can't depend on
       // params outside the cache key (mirrors the header filtering above).

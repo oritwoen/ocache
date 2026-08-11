@@ -2553,6 +2553,158 @@ describe("defineCachedHandler", () => {
     ]);
   });
 
+  it("by default hides Authorization from the handler so token content is never shared", async () => {
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const auth = event.req.headers.get("authorization");
+        seen.push(auth);
+        // A handler that renders per-user content from the token — the exact shape that
+        // used to be stored under the anonymous key and replayed to everyone.
+        return new Response(auth ? `private-for-${auth}` : "anonymous");
+      },
+      { maxAge: 10 },
+    );
+
+    const authed = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const anon = (await handler(makeEvent(path))) as Response;
+
+    // The credential never reaches the handler, so there is no per-user body to leak.
+    expect(seen).toEqual([null]);
+    expect(await authed.text()).toBe("anonymous");
+    expect(await anon.text()).toBe("anonymous");
+    // ... and it never varies the key either (one shared entry).
+    expect(callCount).toBe(1);
+    expect(authed.headers.get("vary")).toBeNull();
+  });
+
+  it("by default hides Proxy-Authorization from the handler", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("proxy-authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    await handler(makeEvent(path, { headers: { "proxy-authorization": "Basic zzz" } }));
+
+    expect(seen).toEqual([null]);
+  });
+
+  it("allowAuthorization keys per credential, varies, and exposes the header", async () => {
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const auth = event.req.headers.get("authorization");
+        seen.push(auth);
+        return new Response(`call-${callCount}:${auth}`);
+      },
+      { maxAge: 10, allowAuthorization: true },
+    );
+
+    const a1 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const a2 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const b1 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer bob" } }),
+    )) as Response;
+
+    // The handler can read the credential ...
+    expect(seen).toEqual(["Bearer alice", "Bearer bob"]);
+    // ... and each distinct value gets its own entry (same value = a hit).
+    expect(callCount).toBe(2);
+    expect(await a1.text()).toBe("call-1:Bearer alice");
+    expect(await a2.text()).toBe("call-1:Bearer alice");
+    expect(await b1.text()).toBe("call-2:Bearer bob");
+    // Downstream caches are told about the dimension too.
+    const vary = a1.headers.get("vary")!.toLowerCase();
+    expect(vary.split(",").map((v) => v.trim())).toEqual(["authorization", "proxy-authorization"]);
+  });
+
+  it("treats varies: ['authorization'] as an opt-in (no double vary entry)", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10, varies: ["authorization"], allowAuthorization: true },
+    );
+
+    const res = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+
+    expect(seen).toEqual(["Bearer alice"]);
+    expect(res.headers.get("vary")!.toLowerCase()).toBe("authorization, proxy-authorization");
+  });
+
+  it("lets the handler read varied headers and stores one rendering per value", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return new Response(`page-${event.req.headers.get("accept-language") ?? "default"}`);
+      },
+      { maxAge: 10, varies: ["accept-language"] },
+    );
+
+    const en = (await handler(
+      makeEvent(path, { headers: { "accept-language": "en" } }),
+    )) as Response;
+    const fr = (await handler(
+      makeEvent(path, { headers: { "accept-language": "fr" } }),
+    )) as Response;
+    const en2 = (await handler(
+      makeEvent(path, { headers: { "accept-language": "en" } }),
+    )) as Response;
+
+    // Distinct values render distinctly (the handler can see the header) under distinct
+    // keys, and a repeat value is a hit.
+    expect(await en.text()).toBe("page-en");
+    expect(await fr.text()).toBe("page-fr");
+    expect(await en2.text()).toBe("page-en");
+    expect(callCount).toBe(2);
+    expect(en.headers.get("vary")).toBe("accept-language");
+  });
+
+  it("does not strip Authorization from requests that bypass caching (non-GET/HEAD)", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    await handler(
+      makeEvent(path, {
+        method: "POST",
+        headers: { authorization: "Bearer alice" },
+      }),
+    );
+
+    expect(seen).toEqual(["Bearer alice"]);
+  });
+
   it("rejects stored entries carrying a non-allowlisted Set-Cookie (pre-upgrade entries)", async () => {
     const written: string[] = [];
     const memory = createMemoryStorage();
@@ -2661,7 +2813,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
-  it("filters variable headers from handler request", async () => {
+  it("forwards variable headers to the handler request", async () => {
     let receivedHeaders: string | null = null;
     const path = uniquePath();
     const handler = defineCachedHandler(
@@ -2677,7 +2829,9 @@ describe("defineCachedHandler", () => {
         headers: { "x-custom": "value" },
       }),
     );
-    expect(receivedHeaders).toBeNull();
+    // The header is part of the cache key, so the handler is allowed (and expected) to
+    // read it — hiding it made every variant hold the same default rendering.
+    expect(receivedHeaders).toBe("value");
   });
 
   it("inherits runtime context on filtered request", async () => {
