@@ -37,6 +37,11 @@ function defaultCacheOptions() {
  * cached separately), sets `cache-control`, `etag`, and `last-modified` headers, and
  * handles `304 Not Modified` responses via conditional request headers.
  *
+ * Only `GET`/`HEAD` requests without a `Range` header are cacheable; everything else
+ * reaches the handler untouched and its response passes straight through. Of the
+ * responses, only `200`, `203`, `301` and `308` are stored — and a status that isn't
+ * stored is never advertised with a synthesized `Cache-Control` either.
+ *
  * @param handler - The event handler to cache.
  * @param opts - Cache and HTTP-specific configuration options.
  * @returns A new event handler that serves cached responses when available. The handler
@@ -132,9 +137,25 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   // key variants can never disagree — making a further method cacheable is a one-line
   // change there. Shared between the `shouldBypassCache` option and the resolver so the
   // request-narrowing step below can't disagree with the bypass decision either. This is
-  // the built-in method check only — a caller's `opts.shouldBypassCache` is composed on
-  // top of it in `_opts` below, never in place of it.
-  const _shouldBypassCache = (event: HTTPEvent) => !_cacheableMethods.includes(event.req.method);
+  // the built-in check only — a caller's `opts.shouldBypassCache` is composed on top of it
+  // in `_opts` below, never in place of it.
+  //
+  // A `Range` request bypasses too. `Range` is forwarded to the handler but is neither part
+  // of the cache key nor a `Vary` dimension, so a range-honoring handler (static files,
+  // media, a framework `serveStatic`) resolved a *partial* representation under the
+  // range-free key: one `curl -r 0-0` stored a one-byte body — with the `Content-Range` that
+  // describes it — and every later `Range`-less GET was served that truncation for the whole
+  // TTL, published to shared CDNs by the synthesized `s-maxage`. RFC 9110 §15.3.7 / RFC 9111
+  // §3.3: a 206 is a valid answer only to the request that asked for that range, and
+  // range-aware caching (combining partials, re-slicing a stored full body) is out of scope
+  // for this library. Bypassing on the *request* side is the cheaper half of the fix — the
+  // handler never runs under a cache key at all, so nothing partial can be stored, no large
+  // partial body is buffered by `serialize`, and a ranged request cannot thrash the plain
+  // entry. The other half is `validate` refusing status 206 outright (defense in depth for
+  // entries written by another writer, an older ocache, or a handler that answers 206 to a
+  // request with no `Range` at all).
+  const _shouldBypassCache = (event: HTTPEvent) =>
+    !_cacheableMethods.includes(event.req.method) || event.req.headers.has("range");
 
   // Memoize the filtered query per request so getKey and the handler-facing URL
   // rewrite don't recompute it. Scoped to this handler instance so a shared
@@ -287,7 +308,28 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       // the entry is still stored/served with SWR/etag/last-modified, but no
       // cache-control is advertised to clients/CDNs — without the `no-store`/`private`
       // tricks that would also disqualify the entry from storage (issue #49, nitro#3997).
-      if (opts.sendCacheControl !== false && !res.headers.has("cache-control")) {
+      //
+      // And never advertise a lifetime for a status ocache itself will not store: the
+      // advertisement and the storage decision consult the *same* `_isCacheableStatus`
+      // predicate, which is the entire point — two independently written status conditions
+      // are exactly how they drifted apart. A transient 500 was not stored (so the origin
+      // took every single request, no protection at all) yet shipped
+      // `s-maxage=60, stale-while-revalidate=600`, pinning the error at every shared cache
+      // for 11 minutes, revalidating successfully the whole time — inverted on both sides.
+      //
+      // Precisely what this does and does not claim: it is status-for-status identical with
+      // `validate`, not "synthesize only if `validate` passes". `validate` has four further
+      // rejections, none of which needs a gate here — an explicit `no-store`/`private`
+      // suppresses synthesis anyway (the `has("cache-control")` check above), a stored
+      // `set-cookie` is impossible by the time we get here (deleted below, and the `validate`
+      // arm is defense in depth for foreign entries), a missing body cannot occur on a value
+      // this hook just built, and the `shouldCache` hook is a caller's own storage policy,
+      // deliberately not a way to change what we advertise.
+      if (
+        opts.sendCacheControl !== false &&
+        _isCacheableStatus(res.status) &&
+        !res.headers.has("cache-control")
+      ) {
         const cacheControl = [];
         if (opts.swr) {
           if (opts.maxAge != null) {
@@ -412,19 +454,15 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       if (value.headers?.["set-cookie"]) {
         return false;
       }
-      if (value.status >= 400) {
-        return false;
-      }
-      // Null-body statuses are never a servable stored representation. A 204/205 carries
-      // nothing to replay, and a 304 is an *answer to a conditional request*, not a
-      // representation at all — yet a handler doing its own conditional handling (h3
-      // `serveStatic`, nitro public assets, any route proxying `If-Modified-Since`
-      // upstream) returns one on request. Stored, it would be served to every later
-      // *unconditional* request for the rest of the TTL, so a single crafted
-      // `If-Modified-Since: <far future>` takes the route down until the entry dies (the
-      // handler is never re-invoked, so nothing self-heals). Rejecting on read as well as
-      // on write means an entry written by an older ocache heals on first access.
-      if (_nullBodyStatuses.has(value.status)) {
+      // ONE status gate, for storage and (via the same predicate) for the advertised
+      // lifetime: an explicit allowlist of the statuses whose response is a complete,
+      // reusable representation of the requested resource. Everything else is refused —
+      // see `_cacheableStatuses` for the per-status reasoning. It subsumes the three
+      // overlapping conditions this used to be (`status >= 400`, the 204/205/304 null-body
+      // set, and the implicit "anything under 400 is fine"), so there is no second place to
+      // keep in sync. Rejecting on read as well as on write means an entry written by an
+      // older, more permissive ocache heals on first access.
+      if (!_isCacheableStatus(value.status)) {
         return false;
       }
       // Only a *missing* body (`serialize` never ran / a malformed foreign entry) is
@@ -690,18 +728,74 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 // --- Internal helpers ---
 
 // Transport/framing headers stripped from a cached entry: the body is stored fully
-// decoded and re-buffered, so these no longer describe it (see `serialize`).
-const _transportHeaders = ["content-encoding", "content-length", "transfer-encoding"];
+// decoded and re-buffered, so these no longer describe it (see `serialize`). `content-range`
+// is here for the same reason and not because a 206 could reach storage (it cannot: `Range`
+// requests bypass, and `validate` rejects the status) — it describes a *partial* body, so on
+// any entry we do store, i.e. a complete representation, it is at best meaningless and at
+// worst a lie about the bytes being served. A proxying handler that copies upstream response
+// headers onto a 200 is the realistic way one gets attached.
+const _transportHeaders = [
+  "content-encoding",
+  "content-length",
+  "content-range",
+  "transfer-encoding",
+];
 
-// The methods whose responses reach the cache. Single source of truth: `_shouldBypassCache`
-// is derived from it, and it enumerates every method variant one resource can be stored
-// under (see the revalidation helpers). Making a further method cacheable is a one-line
-// addition here; the key scheme below already accommodates it.
+// The response statuses ocache stores — and, identically, the only ones it advertises a
+// synthesized `Cache-Control` lifetime for. An allowlist, because "not obviously bad" is not
+// the same as "a complete, reusable representation of what was requested":
+//   200 / 203 — the representation itself (203 is 200 from a transforming proxy).
+//   301 / 308 — permanent redirects; the target *is* the resource's stable identity, and RFC
+//     9111 §15.4 makes exactly these two heuristically cacheable among the 3xx.
+// Everything else is refused, and each exclusion is load-bearing:
+//   302 / 303 / 307 — per-request answers, not representations. An auth middleware bouncing
+//     an anonymous visitor to `/login?next=/dashboard` stored that redirect under the
+//     *anonymous* `/dashboard` key (request-side defaults strip `Cookie`/`Authorization`, so
+//     anonymous and authenticated callers share a key) and published it shared-cacheable, so
+//     an authenticated user hitting `/dashboard` inside the window was bounced to someone
+//     else's login redirect.
+//   206 — a partial body, valid only for the request that named that range; replaying it to a
+//     `Range`-less request is attacker-chosen truncation of the resource (see
+//     `_shouldBypassCache`, which is the request-side half of this).
+//   201 / 202 / 300 — outcomes of an operation, or an unresolved choice; neither is a
+//     representation the next caller asked for.
+//   204 / 205 / 304 — nothing to replay. A 304 in particular is the *answer to a conditional
+//     request*: a handler doing its own conditional handling (h3 `serveStatic`, nitro public
+//     assets, any route proxying `If-Modified-Since` upstream) returns one on demand, so a
+//     single crafted `If-Modified-Since: <far future>` used to store a 304 that every later
+//     *unconditional* request was then served for the rest of the TTL, with nothing to
+//     self-heal it (the handler is never re-invoked). Also illegal to reconstruct a
+//     `Response` from with the `""` body `serialize` stores — see `_nullBodyStatuses`.
+//   >= 400 — unchanged from the previous `status >= 400` rule. Caching 404/410 (RFC 9111
+//     permits it heuristically) was considered and declined: it would *expand* behavior, and
+//     it makes a 404 flood a storage-filling vector while `createMemoryStorage` still bounds
+//     entry count rather than bytes.
+// Strictly narrowing: every status here was already cacheable, so nothing previously rejected
+// became acceptable and no existing entry is invalidated by the change.
+const _cacheableStatuses = new Set([200, 203, 301, 308]);
+
+// The single source of truth for "may this response be stored?", consulted by `validate`
+// (storage) *and* by `serialize` (whether to advertise a synthesized lifetime). One predicate
+// on purpose: an advertised lifetime that outlives what ocache will actually store is the
+// exact defect this closes, so the two must be structurally incapable of disagreeing.
+function _isCacheableStatus(status: number): boolean {
+  return _cacheableStatuses.has(status);
+}
+
+// The methods whose responses reach the cache. Single source of truth: the method half of
+// `_shouldBypassCache` is derived from it (that predicate also bypasses `Range` requests,
+// which is a property of the request, not a key space), and it enumerates every method
+// variant one resource can be stored under (see the revalidation helpers). Making a further
+// method cacheable is a one-line addition here; the key scheme below already accommodates it.
 const _cacheableMethods = ["GET", "HEAD"];
 
 // Statuses whose responses must carry no body at all: the `Response` constructor throws
-// for any non-null body on these. Used on both sides — `validate` refuses to store them,
-// and the read path forces the body to `null` (see each site for why both are needed).
+// for any non-null body on these. Storage-side they are simply absent from
+// `_cacheableStatuses` (no separate check any more), so this set now serves the *read* path
+// alone — which still needs it, and independently of `validate`: `serialize` stores a
+// body-less response as `""`, and the MISS caller is served through that freshly serialized
+// entry regardless of `validate`'s verdict, so without forcing the body back to `null` here
+// every 204/205/304 would throw on the way out.
 const _nullBodyStatuses = new Set([204, 205, 304]);
 
 /**

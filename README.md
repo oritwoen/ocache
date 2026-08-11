@@ -169,6 +169,11 @@ apart), the URL path, variable headers and the request method (`GET` and `HEAD` 
 cached separately), sets `cache-control`, `etag`, and `last-modified` headers, and
 handles `304 Not Modified` responses via conditional request headers.
 
+Only `GET`/`HEAD` requests without a `Range` header are cacheable; everything else
+reaches the handler untouched and its response passes straight through. Of the
+responses, only `200`, `203`, `301` and `308` are stored — and a status that isn't
+stored is never advertised with a synthesized `Cache-Control` either.
+
 **Parameters:**
 
 - **`handler`** — The event handler to cache.

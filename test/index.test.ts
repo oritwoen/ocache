@@ -2190,11 +2190,13 @@ describe("defineCachedHandler", () => {
     const handler = defineCachedHandler(
       () => {
         callCount++;
-        // A 3xx redirect passes the built-in checks (status < 400) but the caller
-        // wants to keep it out of the cache.
-        return new Response("", { status: 302, headers: { location: "/elsewhere" } });
+        // A permanent redirect passes the built-in checks (301 is on the cacheable-status
+        // allowlist) but the caller wants redirects kept out of the cache. Deliberately
+        // *not* a 302 — the built-ins reject that one themselves now, which would leave
+        // this test passing without ever consulting `shouldCache`.
+        return new Response("", { status: 301, headers: { location: "/elsewhere" } });
       },
-      { maxAge: 10, shouldCache: (res) => res.status < 300 || res.status >= 400 },
+      { maxAge: 10, shouldCache: (res) => res.status < 300 },
     );
 
     await handler(makeEvent(path));
@@ -4444,6 +4446,267 @@ describe("defineCachedHandler", () => {
     expect(r2.body).toBeNull();
     expect(r2.headers.get("x-cache")).toBe("MISS");
   });
+
+  // --- Range requests and 206 (finding 07) ---
+
+  /** A range-honoring handler, i.e. what any static-file / media / `serveStatic` route is. */
+  function rangeHandler(body: string) {
+    return (event: HTTPEvent) => {
+      const range = event.req.headers.get("range");
+      if (!range) {
+        return new Response(body, { status: 200 });
+      }
+      const [, start = "0", end = ""] = /bytes=(\d*)-(\d*)/.exec(range) || [];
+      const from = Number(start);
+      const to = end ? Number(end) : body.length - 1;
+      const slice = body.slice(from, to + 1);
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          "content-range": `bytes ${from}-${to}/${body.length}`,
+          "content-length": String(slice.length),
+        },
+      });
+    };
+  }
+
+  it("does not populate the plain GET entry from a Range request", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const inner = rangeHandler("ABCDEFGHIJ");
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return inner(event);
+      },
+      { maxAge: 100 },
+    );
+
+    const ranged = (await handler(
+      makeEvent(path, { headers: { range: "bytes=0-0" } }),
+    )) as Response;
+    expect(ranged.status).toBe(206);
+    expect(await ranged.text()).toBe("A");
+
+    // Bypassed, so nothing is stored under the plain key (nor under any key).
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+    expect(callCount).toBe(1);
+
+    // And bypassed responses pass through untouched: no serialization, no synthesized
+    // cache headers, no cache-status header, so a second ranged request re-resolves.
+    expect(ranged.headers.get("cache-control")).toBeNull();
+    expect(ranged.headers.get("etag")).toBeNull();
+    expect(ranged.headers.get("x-cache")).toBeNull();
+    // Range framing survives untouched on the bypass path (nothing is stripped there).
+    expect(ranged.headers.get("content-range")).toBe("bytes 0-0/10");
+    await handler(makeEvent(path, { headers: { range: "bytes=0-0" } }));
+    expect(callCount).toBe(2);
+  });
+
+  it("serves the full 200 body to a plain GET after a ranged one", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const inner = rangeHandler("ABCDEFGHIJ");
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return inner(event);
+      },
+      { maxAge: 100 },
+    );
+
+    // Attacker truncates: one byte, with a Content-Range describing it.
+    await handler(makeEvent(path, { headers: { range: "bytes=0-0" } }));
+
+    // Victim, no Range: must get the complete representation, never the poisoned partial.
+    const victim = (await handler(makeEvent(path))) as Response;
+    expect(victim.status).toBe(200);
+    expect(await victim.text()).toBe("ABCDEFGHIJ");
+    expect(victim.headers.get("content-range")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  it("never serves a stored entry with status 206", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("ABCDEFGHIJ");
+      },
+      { maxAge: 100 },
+    );
+
+    await handler(makeEvent(path));
+    expect(callCount).toBe(1);
+    const [key] = await handler.resolveKeys(makeEvent(path));
+
+    // Simulate an entry written by another writer sharing the storage, or by an older
+    // ocache that still admitted 206: same shape and integrity, partial payload.
+    const entry = (await testStorage.get(key!)) as any;
+    entry.value.status = 206;
+    entry.value.body = "A";
+    entry.value.headers["content-range"] = "bytes 0-0/10";
+    await testStorage.set(key!, entry);
+
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ABCDEFGHIJ");
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  it("strips content-range from a stored entry", async () => {
+    const path = uniquePath();
+    // A proxying handler that copied upstream headers onto a complete 200 response.
+    const handler = defineCachedHandler(
+      () => new Response("full body", { headers: { "content-range": "bytes 0-8/9" } }),
+      { maxAge: 100 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    expect(r1.headers.get("content-range")).toBeNull();
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const entry = (await testStorage.get(key!)) as any;
+    expect(entry.value.headers["content-range"]).toBeUndefined();
+  });
+
+  // --- Cacheable-status allowlist (findings 10.1 / 10.5) ---
+
+  it("does not store a 302 nor advertise a synthesized cache-control for it", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("", { status: 302, headers: { location: "/elsewhere" } });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/elsewhere");
+    // A per-request answer, not a representation: never stored...
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+    // ...and therefore never published as cacheable to clients/CDNs either.
+    expect(res.headers.get("cache-control")).toBeNull();
+
+    await handler(makeEvent(path));
+    expect(callCount).toBe(2);
+  });
+
+  it("never serves an anonymous login redirect to a later request (10.5)", async () => {
+    let callCount = 0;
+    const path = `${uniquePath()}/dashboard`;
+    // Auth middleware: anonymous visitors are bounced to /login, authenticated ones get
+    // their dashboard. The auth signal here is a proxy-injected header rather than a
+    // cookie/bearer token precisely because those are stripped by request-side defaults —
+    // either way the two callers land on the *same* anonymous cache key, which is exactly
+    // why the 302 must never stick to it.
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return event.req.headers.get("x-forwarded-user")
+          ? new Response("alice's dashboard")
+          : new Response("", {
+              status: 302,
+              headers: { location: `/login?next=${path}` },
+            });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const anonymous = (await handler(makeEvent(path))) as Response;
+    expect(anonymous.status).toBe(302);
+    expect(anonymous.headers.get("cache-control")).toBeNull();
+
+    // The authenticated user must reach the handler, not the stored redirect.
+    const authenticated = (await handler(
+      makeEvent(path, { headers: { "x-forwarded-user": "alice" } }),
+    )) as Response;
+    expect(authenticated.status).toBe(200);
+    expect(authenticated.headers.get("location")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  for (const status of [404, 500]) {
+    it(`returns a ${status} to the caller but neither stores nor advertises it`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("boom", { status });
+        },
+        { maxAge: 60, swr: true, staleMaxAge: 600 },
+      );
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.status).toBe(status);
+      expect(await res.text()).toBe("boom");
+      // Not stored — so the origin takes every request. Advertising a lifetime for it
+      // would pin the error at every shared cache for maxAge + staleMaxAge while ocache
+      // itself offered no protection at all: inverted on both sides.
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+      expect(res.headers.get("cache-control")).toBeNull();
+
+      await handler(makeEvent(path));
+      expect(callCount).toBe(2);
+    });
+  }
+
+  for (const status of [200, 203, 301, 308]) {
+    it(`stores and serves a ${status} response`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("body", { status, headers: { location: "/new" } });
+        },
+        { maxAge: 60 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(r1.status).toBe(status);
+      expect(r1.headers.get("cache-control")).toBe("max-age=60");
+
+      const r2 = (await handler(makeEvent(path))) as Response;
+      expect(r2.status).toBe(status);
+      expect(await r2.text()).toBe("body");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+      expect(callCount).toBe(1);
+    });
+  }
+
+  for (const status of [201, 202, 300, 307]) {
+    it(`never stores a ${status} response`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("body", { status, headers: { location: "/new" } });
+        },
+        { maxAge: 60 },
+      );
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.status).toBe(status);
+      expect(res.headers.get("cache-control")).toBeNull();
+
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+
+      await handler(makeEvent(path));
+      expect(callCount).toBe(2);
+    });
+  }
 });
 
 describe("resolveCacheKeys", () => {

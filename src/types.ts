@@ -423,8 +423,9 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * Additional predicate deciding whether a handler response is cacheable.
    *
    * Runs *after* — and in addition to — the built-in response validation, which
-   * always applies and cannot be bypassed (it rejects `4xx`/`5xx` statuses,
-   * `Cache-Control: no-store`/`private`, missing bodies, and absent
+   * always applies and cannot be bypassed (only `200`, `203`, `301` and `308`
+   * responses are storable at all; it also rejects `Cache-Control:
+   * no-store`/`private`, missing bodies, and absent
    * `etag`/`last-modified`). Return `false` (or a Promise resolving to `false`)
    * to treat the response as non-cacheable; it is still returned to the caller,
    * just not stored. Receives the serialized response entry.
@@ -439,8 +440,8 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    *
    * @example
    * ```ts
-   * // Don't cache redirects (3xx), which the built-in checks would otherwise allow.
-   * shouldCache: (res) => res.status < 300 || res.status >= 400,
+   * // Don't cache permanent redirects (301/308), which the built-in checks allow.
+   * shouldCache: (res) => res.status < 300,
    * ```
    */
   shouldCache?: (entry: ResponseCacheEntry) => boolean | Promise<boolean>;
