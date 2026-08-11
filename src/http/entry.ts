@@ -1,0 +1,175 @@
+// The storage codec, both directions: live `Response` → stored `ResponseCacheEntry`
+// (`serializeResponse`) and back on a hit (`deserializeEntry`). One file because the two
+// halves must agree on the body encoding, the null-body statuses and which headers survive.
+
+import { hash } from "ohash";
+
+import type { HandlerConfig } from "./config.ts";
+import { isCacheableStatus } from "./validate.ts";
+import { appendVary, hasVaryWildcard } from "./vary.ts";
+
+import type { HTTPEvent, ResponseCacheEntry } from "../types.ts";
+
+// Transport/framing headers stripped from a cached entry: the body is stored fully decoded
+// and re-buffered, so none of them still describes it. `content-range` too — it describes a
+// *partial* body, a lie on the complete representations we store (a proxying handler copying
+// upstream headers onto a 200 is how it gets attached; a real 206 never reaches storage).
+const transportHeaders = [
+  "content-encoding",
+  "content-length",
+  "content-range",
+  "transfer-encoding",
+];
+
+// Statuses whose `Response` constructor throws on any non-null body. Read path only (storage
+// rejects them via `validate.ts`'s allowlist), and still needed there: a body-less response
+// is stored as `""`, and the MISS caller is served through that entry whatever `validate` says.
+const nullBodyStatuses = new Set([204, 205, 304]);
+
+// Serializes a resolved `Response` into the stored entry. Runs exactly once per resolution
+// (shared across deduplicated callers), so consuming the body here is safe.
+export async function serializeResponse<E extends HTTPEvent>(
+  config: HandlerConfig<E>,
+  res: Response,
+): Promise<ResponseCacheEntry> {
+  const { opts, varyHeaderNames } = config;
+
+  // Read the body once as raw bytes: valid UTF-8 is stored verbatim as a string (stable text
+  // etags), anything else is base64-encoded and flagged so binary survives a JSON storage
+  // backend. Discriminated on byte validity, not the spoofable/absent content-type.
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const text = decodeUtf8(bytes);
+  const base64 = text === undefined;
+  const body = base64 ? bytesToBase64(bytes) : text;
+
+  if (!res.headers.has("etag")) {
+    res.headers.set("etag", `W/"${hash(body)}"`);
+  }
+
+  if (!res.headers.has("last-modified")) {
+    res.headers.set("last-modified", new Date().toUTCString());
+  }
+
+  // Synthesize only when the handler set no `cache-control`, and never for a response we
+  // won't store — `validate` shares these predicates so the two can't drift (an unstored 500
+  // once shipped `s-maxage=60`). `sendCacheControl: false` opts out entirely (issue #49).
+  if (
+    opts.sendCacheControl !== false &&
+    isCacheableStatus(res.status) &&
+    !hasVaryWildcard(res.headers.get("vary")) &&
+    !res.headers.has("cache-control")
+  ) {
+    const cacheControl = [];
+    // Both branches treat `maxAge` identically — present (`0` included) is advertised. So
+    // `validate` reads a zero lifetime out of our header as out of a hand-written one, i.e.
+    // `maxAge: 0` keeps the response out of storage (it was written already expired anyway).
+    if (opts.swr) {
+      if (opts.maxAge != null) {
+        cacheControl.push(`s-maxage=${opts.maxAge}`);
+      }
+      if (opts.staleMaxAge != null) {
+        cacheControl.push(`stale-while-revalidate=${opts.staleMaxAge}`);
+      } else {
+        cacheControl.push("stale-while-revalidate");
+      }
+    } else if (opts.maxAge != null) {
+      // For non-SWR, set max-age directly
+      cacheControl.push(`max-age=${opts.maxAge}`);
+    }
+    if (cacheControl.length > 0) {
+      res.headers.set("cache-control", cacheControl.join(", "));
+    }
+  }
+
+  // Advertise the request headers this response varies on, merging with any `Vary` the
+  // handler set. `varyHeaderNames`, not the key list: `allowCookies` keys on a hashed cookie
+  // subset, but downstream caches can only be told at header granularity.
+  if (varyHeaderNames.length > 0) {
+    appendVary(res.headers, varyHeaderNames);
+  }
+
+  // No Set-Cookie ever survives a cacheable route — allowlisted or not, stored or served.
+  // A cacheable response is shared with every later hit and every coalesced peer, so a minted
+  // cookie reaches callers it wasn't minted for (issue #61; excepting `allowCookies` names
+  // reopened it as session fixation, h3#1524 finding #15c). `allowCookies` is request-side
+  // only; a handler that must mint one serves it from a bypassed (non-GET/HEAD) route.
+  res.headers.delete("set-cookie");
+
+  // The body is stored fully decoded and re-buffered, so replaying a stored
+  // `content-encoding`/`content-length`/`transfer-encoding` would desync the headers from the
+  // served bytes (nitro#2109). The runtime recomputes `content-length` on read.
+  for (const header of transportHeaders) {
+    res.headers.delete(header);
+  }
+
+  const cacheEntry: ResponseCacheEntry = {
+    status: res.status,
+    statusText: res.statusText,
+    headers: Object.fromEntries(res.headers.entries()),
+    body,
+    // Only set for binary bodies — text entries stay flag-free and byte-identical to
+    // pre-binary-support ones.
+    ...(base64 && { base64: true }),
+  };
+
+  return cacheEntry;
+}
+
+/**
+ * The read half: a stored entry → the pieces its `Response` is rebuilt from (pieces, because
+ * the construction itself is the caller's `createResponse` hook). Mirrors
+ * {@link serializeResponse}: a null-body status is forced back to `null` (`""` is not nullish
+ * and `new Response("", { status: 204 })` throws), and a `base64` entry decodes to raw bytes.
+ */
+export function deserializeEntry(entry: ResponseCacheEntry): {
+  body: string | Uint8Array | null;
+  init: ResponseInit;
+} {
+  const body = nullBodyStatuses.has(entry.status)
+    ? null
+    : entry.base64 && typeof entry.body === "string"
+      ? base64ToBytes(entry.body)
+      : (entry.body ?? null);
+  return {
+    body,
+    init: {
+      status: entry.status,
+      statusText: entry.statusText,
+      headers: entry.headers,
+    },
+  };
+}
+
+// Fatal decoder so invalid UTF-8 throws (→ base64) instead of substituting replacement
+// characters. `ignoreBOM` keeps a leading BOM in the string so it re-encodes byte-for-byte,
+// preserving the lossless roundtrip that lets valid UTF-8 be stored as a plain string.
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** Decodes bytes as UTF-8, returning `undefined` when they aren't valid UTF-8 (i.e. binary). */
+function decodeUtf8(bytes: Uint8Array): string | undefined {
+  try {
+    return utf8Decoder.decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Encodes raw bytes to a base64 string (chunked to stay within `String.fromCharCode` arg limits). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x80_00;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/** Decodes a base64 string produced by {@link bytesToBase64} back to raw bytes. */
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}

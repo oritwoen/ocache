@@ -7,7 +7,7 @@ export {
   type CachedFunction,
 } from "./cache.ts";
 
-export { defineCachedHandler } from "./http.ts";
+export { defineCachedHandler } from "./http/index.ts";
 
 export {
   type StorageInterface,

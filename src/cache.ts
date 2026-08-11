@@ -1,5 +1,5 @@
 import { hash } from "ohash";
-import { _resolveStorage } from "./storage.ts";
+import { resolveStorage } from "./storage.ts";
 
 import type { StorageInterface, StorageOption } from "./storage.ts";
 import type { HTTPEvent, CacheEntry, CacheOptions, CacheStatus } from "./types.ts";
@@ -36,12 +36,12 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   fn: (...args: ArgsT) => T | Promise<T>,
   opts: CacheOptions<T, ArgsT> = {},
 ): CachedFunction<T, ArgsT> {
-  // Resolve `name` from the caller's opts BEFORE merging defaults — see `_resolveName`.
-  const name = _resolveName(opts.name, fn);
+  // Resolve `name` from the caller's opts BEFORE merging defaults — see `resolveName`.
+  const name = resolveName(opts.name, fn);
   // Keep a handle on the caller's own options object *before* the defaults merge clones
   // it: that object is the memo slot for the resolved storage, so a caller who hands the
   // same object to `invalidateCache`/`expireCache` reaches this instance's store (see
-  // `_resolveStorage`). The clone below is kept in sync as a mirror, since it is what the
+  // `resolveStorage`). The clone below is kept in sync as a mirror, since it is what the
   // `.invalidate()`/`.expire()` methods delegate with.
   const _optsRef = opts;
   opts = { ...defaultCacheOptions(), ...opts, name };
@@ -50,7 +50,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   // option may be a factory precisely because the real backend is often only configured
   // after the module that defines this cached function has loaded. Unset means this
   // instance gets its *own* memory storage (no ambient global to collide on).
-  const _useStorage = (): StorageInterface => _resolveStorage(_optsRef, opts);
+  const getStorage = (): StorageInterface => resolveStorage(_optsRef, opts);
 
   // Deduplicates concurrent resolutions for the same key. The shared result carries
   // the storable (post-`serialize`) value plus any dynamic TTL, so `getMaxAge` and
@@ -67,9 +67,9 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
 
   // Normalize cache params
   const group = opts.group || "functions";
-  const integrity = opts.integrity || hash([fn, _integrityOpts(opts)]);
+  const integrity = opts.integrity || hash([fn, integrityOpts(opts)]);
   const validate = opts.validate || ((entry) => entry.value !== undefined);
-  const _onError = (context: string, error: unknown) => {
+  const onError = (context: string, error: unknown) => {
     if (opts.onError) {
       opts.onError(error);
     } else {
@@ -86,7 +86,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   ): Promise<ResolvedCacheEntry<T>> {
     const validateCtx = { args };
     // Use extension for key to avoid conflicting with parent namespace (foo/bar and foo/bar/baz)
-    const bases = _normalizeBases(opts.base);
+    const bases = normalizeBases(opts.base);
 
     let entry: CacheEntry<T> = {} as CacheEntry<T>;
     // Index of the base that had a cache hit (-1 = miss on all tiers)
@@ -94,8 +94,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
     try {
       // Multi-tier read: try each base prefix in order, use first hit
       for (let i = 0; i < bases.length; i++) {
-        const result = (await _useStorage().get(
-          _buildCacheKey(key, { group, name }, bases[i]!),
+        const result = (await getStorage().get(
+          buildCacheKey(key, { group, name }, bases[i]!),
         )) as CacheEntry<T> | null;
         if (result) {
           entry = result;
@@ -104,14 +104,14 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         }
       }
     } catch (error) {
-      _onError("[cache] Cache read error.", error);
+      onError("[cache] Cache read error.", error);
     }
 
     // https://github.com/nitrojs/nitro/issues/2160
     if (typeof entry !== "object") {
       entry = {};
       const error = new Error("Malformed data read from cache.");
-      _onError("[cache]", error);
+      onError("[cache]", error);
     } else {
       // Work on a per-call shallow clone: a storage backend may return the entry by
       // reference (the built-in memory storage does), so all subsequent in-place
@@ -182,7 +182,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
             ? "stale"
             : "revalidated";
 
-    const _resolve = async () => {
+    const resolveEntry = async () => {
       const isPending = pending.has(key);
       if (!isPending) {
         if (entry.value !== undefined && (opts.staleMaxAge || 0) >= 0 && opts.swr === false) {
@@ -210,12 +210,12 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
               const dynamic = typeof resolved === "number" ? { maxAge: resolved } : resolved;
               // Clamp to a non-negative TTL: a value <= 0 means "don't cache" (re-resolve every
               // access), never "cache forever as fresh". Non-finite (NaN) falls back to static options.
-              maxAge = _clampTtl(dynamic?.maxAge);
-              staleMaxAge = _clampTtl(dynamic?.staleMaxAge);
+              maxAge = clampTtl(dynamic?.maxAge);
+              staleMaxAge = clampTtl(dynamic?.staleMaxAge);
               resolvedEntry.maxAge = maxAge;
               resolvedEntry.staleMaxAge = staleMaxAge;
             } catch (error) {
-              _onError("[cache] getMaxAge hook error.", error);
+              onError("[cache] getMaxAge hook error.", error);
             }
           }
           // Prepare the value for storage (write-side counterpart of `transform`).
@@ -234,9 +234,9 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         if (!isPending) {
           pending.delete(key);
           // Evict stale entry from storage so SWR doesn't keep serving it
-          const evictPromise = _evictFromStorage(_useStorage(), key, bases, group, name).catch(
+          const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
             (error) => {
-              _onError("[cache] Cache eviction error.", error);
+              onError("[cache] Cache eviction error.", error);
             },
           );
           event?.req.waitUntil?.(evictPromise);
@@ -286,11 +286,11 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
             try {
               await Promise.all(
                 writeBases.map((b) =>
-                  _useStorage().set(_buildCacheKey(key, { group, name }, b), toStore, setOpts),
+                  getStorage().set(buildCacheKey(key, { group, name }, b), toStore, setOpts),
                 ),
               );
             } catch (error) {
-              _onError("[cache] Cache write error.", error);
+              onError("[cache] Cache write error.", error);
             }
           })();
           event?.req.waitUntil?.(promise);
@@ -299,9 +299,9 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           // evict it so SWR doesn't keep serving the stale value. When there was no
           // cache hit (hitIndex === -1) nothing is stored, so skip the redundant delete
           // (e.g. a handler returning `Cache-Control: no-store`/`private` on every request).
-          const evictPromise = _evictFromStorage(_useStorage(), key, bases, group, name).catch(
+          const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
             (error) => {
-              _onError("[cache] Cache eviction error.", error);
+              onError("[cache] Cache eviction error.", error);
             },
           );
           event?.req.waitUntil?.(evictPromise);
@@ -309,7 +309,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       }
     };
 
-    const _resolvePromise = expired ? _resolve() : Promise.resolve();
+    const _resolvePromise = expired ? resolveEntry() : Promise.resolve();
 
     if (entry.value === undefined) {
       await _resolvePromise;
@@ -334,7 +334,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
 
     if (swr && (await validate(entry, validateCtx)) !== false) {
       _resolvePromise.catch((error) => {
-        _onError("[cache] SWR handler error.", error);
+        onError("[cache] SWR handler error.", error);
       });
       return entry as ResolvedCacheEntry<T>;
     }
@@ -366,14 +366,14 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   cachedFn.resolveKeys = (...args: ArgsT) => resolveCacheKeys({ options: opts, args });
   // Resolve storage before delegating: `opts` may still hold an unresolved factory (or
   // nothing at all) when a purge is issued before the first cached call, and the helpers
-  // would then resolve a *different* store and silently no-op. `_useStorage` memoizes
+  // would then resolve a *different* store and silently no-op. `getStorage` memoizes
   // into `opts`, so both paths end up on this instance's backend either way.
   cachedFn.invalidate = (...args: ArgsT) => {
-    _useStorage();
+    getStorage();
     return invalidateCache({ options: opts, args });
   };
   cachedFn.expire = (...args: ArgsT) => {
-    _useStorage();
+    getStorage();
     return expireCache({ options: opts, args });
   };
 
@@ -421,7 +421,7 @@ export async function resolveCacheKeys<ArgsT extends unknown[] = any[]>(
   const opts = input.options ?? {};
   const args = input.args ?? ([] as unknown as ArgsT);
   const key = await (opts.getKey || getKey)(...args);
-  return _normalizeBases(opts.base).map((base) => _buildCacheKey(key, opts, base));
+  return normalizeBases(opts.base).map((base) => buildCacheKey(key, opts, base));
 }
 
 /**
@@ -454,7 +454,7 @@ export async function invalidateCache<ArgsT extends unknown[] = any[]>(
   } = {},
 ): Promise<void> {
   const keys = await resolveCacheKeys(input);
-  const storage = _requireStorage(input.options, "invalidateCache");
+  const storage = requireStorage(input.options, "invalidateCache");
   await Promise.all(keys.map((key) => storage.set(key, null)));
 }
 
@@ -496,14 +496,14 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
 ): Promise<void> {
   const opts = input.options ?? {};
   const keys = await resolveCacheKeys(input);
-  const storage = _requireStorage(opts, "expireCache");
+  const storage = requireStorage(opts, "expireCache");
   await Promise.all(
     keys.map(async (key) => {
       const entry = (await storage.get(key)) as CacheEntry | null;
       if (!entry || typeof entry !== "object" || entry.value === undefined) {
         return;
       }
-      await storage.set(key, { ...entry, stale: true }, _remainingTtl(entry, opts));
+      await storage.set(key, { ...entry, stale: true }, remainingTtl(entry, opts));
     }),
   );
 }
@@ -534,7 +534,7 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
 // an explicit `name`/`getKey` for those. The integrity hash collides there too, so it is
 // unfixable from the source alone, and with a shared `storage` it is a cross-instance leak
 // rather than mere thrash.
-export function _resolveName(name: string | undefined, fn: (...args: any[]) => any): string {
+export function resolveName(name: string | undefined, fn: (...args: any[]) => any): string {
   return name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
 }
 
@@ -548,14 +548,14 @@ export function _resolveName(name: string | undefined, fn: (...args: any[]) => a
 // event-scoped variants) resolve it before delegating, and a caller reaching for these
 // helpers directly either passes an explicit shared backend or hands over the very options
 // object they cached with, onto which the resolved storage was memoized.
-function _requireStorage(
+function requireStorage(
   options: { storage?: StorageOption } | undefined,
   caller: string,
 ): StorageInterface {
   if (!options?.storage) {
     throw new Error(`[ocache] ${caller}() requires \`options.storage\``);
   }
-  return _resolveStorage(options);
+  return resolveStorage(options);
 }
 
 function isHTTPEvent(input: unknown): input is HTTPEvent {
@@ -563,7 +563,7 @@ function isHTTPEvent(input: unknown): input is HTTPEvent {
 }
 
 /** Normalizes a dynamic TTL: clamps negatives to 0, treats nullish/non-finite as "unset" (static fallback). */
-function _clampTtl(value: number | undefined): number | undefined {
+function clampTtl(value: number | undefined): number | undefined {
   return value == null || !Number.isFinite(value) ? undefined : Math.max(0, value);
 }
 
@@ -571,7 +571,7 @@ function getKey(...args: unknown[]) {
   return args.length > 0 ? hash(args) : "";
 }
 
-function _buildCacheKey(
+function buildCacheKey(
   key: string,
   opts: Pick<CacheOptions, "group" | "name">,
   base: string,
@@ -581,23 +581,23 @@ function _buildCacheKey(
   return [base, group, name, key + ".json"].filter(Boolean).join(":").replace(/:\/$/, ":index");
 }
 
-function _normalizeBases(base: CacheOptions["base"]): [string, ...string[]] {
+function normalizeBases(base: CacheOptions["base"]): [string, ...string[]] {
   if (Array.isArray(base)) return base as [string, ...string[]];
   return [base ?? "/cache"];
 }
 
-async function _evictFromStorage(
+async function evictFromStorage(
   storage: StorageInterface,
   key: string,
   bases: string[],
   group: string,
   name: string,
 ) {
-  await Promise.all(bases.map((b) => storage.set(_buildCacheKey(key, { group, name }, b), null)));
+  await Promise.all(bases.map((b) => storage.set(buildCacheKey(key, { group, name }, b), null)));
 }
 
 /** Computes remaining storage TTL (seconds) so expiring an entry doesn't extend its original lifetime. */
-function _remainingTtl(
+function remainingTtl(
   entry: CacheEntry,
   opts: Pick<CacheOptions, "maxAge" | "swr" | "staleMaxAge">,
 ): { ttl: number } | undefined {
@@ -632,7 +632,7 @@ function _remainingTtl(
  * a closure variable) while a factory vs. a ready instance hash differently: an integrity
  * change on a purely cosmetic config edit.
  */
-function _integrityOpts(
+function integrityOpts(
   opts: CacheOptions<any, any>,
 ): Omit<CacheOptions, "base" | "group" | "name" | "storage"> {
   const { base: _, group: _g, name: _n, storage: _s, ...rest } = opts;

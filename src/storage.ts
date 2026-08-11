@@ -23,9 +23,9 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
   const map = new Map<string, { value: unknown; expires?: number }>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  function _delete(key: string) {
+  function deleteEntry(key: string) {
     map.delete(key);
-    _clearTimer(timers, key);
+    clearTimer(timers, key);
   }
 
   return {
@@ -35,7 +35,7 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
         return null;
       }
       if (entry.expires && Date.now() > entry.expires) {
-        _delete(key);
+        deleteEntry(key);
         return null;
       }
       // Mark as most-recently-used by reinserting (Map preserves insertion order).
@@ -46,7 +46,7 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
       return entry.value as any;
     },
     set(key, value, opts) {
-      _clearTimer(timers, key);
+      clearTimer(timers, key);
       if (value === null || value === undefined) {
         map.delete(key);
         return;
@@ -76,14 +76,14 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
           if (oldest === undefined) {
             break;
           }
-          _delete(oldest);
+          deleteEntry(oldest);
         }
       }
     },
   };
 }
 
-function _clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: string) {
+function clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: string) {
   const existing = timers.get(key);
   if (existing !== undefined) {
     clearTimeout(existing);
@@ -121,7 +121,7 @@ export type StorageOption = StorageInterface | (() => StorageInterface);
 // the resolved `name`. It also guarantees a factory runs at most once.
 //
 // Internal (deliberately not a JSDoc block: it must stay out of the generated API docs).
-export function _resolveStorage(
+export function resolveStorage(
   ...optsList: Array<{ storage?: StorageOption } | undefined>
 ): StorageInterface {
   const configured = optsList[0]?.storage;
