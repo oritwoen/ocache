@@ -1,3 +1,5 @@
+import type { StorageOption } from "./storage.ts";
+
 /**
  * Extended `Request` interface with optional `waitUntil` for background tasks.
  *
@@ -176,6 +178,38 @@ export interface CacheOptions<T = any, ArgsT extends unknown[] = any[]> {
     | Promise<number | { maxAge?: number; staleMaxAge?: number } | undefined>;
   /** Base path prefix(es) for cache keys. When an array, reads try each prefix in order (multi-tier) and writes go to all prefixes. Defaults to `"/cache"`. */
   base?: string | string[];
+  /**
+   * Where to persist cache entries: a {@link StorageInterface}, or a factory returning
+   * one. **Defaults to a fresh in-memory storage per cached function/handler.**
+   *
+   * Storage is per instance — there is no global backend. Two cached functions that both
+   * take the default never share entries, even under an identical `name`/key, so two
+   * independent apps in one process cannot leak cached values into each other. To share a
+   * cache, pass the *same* `storage` to each caller that should see it.
+   *
+   * The factory form is for late binding: it is called on the first cache read/write
+   * (never at definition time) and at most once, so a handler can be defined at module
+   * load while its backend is only configured at server start.
+   *
+   * The resolved instance is written back into this options object, so passing the *same*
+   * object to `resolveCacheKeys` / `invalidateCache` / `expireCache` targets the same
+   * store. A different object literal — even a structurally identical one — resolves its
+   * own storage and would silently act on an unrelated store, exactly like passing a
+   * different `name`.
+   *
+   * @example
+   * ```ts
+   * // Shared between two cached functions
+   * const storage = createMemoryStorage();
+   * const a = cachedFunction(fnA, { storage });
+   * const b = cachedFunction(fnB, { storage });
+   *
+   * // Late-bound backend, resolved on first use
+   * let redis: StorageInterface;
+   * const handler = defineCachedHandler(h, { storage: () => redis });
+   * ```
+   */
+  storage?: StorageOption;
   /** Optional error handler called for all cache-related errors (read, write, SWR, malformed data). */
   onError?: (error: unknown) => void;
 }

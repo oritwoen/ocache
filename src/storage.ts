@@ -91,17 +91,46 @@ function _clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: st
   }
 }
 
-let _storage: StorageInterface | undefined;
+/**
+ * Where a cached function/handler persists its entries: a ready {@link StorageInterface},
+ * or a factory returning one.
+ *
+ * The factory form exists for **late binding** — handlers are typically defined at module
+ * load while the real backend (Redis, KV, ...) only exists once the server has started.
+ * It is called on the first actual cache read/write, never at definition time, and at
+ * most once per cached function/handler.
+ */
+export type StorageOption = StorageInterface | (() => StorageInterface);
 
-/** Returns the current storage instance. If none has been set via `setStorage`, lazily initializes an in-memory storage. */
-export function useStorage(): StorageInterface {
-  if (!_storage) {
-    _storage = createMemoryStorage();
+// Resolves `opts.storage` into a concrete backend, memoizing it back into every options
+// object passed. `optsList[0]` is the source of truth and must be the one stable object per
+// cached function/handler instance; the rest are mirrors (internal clones of it).
+//
+// There is deliberately no ambient storage to fall back on. The removed `setStorage()`
+// singleton meant the *last* call won for every consumer in the process — including
+// unrelated `defineCachedFunction` callers who never asked for it — which is how two
+// independent apps, each constructing its own handler and its own storage, ended up sharing
+// one backend and serving each other's cached response bodies (h3#1524 audit, finding #2).
+// So an unset `storage` yields a *fresh* memory storage per cached function/handler:
+// colliding by accident is now impossible, and callers who want a shared cache pass the
+// same `storage` explicitly.
+//
+// The write-back is what lets the standalone `resolveCacheKeys` / `invalidateCache` /
+// `expireCache` helpers reach the same store as the cached function — hand them the same
+// options object and they see the memoized instance. Same mechanism (and same caveat) as
+// the resolved `name`. It also guarantees a factory runs at most once.
+//
+// Internal (deliberately not a JSDoc block: it must stay out of the generated API docs).
+export function _resolveStorage(
+  ...optsList: Array<{ storage?: StorageOption } | undefined>
+): StorageInterface {
+  const configured = optsList[0]?.storage;
+  const resolved = typeof configured === "function" ? configured() : configured;
+  const storage = resolved ?? createMemoryStorage();
+  for (const opts of optsList) {
+    if (opts) {
+      opts.storage = storage;
+    }
   }
-  return _storage;
-}
-
-/** Sets a custom storage implementation to be used by all cached functions. */
-export function setStorage(storage: StorageInterface): void {
-  _storage = storage;
+  return storage;
 }

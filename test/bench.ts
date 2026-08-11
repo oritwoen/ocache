@@ -1,5 +1,5 @@
 import { bench, summary, compact, run } from "mitata";
-import { defineCachedFunction, setStorage, createMemoryStorage } from "../src/index.ts";
+import { defineCachedFunction, createMemoryStorage } from "../src/index.ts";
 import type { StorageInterface } from "../src/index.ts";
 
 // --- Simulated costs (ms) ---
@@ -61,9 +61,10 @@ async function simulatedFn() {
   return "value";
 }
 
-// --- Setup global routed storage ---
-// Each scenario gets its own prefix so they don't collide,
-// and we only call setStorage once.
+// --- Setup shared routed storage ---
+// Each scenario gets its own prefix so they don't collide, and every cached function below
+// is handed this one `storage` explicitly — storage is per cached function now (no global
+// singleton), so sharing has to be opted into.
 
 const storeSingle = createSimulatedStorage();
 const storeTier1Fast = createSimulatedStorage();
@@ -72,16 +73,14 @@ const storeTier2Fast = createSimulatedStorage();
 const storeTier2Slow = createSimulatedStorage();
 const storeMiss = createSimulatedStorage();
 
-setStorage(
-  createRoutedStorage([
-    ["/single", storeSingle],
-    ["/t1-fast", storeTier1Fast],
-    ["/t1-slow", storeTier1Slow],
-    ["/t2-fast", storeTier2Fast],
-    ["/t2-slow", storeTier2Slow],
-    ["/miss", storeMiss],
-  ]),
-);
+const storage = createRoutedStorage([
+  ["/single", storeSingle],
+  ["/t1-fast", storeTier1Fast],
+  ["/t1-slow", storeTier1Slow],
+  ["/t2-fast", storeTier2Fast],
+  ["/t2-slow", storeTier2Slow],
+  ["/miss", storeMiss],
+]);
 
 // --- Prepare cached functions ---
 
@@ -92,6 +91,7 @@ const cachedSingle = defineCachedFunction(simulatedFn, {
   base: "/single",
   name: "bench",
   getKey: () => "k",
+  storage,
 });
 await cachedSingle(); // warm up
 
@@ -102,6 +102,7 @@ const cachedTier1 = defineCachedFunction(simulatedFn, {
   base: ["/t1-fast", "/t1-slow"],
   name: "bench",
   getKey: () => "k",
+  storage,
 });
 await cachedTier1(); // warm up — writes to both tiers
 
@@ -114,6 +115,7 @@ const tier2Writer = defineCachedFunction(simulatedFn, {
   name: "bench",
   getKey: () => "k",
   integrity: "shared",
+  storage,
 });
 await tier2Writer(); // populate slow tier
 
@@ -124,6 +126,7 @@ const cachedTier2 = defineCachedFunction(simulatedFn, {
   name: "bench",
   getKey: () => "k",
   integrity: "shared",
+  storage,
 });
 
 // 4. Cache miss (maxAge: 0 forces re-evaluation every time)
@@ -133,6 +136,7 @@ const cachedMiss = defineCachedFunction(simulatedFn, {
   base: "/miss",
   name: "bench",
   getKey: () => "k",
+  storage,
 });
 
 // --- Benchmark ---

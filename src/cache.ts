@@ -1,6 +1,7 @@
 import { hash } from "ohash";
-import { useStorage } from "./storage.ts";
+import { _resolveStorage } from "./storage.ts";
 
+import type { StorageInterface, StorageOption } from "./storage.ts";
 import type { HTTPEvent, CacheEntry, CacheOptions, CacheStatus } from "./types.ts";
 
 function defaultCacheOptions() {
@@ -47,7 +48,19 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   // that only differ by closed-over variables — pass an explicit `name`/`getKey` for
   // those (the integrity hash collides there too, so it's unfixable from the source alone).
   const name = opts.name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
+  // Keep a handle on the caller's own options object *before* the defaults merge clones
+  // it: that object is the memo slot for the resolved storage, so a caller who hands the
+  // same object to `invalidateCache`/`expireCache` reaches this instance's store (see
+  // `_resolveStorage`). The clone below is kept in sync as a mirror, since it is what the
+  // `.invalidate()`/`.expire()` methods delegate with.
+  const _optsRef = opts;
   opts = { ...defaultCacheOptions(), ...opts, name };
+
+  // Storage is resolved on first actual read/write, never at definition time: the `storage`
+  // option may be a factory precisely because the real backend is often only configured
+  // after the module that defines this cached function has loaded. Unset means this
+  // instance gets its *own* memory storage (no ambient global to collide on).
+  const _useStorage = (): StorageInterface => _resolveStorage(_optsRef, opts);
 
   // Deduplicates concurrent resolutions for the same key. The shared result carries
   // the storable (post-`serialize`) value plus any dynamic TTL, so `getMaxAge` and
@@ -85,7 +98,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
     try {
       // Multi-tier read: try each base prefix in order, use first hit
       for (let i = 0; i < bases.length; i++) {
-        const result = (await useStorage().get(
+        const result = (await _useStorage().get(
           _buildCacheKey(key, { group, name }, bases[i]!),
         )) as CacheEntry<T> | null;
         if (result) {
@@ -224,9 +237,11 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         if (!isPending) {
           delete pending[key];
           // Evict stale entry from storage so SWR doesn't keep serving it
-          const evictPromise = _evictFromStorage(key, bases, group, name).catch((error) => {
-            _onError("[cache] Cache eviction error.", error);
-          });
+          const evictPromise = _evictFromStorage(_useStorage(), key, bases, group, name).catch(
+            (error) => {
+              _onError("[cache] Cache eviction error.", error);
+            },
+          );
           event?.req.waitUntil?.(evictPromise);
         }
         // Re-throw error to make sure the caller knows the task failed.
@@ -274,7 +289,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
             try {
               await Promise.all(
                 writeBases.map((b) =>
-                  useStorage().set(_buildCacheKey(key, { group, name }, b), toStore, setOpts),
+                  _useStorage().set(_buildCacheKey(key, { group, name }, b), toStore, setOpts),
                 ),
               );
             } catch (error) {
@@ -287,9 +302,11 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           // evict it so SWR doesn't keep serving the stale value. When there was no
           // cache hit (hitIndex === -1) nothing is stored, so skip the redundant delete
           // (e.g. a handler returning `Cache-Control: no-store`/`private` on every request).
-          const evictPromise = _evictFromStorage(key, bases, group, name).catch((error) => {
-            _onError("[cache] Cache eviction error.", error);
-          });
+          const evictPromise = _evictFromStorage(_useStorage(), key, bases, group, name).catch(
+            (error) => {
+              _onError("[cache] Cache eviction error.", error);
+            },
+          );
           event?.req.waitUntil?.(evictPromise);
         }
       }
@@ -350,8 +367,18 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   };
 
   cachedFn.resolveKeys = (...args: ArgsT) => resolveCacheKeys({ options: opts, args });
-  cachedFn.invalidate = (...args: ArgsT) => invalidateCache({ options: opts, args });
-  cachedFn.expire = (...args: ArgsT) => expireCache({ options: opts, args });
+  // Resolve storage before delegating: `opts` may still hold an unresolved factory (or
+  // nothing at all) when a purge is issued before the first cached call, and the helpers
+  // would then resolve a *different* store and silently no-op. `_useStorage` memoizes
+  // into `opts`, so both paths end up on this instance's backend either way.
+  cachedFn.invalidate = (...args: ArgsT) => {
+    _useStorage();
+    return invalidateCache({ options: opts, args });
+  };
+  cachedFn.expire = (...args: ArgsT) => {
+    _useStorage();
+    return expireCache({ options: opts, args });
+  };
 
   return cachedFn;
 }
@@ -376,12 +403,15 @@ export const cachedFunction = defineCachedFunction;
  *
  * @example
  * ```ts
+ * const storage = createMemoryStorage();
+ * const fn = cachedFunction(fetchUser, { name: "fetchUser", getKey: (id: string) => id, storage });
+ *
  * const keys = await resolveCacheKeys({
  *   options: { name: "fetchUser", getKey: (id: string) => id },
  *   args: ["user-123"],
  * });
  * for (const key of keys) {
- *   await useStorage().set(key, null); // invalidate all tiers
+ *   await storage.set(key, null); // invalidate all tiers
  * }
  * ```
  */
@@ -402,25 +432,32 @@ export async function resolveCacheKeys<ArgsT extends unknown[] = any[]>(
  *
  * Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
  *
+ * Targets `options.storage` — pass the same backend (or, better, the very same options
+ * object you cached with, whose resolved storage is memoized on it) the entries were
+ * written to. **Throws** if `storage` is unset: there is no global store to fall back on,
+ * so the call could only purge a fresh empty one while the stale entry kept being served.
+ * A mismatched `name`/`getKey` still purges nothing silently. When the cached function is
+ * at hand, prefer its own `.invalidate(...args)`.
+ *
  * @param input - Object with `options` (cache options) and optional `args` (function arguments).
  *
  * @example
  * ```ts
  * // Invalidate a specific cached entry
  * await invalidateCache({
- *   options: { name: "fetchUser", getKey: (id: string) => id },
+ *   options: { name: "fetchUser", getKey: (id: string) => id, storage },
  *   args: ["user-123"],
  * });
  * ```
  */
 export async function invalidateCache<ArgsT extends unknown[] = any[]>(
   input: {
-    options?: Pick<CacheOptions<any, ArgsT>, "base" | "group" | "name" | "getKey">;
+    options?: Pick<CacheOptions<any, ArgsT>, "base" | "group" | "name" | "getKey" | "storage">;
     args?: ArgsT;
   } = {},
 ): Promise<void> {
   const keys = await resolveCacheKeys(input);
-  const storage = useStorage();
+  const storage = _requireStorage(input.options, "invalidateCache");
   await Promise.all(keys.map((key) => storage.set(key, null)));
 }
 
@@ -437,13 +474,16 @@ export async function invalidateCache<ArgsT extends unknown[] = any[]>(
  * Pass the same `maxAge` / `swr` / `staleMaxAge` options you cache with so the
  * remaining storage TTL is preserved.
  *
+ * Targets `options.storage` with the same rule as {@link invalidateCache}: **throws** if
+ * `storage` is unset, since there is no global store to fall back on.
+ *
  * @param input - Object with `options` (cache options) and optional `args` (function arguments).
  *
  * @example
  * ```ts
  * // Mark a cached entry for background refresh on next access
  * await expireCache({
- *   options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300 },
+ *   options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300, storage },
  *   args: ["user-123"],
  * });
  * ```
@@ -452,14 +492,14 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
   input: {
     options?: Pick<
       CacheOptions<any, ArgsT>,
-      "base" | "group" | "name" | "getKey" | "maxAge" | "swr" | "staleMaxAge"
+      "base" | "group" | "name" | "getKey" | "maxAge" | "swr" | "staleMaxAge" | "storage"
     >;
     args?: ArgsT;
   } = {},
 ): Promise<void> {
   const opts = input.options ?? {};
   const keys = await resolveCacheKeys(input);
-  const storage = useStorage();
+  const storage = _requireStorage(opts, "expireCache");
   await Promise.all(
     keys.map(async (key) => {
       const entry = (await storage.get(key)) as CacheEntry | null;
@@ -472,6 +512,26 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
 }
 
 // --- Internal helpers ---
+
+// Storage for the standalone purge helpers, which — unlike `resolveCacheKeys` (pure key
+// derivation, no storage) — are useless without the backend the entries were written to.
+// Since storage became per-instance there is no ambient store to fall back on, so an unset
+// `storage` used to resolve a *fresh empty* one: the purge found nothing, reported success,
+// and the stale entry kept being served. That silent no-op is the whole hazard, so it is an
+// error instead. Both valid paths leave `storage` set, so this only ever fires on a genuine
+// mistake: the cached function's own `.invalidate()`/`.expire()` (and `defineCachedHandler`'s
+// event-scoped variants) resolve it before delegating, and a caller reaching for these
+// helpers directly either passes an explicit shared backend or hands over the very options
+// object they cached with, onto which the resolved storage was memoized.
+function _requireStorage(
+  options: { storage?: StorageOption } | undefined,
+  caller: string,
+): StorageInterface {
+  if (!options?.storage) {
+    throw new Error(`[ocache] ${caller}() requires \`options.storage\``);
+  }
+  return _resolveStorage(options);
+}
 
 function isHTTPEvent(input: unknown): input is HTTPEvent {
   return (input as any)?.req instanceof Request;
@@ -501,10 +561,14 @@ function _normalizeBases(base: CacheOptions["base"]): [string, ...string[]] {
   return [base ?? "/cache"];
 }
 
-async function _evictFromStorage(key: string, bases: string[], group: string, name: string) {
-  await Promise.all(
-    bases.map((b) => useStorage().set(_buildCacheKey(key, { group, name }, b), null)),
-  );
+async function _evictFromStorage(
+  storage: StorageInterface,
+  key: string,
+  bases: string[],
+  group: string,
+  name: string,
+) {
+  await Promise.all(bases.map((b) => storage.set(_buildCacheKey(key, { group, name }, b), null)));
 }
 
 /** Computes remaining storage TTL (seconds) so expiring an entry doesn't extend its original lifetime. */
@@ -532,10 +596,20 @@ function _remainingTtl(
   return { ttl: Math.max(Math.ceil((entry.mtime + ttlWindow * 1000 - Date.now()) / 1000), 1) };
 }
 
-/** Strips storage-location fields from opts so integrity only reflects the cached computation. */
+/**
+ * Strips storage-location fields from opts so integrity only reflects the cached computation.
+ *
+ * `storage` belongs in that set for the same reason as `base`/`group`/`name`: it says
+ * *where* entries live, not what they contain, so pointing an instance at a different
+ * backend must not invalidate the entries already there. Hashing it would also be
+ * meaningless and expensive — ohash walks a storage object's methods as source text, so
+ * two `createMemoryStorage()` instances hash identically (including different `maxSize`,
+ * a closure variable) while a factory vs. a ready instance hash differently: an integrity
+ * change on a purely cosmetic config edit.
+ */
 function _integrityOpts(
   opts: CacheOptions<any, any>,
-): Omit<CacheOptions, "base" | "group" | "name"> {
-  const { base: _, group: _g, name: _n, ...rest } = opts;
+): Omit<CacheOptions, "base" | "group" | "name" | "storage"> {
+  const { base: _, group: _g, name: _n, storage: _s, ...rest } = opts;
   return rest;
 }

@@ -1,19 +1,47 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-  cachedFunction,
-  defineCachedFunction,
-  defineCachedHandler,
+  cachedFunction as _cachedFunction,
+  defineCachedFunction as _defineCachedFunction,
+  defineCachedHandler as _defineCachedHandler,
   resolveCacheKeys,
   invalidateCache,
   expireCache,
   createMemoryStorage,
-  setStorage,
-  useStorage,
+  type StorageInterface,
   type HTTPEvent,
 } from "../src/index.ts";
+
+// There is no global storage any more: every cached function/handler owns its own memory
+// storage unless it is handed one, which is what makes two independent consumers unable to
+// collide (covered explicitly in `describe("storage")`). Most tests here predate that and
+// want ONE shared, inspectable backend, so the wrappers below inject `testStorage` as the
+// `storage` option. It goes in as a *factory* — resolved on first use — so a test can still
+// swap the backend after defining its cached function, exactly as the old `useTestStorage()`
+// calls did. Use the `_`-prefixed imports directly to exercise the real defaults.
+let testStorage: StorageInterface;
+
 beforeEach(() => {
-  setStorage(createMemoryStorage());
+  testStorage = createMemoryStorage();
 });
+
+/** Replaces the storage the wrappers below hand out (the old global `setStorage`). */
+function useTestStorage(storage: StorageInterface): void {
+  testStorage = storage;
+}
+
+// Mutates rather than clones: the standalone `invalidateCache`/`expireCache` helpers reach
+// a cached function's store by being handed the very same options object, so the wrapper
+// must not break that identity.
+function _withTestStorage<O extends { storage?: any }>(opts: O): O {
+  opts.storage ??= () => testStorage;
+  return opts;
+}
+
+const cachedFunction: typeof _cachedFunction = (fn: any, opts: any = {}) =>
+  _cachedFunction(fn, _withTestStorage(opts));
+const defineCachedFunction: typeof _defineCachedFunction = cachedFunction;
+const defineCachedHandler: typeof _defineCachedHandler = (handler: any, opts: any = {}) =>
+  _defineCachedHandler(handler, _withTestStorage(opts));
 
 describe("cachedFunction", () => {
   it("caches function results", async () => {
@@ -137,7 +165,7 @@ describe("cachedFunction", () => {
     await fn(); // miss (writes entry)
     await fn(); // hit — must not mutate the stored entry with `status`
     const [key] = await fn.resolveKeys();
-    const stored = (await useStorage().get(key!)) as Record<string, unknown>;
+    const stored = (await testStorage.get(key!)) as Record<string, unknown>;
     expect(Object.keys(stored)).not.toContain("status");
   });
 
@@ -152,7 +180,7 @@ describe("cachedFunction", () => {
     await fn(); // hit (sets per-call status on the returned entry)
     await fn.expire();
     const [key] = await fn.resolveKeys();
-    const stored = (await useStorage().get(key!)) as Record<string, unknown>;
+    const stored = (await testStorage.get(key!)) as Record<string, unknown>;
     expect(stored.stale).toBe(true);
     expect(Object.keys(stored)).not.toContain("status");
   });
@@ -339,7 +367,7 @@ describe("cachedFunction", () => {
 
   it("handles cache read errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => Promise.reject(new Error("read error")),
       set: () => {},
     });
@@ -352,7 +380,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache read errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => {
         throw new Error("sync read error");
       },
@@ -367,7 +395,7 @@ describe("cachedFunction", () => {
 
   it("handles cache write errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => Promise.reject(new Error("write error")),
     });
@@ -381,7 +409,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache write errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => {
         throw new Error("sync write error");
@@ -397,7 +425,7 @@ describe("cachedFunction", () => {
 
   it("handles cache eviction errors gracefully", async () => {
     const errors: unknown[] = [];
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => Promise.reject(new Error("evict error")),
     });
@@ -418,7 +446,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache eviction errors gracefully", async () => {
     const errors: unknown[] = [];
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => {
         throw new Error("sync evict error");
@@ -441,7 +469,7 @@ describe("cachedFunction", () => {
 
   it("handles malformed cache data", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => "not-an-object" as any,
       set: () => {},
     });
@@ -556,7 +584,7 @@ describe("cachedFunction", () => {
 
   it("sets storage TTL when swr is false", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -668,7 +696,7 @@ describe("cachedFunction", () => {
 
     // The stale entry should have been removed from storage after the bg error.
     const keys = await fn.resolveKeys();
-    const staleEntry = await useStorage().get(keys[0]!);
+    const staleEntry = await testStorage.get(keys[0]!);
     // BUG: stale entry persists in storage — it should be null after failed revalidation
     expect(staleEntry).toBeNull();
   });
@@ -718,7 +746,7 @@ describe("cachedFunction", () => {
     // The stale entry should have been removed from storage because the
     // bg revalidation produced an invalid result (undefined).
     const keys = await fn.resolveKeys();
-    const staleEntry = await useStorage().get(keys[0]!);
+    const staleEntry = await testStorage.get(keys[0]!);
     // BUG: stale entry persists in storage — it should be null after failed revalidation
     expect(staleEntry).toBeNull();
   });
@@ -744,7 +772,7 @@ describe("cachedFunction", () => {
 
   it("sets storage TTL to maxAge + staleMaxAge when SWR with staleMaxAge", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -760,7 +788,7 @@ describe("cachedFunction", () => {
 
   it("does not set storage TTL when SWR without staleMaxAge", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -971,7 +999,7 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     await fn();
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBe(42);
     expect(entry.staleMaxAge).toBe(7);
   });
@@ -997,7 +1025,7 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(callCount).toBe(1);
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBeUndefined();
   });
 
@@ -1072,7 +1100,7 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(callCount).toBe(2);
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBe(0);
   });
 
@@ -1089,10 +1117,10 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
 
     await fn();
     const keys = await fn.resolveKeys();
-    expect(((await useStorage().get(keys[0]!)) as any).stale).toBeUndefined();
+    expect(((await testStorage.get(keys[0]!)) as any).stale).toBeUndefined();
 
     await expireCache({ options, args: [] });
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.stale).toBe(true);
     // Entry value is preserved for SWR to keep serving
     expect(entry.value).toBe("value");
@@ -1117,7 +1145,7 @@ describe("serialize (write-time hook)", () => {
 
     // Storage holds the serialized (string) form, not the raw object.
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.value).toBe('{"n":1}');
   });
 
@@ -1203,7 +1231,7 @@ describe("serialize (write-time hook)", () => {
 
     // The per-entry maxAge derived from the raw value is persisted alongside the serialized value.
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBe(42);
     expect(entry.value).toBe('{"expiresIn":42}');
   });
@@ -1239,7 +1267,7 @@ describe("serialize (write-time hook)", () => {
 
     // Nothing was persisted, so a second call re-resolves.
     const keys = await fn.resolveKeys();
-    expect(await useStorage().get(keys[0]!)).toBeNull();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
     await expect(fn()).rejects.toThrow("cannot serialize");
     expect(resolverCalls).toBe(2);
   });
@@ -1252,18 +1280,6 @@ describe("storage", () => {
     expect(storage.get("unique-ttl-key")).not.toBeNull();
     await new Promise((r) => setTimeout(r, 20));
     expect(storage.get("unique-ttl-key")).toBeNull();
-  });
-
-  it("useStorage returns singleton", () => {
-    const s1 = useStorage();
-    const s2 = useStorage();
-    expect(s1).toBe(s2);
-  });
-
-  it("setStorage overrides storage", () => {
-    const custom = createMemoryStorage();
-    setStorage(custom);
-    expect(useStorage()).toBe(custom);
   });
 
   it("set with null deletes the entry", () => {
@@ -1374,6 +1390,238 @@ describe("storage", () => {
     for (let i = 0; i < 10; i++) {
       expect(origGet(`key-${i}`)).toBeNull();
     }
+  });
+
+  // The `storage` option and the per-instance default that replaced the global
+  // `setStorage()`/`useStorage()` singleton. These use the raw `_`-prefixed imports so the
+  // test harness doesn't inject a shared storage over the behavior under test.
+  describe("storage option", () => {
+    // Regression (h3#1524 audit, finding #2): two independent apps, each building the same
+    // cached function from a shared module (so same name, same key, same integrity) but
+    // owning its own cache, used to land in the one global storage and serve each other's
+    // values. Nothing but the per-instance default prevents that — a caller cannot pick a
+    // "unique enough" name for an app it doesn't know exists.
+    it("gives each cached function its own storage by default", async () => {
+      const calls: string[] = [];
+      const makeApp = (app: string) =>
+        _defineCachedFunction(
+          () => {
+            calls.push(app);
+            return `body-from-${app}`;
+          },
+          { maxAge: 10, name: "render", getKey: () => "/index" },
+        );
+
+      const a = makeApp("a");
+      const b = makeApp("b");
+
+      expect(await a()).toBe("body-from-a");
+      expect(await b()).toBe("body-from-b");
+      // Each still serves its own value from its own cache.
+      expect(await a()).toBe("body-from-a");
+      expect(await b()).toBe("body-from-b");
+      expect(calls).toEqual(["a", "b"]);
+    });
+
+    it("shares entries between cached functions given the same storage", async () => {
+      const storage = createMemoryStorage();
+      const calls: string[] = [];
+      const makeApp = (app: string) =>
+        _defineCachedFunction(
+          () => {
+            calls.push(app);
+            return `body-from-${app}`;
+          },
+          { maxAge: 10, name: "render", getKey: () => "/index", storage },
+        );
+
+      const a = makeApp("a");
+      const b = makeApp("b");
+
+      expect(await a()).toBe("body-from-a");
+      // Sharing is opt-in and explicit: `b` reads the entry `a` wrote.
+      expect(await b()).toBe("body-from-a");
+      expect(calls).toEqual(["a"]);
+    });
+
+    it("writes to a ready storage instance", async () => {
+      const storage = createMemoryStorage();
+      const fn = _defineCachedFunction(() => "value", {
+        maxAge: 10,
+        name: "ready",
+        getKey: () => "k",
+        storage,
+      });
+
+      expect(await fn()).toBe("value");
+      expect(await storage.get("/cache:functions:ready:k.json")).toMatchObject({ value: "value" });
+      expect((await fn.resolveKeys())[0]).toBe("/cache:functions:ready:k.json");
+    });
+
+    it("resolves a storage factory lazily and only once", async () => {
+      const storage = createMemoryStorage();
+      let factoryCalls = 0;
+      const fn = _defineCachedFunction(() => "value", {
+        maxAge: 10,
+        name: "lazy",
+        getKey: () => "k",
+        storage: () => {
+          factoryCalls++;
+          return storage;
+        },
+      });
+
+      // Late binding: the factory must not run at definition time — a handler is commonly
+      // defined at module load, before the real backend has been configured.
+      expect(factoryCalls).toBe(0);
+
+      // A purge issued before anything was cached must resolve the *same* store the read/
+      // write path will use, not run the factory a second time on its own copy of the opts.
+      await fn.invalidate();
+      expect(factoryCalls).toBe(1);
+
+      await fn();
+      await fn();
+      await fn();
+      await fn.invalidate();
+      await fn.expire();
+      await fn();
+
+      expect(factoryCalls).toBe(1);
+      expect(await storage.get("/cache:functions:lazy:k.json")).toBeTruthy();
+    });
+
+    it("standalone helpers reach the default storage via the same options object", async () => {
+      let calls = 0;
+      // No `storage`: this instance builds its own. The helpers can only find it because
+      // the resolved instance is memoized back onto this very object (same mechanism as
+      // the resolved `name`).
+      const opts = { maxAge: 10, name: "standalone-default", getKey: () => "k" };
+      const fn = _defineCachedFunction(() => `v${++calls}`, opts);
+
+      expect(await fn()).toBe("v1");
+      expect(await fn()).toBe("v1");
+
+      await invalidateCache({ options: opts });
+      expect(await fn()).toBe("v2");
+
+      await expireCache({ options: opts });
+      expect(await fn()).toBe("v3");
+
+      // A *different* object — even a structurally identical literal — carries no resolved
+      // storage, so it cannot know which backend to purge. That used to resolve a fresh
+      // empty store and report success while the stale entry kept being served; it throws
+      // instead, so the mistake is impossible to miss.
+      await expect(
+        invalidateCache({ options: { name: "standalone-default", getKey: () => "k" } }),
+      ).rejects.toThrow(/requires `options.storage`/);
+      await expect(
+        expireCache({ options: { name: "standalone-default", getKey: () => "k" } }),
+      ).rejects.toThrow(/requires `options.storage`/);
+      expect(await fn()).toBe("v3");
+    });
+
+    it("does not perturb the integrity hash", async () => {
+      const s1 = createMemoryStorage();
+      const s2 = createMemoryStorage();
+      const fn = () => "value";
+      const key = "/cache:functions:integrity:k.json";
+
+      // Identical in every way except where entries live, and in which *form* the storage
+      // was passed — ohash hashes a factory and a ready instance differently, so this
+      // would diverge if `storage` reached the integrity hash.
+      const a = _defineCachedFunction(fn, {
+        maxAge: 10,
+        name: "integrity",
+        getKey: () => "k",
+        storage: s1,
+      });
+      const b = _defineCachedFunction(fn, {
+        maxAge: 10,
+        name: "integrity",
+        getKey: () => "k",
+        storage: () => s2,
+      });
+
+      await a();
+      await b();
+
+      const entryA = (await s1.get(key)) as any;
+      const entryB = (await s2.get(key)) as any;
+      expect(entryA.integrity).toBe(entryB.integrity);
+    });
+
+    it("handler revalidation methods act on the handler's own storage", async () => {
+      const storage = createMemoryStorage();
+      let callCount = 0;
+      const handler = _defineCachedHandler(() => new Response(`call-${++callCount}`), {
+        maxAge: 60,
+        swr: true,
+        staleMaxAge: 60,
+        storage,
+      });
+      const event = () => ({ req: new Request("http://localhost/resource") });
+
+      const r1 = (await handler(event())) as Response;
+      expect(await r1.text()).toBe("call-1");
+
+      // Keys resolve against this handler's own store — and the entry is really there.
+      const keys = await handler.resolveKeys(event());
+      expect(keys).toHaveLength(2); // GET + HEAD variants of the resource
+      expect(await storage.get(keys[0]!)).toBeTruthy();
+
+      await handler.expire(event());
+      expect(await storage.get(keys[0]!)).toMatchObject({ stale: true });
+
+      await handler.invalidate(event());
+      expect(await storage.get(keys[0]!)).toBeNull();
+
+      const r2 = (await handler(event())) as Response;
+      expect(await r2.text()).toBe("call-2");
+    });
+
+    it("handler revalidation resolves the handler's storage once, before the first request", async () => {
+      const storage = createMemoryStorage();
+      let factoryCalls = 0;
+      const handler = _defineCachedHandler(() => new Response("ok"), {
+        maxAge: 60,
+        storage: () => {
+          factoryCalls++;
+          return storage;
+        },
+      });
+      const event = () => ({ req: new Request("http://localhost/cold") });
+
+      // `_variantOptions` spreads one fresh options object per method variant; without
+      // resolving the handler's storage into `_opts` first, each copy would resolve its own
+      // (running the factory once per variant, then again on the first request).
+      await handler.invalidate(event());
+      expect(factoryCalls).toBe(1);
+
+      await handler(event());
+      const keys = await handler.resolveKeys(event());
+      expect(await storage.get(keys[0]!)).toBeTruthy();
+
+      await handler.invalidate(event());
+      expect(await storage.get(keys[0]!)).toBeNull();
+      expect(factoryCalls).toBe(1);
+    });
+
+    it("handler revalidation reaches the handler's own default storage", async () => {
+      let callCount = 0;
+      // No `storage`: the handler owns a private memory storage nobody else can reach, so
+      // its purge methods are the only way in.
+      const handler = _defineCachedHandler(() => new Response(`call-${++callCount}`), {
+        maxAge: 60,
+      });
+      const event = () => ({ req: new Request("http://localhost/default-store") });
+
+      expect(await ((await handler(event())) as Response).text()).toBe("call-1");
+      expect(await ((await handler(event())) as Response).text()).toBe("call-1");
+
+      await handler.invalidate(event());
+      expect(await ((await handler(event())) as Response).text()).toBe("call-2");
+    });
   });
 });
 
@@ -1640,7 +1888,7 @@ describe("defineCachedHandler", () => {
     // A storage backend that JSON-serializes entries (like most real ones) — a raw
     // Uint8Array wouldn't survive this, but a base64 string does.
     const inner = createMemoryStorage();
-    setStorage({
+    useTestStorage({
       get: (key) => {
         const raw = inner.get<string>(key) as string | null;
         return raw == null ? null : JSON.parse(raw);
@@ -1796,7 +2044,7 @@ describe("defineCachedHandler", () => {
 
   it("does not write to storage (no redundant eviction) on a no-store miss", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const handler = defineCachedHandler(
       () => new Response("ok", { headers: { "cache-control": "no-store" } }),
@@ -1935,7 +2183,7 @@ describe("defineCachedHandler", () => {
   // check (which runs before the status/body guards).
   it("degrades to a miss on a corrupt cache entry with no headers", async () => {
     let callCount = 0;
-    setStorage({
+    useTestStorage({
       get: () => ({ value: { status: 200 } }) as any,
       set: () => {},
     });
@@ -2712,7 +2960,7 @@ describe("defineCachedHandler", () => {
   it("rejects stored entries carrying a non-allowlisted Set-Cookie (pre-upgrade entries)", async () => {
     const written: string[] = [];
     const memory = createMemoryStorage();
-    setStorage({
+    useTestStorage({
       get: (key) => memory.get(key),
       set: (key, value, opts) => {
         written.push(key);
@@ -3098,7 +3346,7 @@ describe("defineCachedHandler", () => {
     const keys = await handler.resolveKeys(event);
     // The event's own (GET) key first, then the sibling HEAD variant of the same resource.
     expect(keys.length).toBe(2);
-    const stored = await useStorage().get(keys[0]!);
+    const stored = await testStorage.get(keys[0]!);
     expect(stored).toBeTruthy();
     expect((stored as any).value.body).toBe("ok");
   });
@@ -3123,7 +3371,7 @@ describe("defineCachedHandler", () => {
 
     await handler.invalidate(makeEvent(path));
     const [key] = await handler.resolveKeys(makeEvent(path));
-    expect(await useStorage().get(key!)).toBeFalsy();
+    expect(await testStorage.get(key!)).toBeFalsy();
 
     // Next call re-resolves.
     const r3 = (await handler(makeEvent(path))) as Response;
@@ -3352,7 +3600,7 @@ describe("defineCachedHandler", () => {
     const getKey = (await handler.resolveKeys(makeEvent(path)))[0]!;
     const keys = [getKey, getKey.replace(":handlers:_:", ":handlers:_:HEAD:")];
     for (const key of keys) {
-      expect(await useStorage().get(key)).toBeTruthy();
+      expect(await testStorage.get(key)).toBeTruthy();
     }
     return keys;
   }
@@ -3373,10 +3621,10 @@ describe("defineCachedHandler", () => {
 
     // keys[0] is still exactly the key that event reads/writes.
     await handler(makeEvent(path));
-    expect(await useStorage().get(getKeys[0]!)).toBeTruthy();
-    expect(await useStorage().get(getKeys[1]!)).toBeFalsy();
+    expect(await testStorage.get(getKeys[0]!)).toBeTruthy();
+    expect(await testStorage.get(getKeys[1]!)).toBeFalsy();
     await handler(makeEvent(path, { method: "HEAD" }));
-    expect(await useStorage().get(headKeys[0]!)).toBeTruthy();
+    expect(await testStorage.get(headKeys[0]!)).toBeTruthy();
   });
 
   it(".invalidate(event) clears every method variant of the resource", async () => {
@@ -3395,14 +3643,14 @@ describe("defineCachedHandler", () => {
     const keys = await primeBothVariants(handler, path);
     await handler.invalidate(makeEvent(path));
     for (const key of keys) {
-      expect(await useStorage().get(key)).toBeFalsy();
+      expect(await testStorage.get(key)).toBeFalsy();
     }
 
     // ...and the same in the other direction, from a HEAD event.
     await primeBothVariants(handler, path);
     await handler.invalidate(makeEvent(path, { method: "HEAD" }));
     for (const key of keys) {
-      expect(await useStorage().get(key)).toBeFalsy();
+      expect(await testStorage.get(key)).toBeFalsy();
     }
   });
 
@@ -3418,7 +3666,7 @@ describe("defineCachedHandler", () => {
     const keys = await primeBothVariants(handler, path);
     await handler.expire(makeEvent(path));
     for (const key of keys) {
-      expect(await useStorage().get(key)).toMatchObject({ stale: true });
+      expect(await testStorage.get(key)).toMatchObject({ stale: true });
     }
 
     // ...and from a HEAD event.
@@ -3426,7 +3674,7 @@ describe("defineCachedHandler", () => {
     await primeBothVariants(handler, path);
     await handler.expire(makeEvent(path, { method: "HEAD" }));
     for (const key of keys) {
-      expect(await useStorage().get(key)).toMatchObject({ stale: true });
+      expect(await testStorage.get(key)).toMatchObject({ stale: true });
     }
   });
 });
@@ -3456,7 +3704,7 @@ describe("resolveCacheKeys", () => {
 
   it("matches the key used internally by defineCachedFunction", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const opts = {
       maxAge: 10,
@@ -3547,7 +3795,7 @@ describe("invalidateCache", () => {
 
     await fn();
 
-    const storage = useStorage();
+    const storage = testStorage;
     expect(await storage.get("/tier1:functions:myFn:k.json")).not.toBeNull();
     expect(await storage.get("/tier2:functions:myFn:k.json")).not.toBeNull();
 
@@ -3574,9 +3822,9 @@ describe("invalidateCache", () => {
   });
 
   it("invalidating non-existent key is a no-op", async () => {
-    // Should not throw
+    // Should not throw (a missing *entry* is fine; only a missing `storage` is an error)
     await invalidateCache({
-      options: { name: "nonexistent", getKey: () => "nope" },
+      options: { name: "nonexistent", getKey: () => "nope", storage: testStorage },
     });
   });
 });
@@ -3621,7 +3869,7 @@ describe("expireCache", () => {
     await fn(); // triggers revalidation (sync resolver updates the entry)
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.stale).toBeUndefined();
   });
 
@@ -3666,7 +3914,7 @@ describe("expireCache", () => {
     const fn = defineCachedFunction(() => "value", opts);
     await fn();
 
-    const storage = useStorage();
+    const storage = testStorage;
     const setSpy = vi.spyOn(storage, "set");
 
     await fn.expire();
@@ -3688,7 +3936,7 @@ describe("expireCache", () => {
     await fn();
     await fn.expire();
 
-    const storage = useStorage();
+    const storage = testStorage;
     const tier1 = (await storage.get("/tier1:functions:myFn:k.json")) as any;
     const tier2 = (await storage.get("/tier2:functions:myFn:k.json")) as any;
     expect(tier1.stale).toBe(true);
@@ -3713,11 +3961,12 @@ describe("expireCache", () => {
   });
 
   it("expiring non-existent key is a no-op", async () => {
-    // Should not throw and should not create an entry
+    // Should not throw and should not create an entry (a missing *entry* is fine; only a
+    // missing `storage` is an error)
     await expireCache({
-      options: { name: "nonexistent", getKey: () => "nope" },
+      options: { name: "nonexistent", getKey: () => "nope", storage: testStorage },
     });
-    expect(await useStorage().get("/cache:functions:nonexistent:nope.json")).toBeNull();
+    expect(await testStorage.get("/cache:functions:nonexistent:nope.json")).toBeNull();
   });
 });
 
@@ -3758,7 +4007,7 @@ describe("multi-tier base", () => {
 
   it("writes to all tiers on full miss", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const fn = defineCachedFunction(() => "value", {
       maxAge: 10,
@@ -3775,7 +4024,7 @@ describe("multi-tier base", () => {
 
   it("skips writing to lower tiers when a higher tier hits", async () => {
     const sharedIntegrity = "shared-integrity";
-    const storage = useStorage();
+    const storage = testStorage;
 
     // Populate both tiers
     const entry = {
@@ -3812,7 +4061,7 @@ describe("multi-tier base", () => {
     };
 
     // Custom storage: tier1 misses, tier2 hits, tier3 is never checked
-    setStorage({
+    useTestStorage({
       get: (key: string): any => {
         if (key === "/tier2:functions:myFn:k.json") return tier2Entry;
         return null;
@@ -3851,7 +4100,7 @@ describe("multi-tier base", () => {
     await fn1();
 
     // Copy tier1 entry to tier2 with different value
-    const storage = useStorage();
+    const storage = testStorage;
     const tier1Entry = (await storage.get("/tier1:functions:myFn:k.json")) as any;
     await storage.set("/tier2:functions:myFn:k.json", { ...tier1Entry, value: "from-tier2" });
 

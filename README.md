@@ -209,6 +209,9 @@ Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
 Pass the same `maxAge` / `swr` / `staleMaxAge` options you cache with so the
 remaining storage TTL is preserved.
 
+Targets `options.storage` with the same rule as [`invalidateCache`](#invalidatecache): **throws** if
+`storage` is unset, since there is no global store to fall back on.
+
 **Parameters:**
 
 - **`input`** — Object with `options` (cache options) and optional `args` (function arguments).
@@ -218,7 +221,7 @@ remaining storage TTL is preserved.
 ```ts
 // Mark a cached entry for background refresh on next access
 await expireCache({
-  options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300 },
+  options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300, storage },
   args: ["user-123"],
 });
 ```
@@ -236,6 +239,13 @@ Invalidates (removes) cached entries for given arguments and cache options acros
 
 Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
 
+Targets `options.storage` — pass the same backend (or, better, the very same options
+object you cached with, whose resolved storage is memoized on it) the entries were
+written to. **Throws** if `storage` is unset: there is no global store to fall back on,
+so the call could only purge a fresh empty one while the stale entry kept being served.
+A mismatched `name`/`getKey` still purges nothing silently. When the cached function is
+at hand, prefer its own `.invalidate(...args)`.
+
 **Parameters:**
 
 - **`input`** — Object with `options` (cache options) and optional `args` (function arguments).
@@ -245,7 +255,7 @@ Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
 ```ts
 // Invalidate a specific cached entry
 await invalidateCache({
-  options: { name: "fetchUser", getKey: (id: string) => id },
+  options: { name: "fetchUser", getKey: (id: string) => id, storage },
   args: ["user-123"],
 });
 ```
@@ -278,34 +288,33 @@ Pass the same `getKey`, `name`, `group`, and `base` options you use in
 **Example:**
 
 ```ts
+const storage = createMemoryStorage();
+const fn = cachedFunction(fetchUser, { name: "fetchUser", getKey: (id: string) => id, storage });
+
 const keys = await resolveCacheKeys({
   options: { name: "fetchUser", getKey: (id: string) => id },
   args: ["user-123"],
 });
 for (const key of keys) {
-  await useStorage().set(key, null); // invalidate all tiers
+  await storage.set(key, null); // invalidate all tiers
 }
 ```
 
 ---
 
-### `setStorage`
+### `StorageOption`
 
 ```ts
-function setStorage(storage: StorageInterface): void;
+type StorageOption = StorageInterface | (() => StorageInterface);
 ```
 
-Sets a custom storage implementation to be used by all cached functions.
+Where a cached function/handler persists its entries: a ready [`StorageInterface`](#storageinterface),
+or a factory returning one.
 
----
-
-### `useStorage`
-
-```ts
-function useStorage(): StorageInterface;
-```
-
-Returns the current storage instance. If none has been set via `setStorage`, lazily initializes an in-memory storage.
+The factory form exists for **late binding** — handlers are typically defined at module
+load while the real backend (Redis, KV, ...) only exists once the server has started.
+It is called on the first actual cache read/write, never at definition time, and at
+most once per cached function/handler.
 
 <!-- /automd-->
 

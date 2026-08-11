@@ -11,10 +11,9 @@ export { defineCachedHandler } from "./http.ts";
 
 export {
   type StorageInterface,
+  type StorageOption,
   type MemoryStorageOptions,
   createMemoryStorage,
-  useStorage,
-  setStorage,
 } from "./storage.ts";
 
 export type {

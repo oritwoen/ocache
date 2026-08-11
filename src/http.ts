@@ -1,5 +1,6 @@
 import { hash } from "ohash";
 import { cachedFunction, expireCache, invalidateCache, resolveCacheKeys } from "./cache.ts";
+import { _resolveStorage } from "./storage.ts";
 
 import type {
   HTTPEvent,
@@ -526,6 +527,12 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   // The keys are handed to the standalone `cache.ts` helpers as a fixed `getKey`; going
   // through `_cachedHandler.*` would re-derive only the event's own variant.
   const _variantOptions = async (event: E) => {
+    // `_opts` is the object `cachedFunction` memoizes this handler's resolved storage into,
+    // but each variant below spreads it into a *fresh* object. Resolve first so every
+    // variant carries the concrete backend: without it, a purge issued before the first
+    // request would leave an unresolved `storage` (or none at all) on each copy, each copy
+    // would build its own default memory storage, and the purge would silently no-op.
+    _resolveStorage(_opts);
     const key = await _resolveKey(event);
     const methods = _cacheableMethods.includes(event.req.method)
       ? [event.req.method, ..._cacheableMethods.filter((m) => m !== event.req.method)]
@@ -707,11 +714,14 @@ function _forbidsSharedCaching(cacheControl: unknown): boolean {
   });
 }
 
-/** Strips storage-location fields from opts so integrity only reflects the cached computation. */
+/**
+ * Strips storage-location fields from opts so integrity only reflects the cached
+ * computation (`storage` included — see the same helper in `cache.ts`).
+ */
 function _integrityOpts<E extends HTTPEvent>(
   opts: CachedEventHandlerOptions<E>,
-): Omit<CachedEventHandlerOptions<E>, "base" | "group" | "name"> {
-  const { base: _, group: _g, name: _n, ...rest } = opts;
+): Omit<CachedEventHandlerOptions<E>, "base" | "group" | "name" | "storage"> {
+  const { base: _, group: _g, name: _n, storage: _s, ...rest } = opts;
   return rest;
 }
 
