@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "obuild",
+    "bundle": "node test/bundle.ts",
     "dev": "vitest dev",
     "fmt": "automd && oxlint . --fix && oxfmt .",
     "lint": "oxlint . && oxfmt --check .",
@@ -36,6 +37,7 @@
     "obuild": "^0.4.38",
     "oxfmt": ">=0.62.0",
     "oxlint": "^1.77.0",
+    "rolldown": "^1.2.3",
     "typescript": "^7",
     "vitest": "^4.1.10"
   },
