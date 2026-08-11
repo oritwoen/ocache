@@ -2663,7 +2663,7 @@ describe("defineCachedHandler", () => {
     expect(b.headers.get("set-cookie")).toBeNull();
   });
 
-  it("keeps allowlisted Set-Cookies and strips the rest, caching the result", async () => {
+  it("strips an allowlisted Set-Cookie too, and still caches the rest", async () => {
     let allowedCalls = 0;
     const allowedPath = uniquePath();
     const allowedHandler = defineCachedHandler(
@@ -2678,9 +2678,12 @@ describe("defineCachedHandler", () => {
 
     const a1 = (await allowedHandler(makeEvent(allowedPath))) as Response;
     await allowedHandler(makeEvent(allowedPath));
-    // Allowlisted cookie -> kept and cached, second request is a hit.
+    // `allowCookies` governs the request side only: even its own names never survive as
+    // Set-Cookie — not on the stored entry and not on the direct caller's MISS response.
+    // The rest of the response is still cached, so the second request is a hit.
     expect(allowedCalls).toBe(1);
-    expect(a1.headers.get("set-cookie")).toBe("theme=dark; Path=/");
+    expect(a1.headers.get("set-cookie")).toBeNull();
+    expect(await a1.text()).toBe("call-1");
 
     let mixedCalls = 0;
     const mixedPath = uniquePath();
@@ -2697,16 +2700,140 @@ describe("defineCachedHandler", () => {
 
     const m1 = (await mixedHandler(makeEvent(mixedPath))) as Response;
     await mixedHandler(makeEvent(mixedPath));
-    // The non-allowlisted `sid` is stripped; the allowed `theme` remains, so the
-    // response is cached and the second request is a hit.
+    // Both cookies go — the allowlisted `theme` alongside the unlisted `sid`.
     expect(mixedCalls).toBe(1);
-    expect(m1.headers.getSetCookie()).toEqual(["theme=dark"]);
+    expect(m1.headers.getSetCookie()).toEqual([]);
   });
 
-  it("strips Set-Cookie conservatively on runtimes without getSetCookie", async () => {
-    // Simulate an environment whose Headers lacks getSetCookie (older Node / polyfills):
-    // the guard can't enumerate individual cookies, so it must strip every Set-Cookie
-    // (fail safe) rather than risk replaying one.
+  it("never replays an allowlisted Set-Cookie to a later caller (h3#1524 audit, #15c)", async () => {
+    // The session-fixation repro. The handler mints a session id on every call and
+    // `sid` is allowlisted, so it used to be stored on the entry: the first visitor
+    // (no `sid` cookie) seeded the *no-sid* key with `Set-Cookie: sid=s1`, and every
+    // subsequent first-time visitor — same key, since they also have no `sid` — was
+    // served that same `sid=s1` on a HIT. Measured as `MISS sid=s1 / HIT sid=s1`.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const existing = event.req.headers.get("cookie");
+        return new Response(existing ?? "anonymous", {
+          headers: { "set-cookie": `sid=s${callCount}; Path=/; HttpOnly` },
+        });
+      },
+      { maxAge: 10, swr: false, allowCookies: ["sid"] },
+    );
+
+    // Visitor A: no cookie yet -> MISS.
+    const a = (await handler(makeEvent(path))) as Response;
+    // Visitor B: also no cookie, so the very same cache key -> HIT.
+    const b = (await handler(makeEvent(path))) as Response;
+
+    expect(callCount).toBe(1);
+    expect(a.headers.get("set-cookie")).toBeNull();
+    expect(b.headers.get("set-cookie")).toBeNull();
+    // And nothing was stored that a later hit could replay.
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const stored = (await testStorage.get(key!)) as { value: { headers: Record<string, string> } };
+    expect(stored.value.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("allowCookies still keys on and forwards the cookie it no longer returns", async () => {
+    // The two directions are decoupled: the allowlisted cookie is fully live on the
+    // request side (visible to the handler, part of the key) while its Set-Cookie
+    // counterpart is unconditionally dropped.
+    const seen: (string | null)[] = [];
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`, {
+          headers: { "set-cookie": "theme=dark; Path=/" },
+        });
+      },
+      { maxAge: 10, swr: false, allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=secret; theme=dark" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light" } }),
+    )) as Response;
+    const darkAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=other" } }),
+    )) as Response;
+
+    // Request side, unchanged: only `theme` reaches the handler, and it varies the key.
+    expect(seen).toEqual(["theme=dark", "theme=light"]);
+    expect(callCount).toBe(2);
+    expect(await darkAgain.text()).toBe("call-1");
+    // Response side: no Set-Cookie, on the misses or the hit.
+    expect(dark.headers.get("set-cookie")).toBeNull();
+    expect(light.headers.get("set-cookie")).toBeNull();
+    expect(darkAgain.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("passes Set-Cookie through untouched on a bypassed (non-GET/HEAD) request", async () => {
+    // The documented escape hatch: mint per-request cookies from a route that never
+    // reaches the cache. A bypassed call skips `serialize` entirely, so the handler's
+    // live Response — Set-Cookie included — is returned as-is.
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        const headers = new Headers();
+        headers.append("set-cookie", "sid=minted; Path=/; HttpOnly");
+        headers.append("set-cookie", "csrf=token");
+        return new Response("ok", { headers });
+      },
+      { maxAge: 10, allowCookies: ["theme"] },
+    );
+
+    const res = (await handler(makeEvent(path, { method: "POST" }))) as Response;
+
+    expect(res.headers.getSetCookie()).toEqual(["sid=minted; Path=/; HttpOnly", "csrf=token"]);
+  });
+
+  it("rejects a stored entry carrying a Set-Cookie (defense-in-depth)", async () => {
+    // Entries written before the unconditional strip existed (e.g. by an older ocache
+    // that kept allowlisted cookies on the response), or by another writer sharing the
+    // storage, must not be replayed until expiry — `validate` rejects any stored
+    // Set-Cookie, allowlist or no allowlist.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, swr: false, allowCookies: ["theme"] },
+    );
+
+    // Seed a genuine entry (correct integrity/key), then poison it in place.
+    await handler(makeEvent(path));
+    expect(callCount).toBe(1);
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const stored = (await testStorage.get(key!)) as {
+      value: { headers: Record<string, string> };
+    };
+    stored.value.headers["set-cookie"] = "theme=dark; Path=/";
+    await testStorage.set(key!, stored);
+
+    const res = (await handler(makeEvent(path))) as Response;
+
+    // The poisoned entry is refused, so the handler runs again and its cookie-free
+    // response is served instead.
+    expect(callCount).toBe(2);
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(await res.text()).toBe("call-2");
+  });
+
+  it("strips Set-Cookie on runtimes without getSetCookie", async () => {
+    // Simulate an environment whose Headers lacks getSetCookie (older Node / polyfills).
+    // The strip is a bare `headers.delete("set-cookie")`, which drops every value
+    // everywhere, so it must not depend on being able to enumerate cookies individually.
     const original = Object.getOwnPropertyDescriptor(Headers.prototype, "getSetCookie");
     // @ts-expect-error - deliberately removing the method for this test
     delete Headers.prototype.getSetCookie;

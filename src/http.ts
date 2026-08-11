@@ -43,9 +43,10 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 ): CachedEventHandler<E> {
   opts = { ...defaultCacheOptions(), ...opts };
 
-  // Allowlist of cookie names that may participate in caching. `undefined` means
-  // "no cookies allowed": the Cookie request header is stripped before the handler
-  // runs, cookies never vary the key, and Set-Cookie responses are refused storage.
+  // Allowlist of cookie names that may participate in caching — the *request* side only.
+  // `undefined` means "no cookies allowed": the Cookie request header is stripped before
+  // the handler runs and cookies never vary the key. The response side is not negotiable:
+  // no Set-Cookie ever survives a cacheable route, allowlisted or not (see `serialize`).
   // Names are trimmed/deduped; an empty (or whitespace-only) list normalizes to the
   // "no cookies allowed" default.
   const _cookieNames = [
@@ -247,29 +248,28 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
         _appendVary(res.headers, variableHeaderNames);
       }
 
-      // Strip every Set-Cookie the allowlist doesn't cover BEFORE the headers are
-      // serialized, so a per-request cookie (e.g. a session id) can never reach a caller
-      // other than the one it was minted for — neither a future cache hit nor a
-      // concurrent, coalesced peer that shares this single resolution (issue #61). By
-      // default (no `allowCookies`) that drops every Set-Cookie: a shared cache must not
-      // carry per-client cookies, mirroring both the Cookie-request-header stripping on
-      // the way in and how CDNs / Varnish treat cacheable responses. The rest of the
-      // response is still cached. Prefer `getSetCookie()` so each cookie is inspected
-      // individually — `Object.fromEntries(headers.entries())` below collapses multiples
-      // to one. On runtimes without it we can't tell which cookies are present, so strip
-      // all of them (fail safe) rather than risk replaying one.
-      if (typeof res.headers.getSetCookie === "function") {
-        const setCookies = res.headers.getSetCookie();
-        const kept = setCookies.filter((c) => allowedCookieNames?.includes(_cookieName(c)));
-        if (kept.length !== setCookies.length) {
-          res.headers.delete("set-cookie");
-          for (const c of kept) {
-            res.headers.append("set-cookie", c);
-          }
-        }
-      } else if (res.headers.has("set-cookie")) {
-        res.headers.delete("set-cookie");
-      }
+      // Strip EVERY Set-Cookie — allowlisted or not — BEFORE the headers are serialized.
+      // A cacheable response is a shared object: it is replayed to every later hit on the
+      // same key and to every concurrent peer coalesced onto this one resolution, so a
+      // cookie minted here reaches callers it was never minted for (issue #61: the
+      // leader's session id handed to every deduplicated peer). `allowCookies` used to
+      // except its own names from this strip, which reintroduced that exact leak one
+      // opt-in later — a handler minting `sid` on first visit stores the response under
+      // the *no-sid* key with `Set-Cookie: sid=s1` attached, so every subsequent
+      // first-time visitor keys the same and is served `sid=s1`: session fixation, and a
+      // broad rule set like `"/**": { swr: 60 }` puts every cookie-setting route in that
+      // position (h3#1524 audit, finding #15c). The more permissive alternative — refuse
+      // to *store* a response that mints a cookie, rather than stripping it — cannot close
+      // the concurrent-peer case at all, since coalesced callers share one resolution and
+      // are indistinguishable from each other. So the rule is uniform and statable in one
+      // sentence: no Set-Cookie survives a cacheable route, in either the served or the
+      // stored response. `allowCookies` governs the request side only. The rest of the
+      // response is still cached (mirroring how CDNs / Varnish drop Set-Cookie on
+      // cacheable responses); a handler that must mint a cookie serves it from a
+      // non-GET/HEAD route, which bypasses the cache and passes through untouched.
+      // A bare `delete` drops every value on every runtime, so the `getSetCookie()`
+      // capability dance the old per-cookie filter needed is gone with the filter.
+      res.headers.delete("set-cookie");
 
       // Strip transport headers before storing. The body has already been fully read and
       // decoded into `bytes`, so a stored `content-encoding` (e.g. `gzip`) would describe
@@ -330,15 +330,16 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       if (_forbidsSharedCaching(value.headers?.["cache-control"])) {
         return false;
       }
-      // Defense-in-depth for entries this version didn't write (e.g. cached before the
-      // Set-Cookie stripping in `serialize` existed, or by another writer sharing the
-      // storage): reject a stored Set-Cookie outside the allowlist instead of replaying
-      // it until expiry. Entries written by this version never carry a disallowed
-      // Set-Cookie — `serialize` strips them before storage — so this only guards
-      // pre-existing/foreign entries. Serialized headers collapse multiple Set-Cookie
-      // values to the last, so the check is partial; the lossless guard is the strip.
-      const _setCookie = value.headers?.["set-cookie"];
-      if (_setCookie && !allowedCookieNames?.includes(_cookieName(_setCookie))) {
+      // Defense-in-depth for entries this version didn't write: cached before the
+      // Set-Cookie stripping in `serialize` existed, by an older ocache that still kept
+      // allowlisted cookies on the response (h3#1524 audit, finding #15c), or by another
+      // writer sharing the storage. Reject *any* stored Set-Cookie rather than replay it
+      // to strangers until expiry — the allowlist has no say here, matching the
+      // unconditional strip in `serialize`, so entries written by this version can never
+      // trip it. Serialized headers collapse multiple Set-Cookie values to the last, so
+      // this sees only one of them; presence alone is enough to reject, and the lossless
+      // guard is the strip.
+      if (value.headers?.["set-cookie"]) {
         return false;
       }
       if (value.status >= 400) {
@@ -659,12 +660,6 @@ function _filterCookie(header: string | null | undefined, names: string[]): stri
     a[0] === b[0] ? (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) : a[0] < b[0] ? -1 : 1,
   );
   return kept.map(([n, v]) => `${n}=${v}`).join("; ");
-}
-
-/** Extracts the cookie name from a `Set-Cookie` header value (the token before the first `=`). */
-function _cookieName(setCookie: string): string {
-  const eq = setCookie.indexOf("=");
-  return (eq < 0 ? setCookie.split(";")[0]! : setCookie.slice(0, eq)).trim();
 }
 
 /**

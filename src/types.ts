@@ -286,35 +286,30 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
   allowQuery?: string[] | readonly string[];
 
   /**
-   * Allowlist of cookie names that participate in caching.
+   * Allowlist of `Cookie` **request** header names that participate in caching.
    *
-   * **By default no cookies are allowed** (secure default), in both directions:
-   * - the `Cookie` request header is stripped before the handler runs and never
-   *   varies the cache key, so a handler cannot produce cookie-dependent output
-   *   that leaks across users, and
-   * - any `Set-Cookie` the handler sets is stripped from the response before it is
-   *   cached or returned (mirroring how shared caches / CDNs drop `Set-Cookie` on
-   *   cacheable responses), so a per-request cookie such as a session id can never
-   *   reach another user — whether via a later cache hit or a concurrent, coalesced
-   *   caller sharing the single resolution. The rest of the response is still cached.
+   * **By default no cookies are allowed** (secure default): the `Cookie` header is
+   * stripped before the handler runs and never varies the cache key, so a handler
+   * cannot produce cookie-dependent output that then leaks across users.
    *
-   * When set, only the listed cookies are kept: their name/value pairs vary the
-   * cache key (sorted, order-independent — like {@link allowQuery}) and survive in
-   * the `Cookie` header the handler sees; on the response, non-allowlisted
-   * `Set-Cookie`s are stripped and the rest is still cached. Case-sensitive.
+   * When set, only the listed cookies survive in the `Cookie` header the handler sees,
+   * and their name/value pairs vary the cache key (sorted, order-independent — like
+   * {@link allowQuery}). Case-sensitive. Allowlist a cookie whose value legitimately
+   * selects a *representation* — a `theme`/`locale` preference that becomes part of the
+   * key — not a per-user secret: everyone presenting the same value shares one entry.
    *
-   * ⚠️ An allowlisted cookie **participates in caching** — its value is shared
-   * across every caller that resolves to the same cache key (concurrent requests are
-   * coalesced into one handler call, and the cached `Set-Cookie` is replayed to later
-   * hits). It is the caller's responsibility to only allowlist cookies whose value is
-   * safe to share across those users — a `theme`/`locale` preference that is *part
-   * of* the key, never a per-user secret. To cache a handler that mints a per-request
-   * cookie, give it a user-specific `getKey`/`varies` so each user keys to a distinct
-   * entry (or don't cache it).
+   * **This option has no effect on the response.** No `Set-Cookie` ever survives a
+   * cacheable response, allowlisted or not: it is stripped before the entry is stored
+   * *and* before the response is returned, mirroring how shared caches / CDNs drop
+   * `Set-Cookie` on cacheable responses. A cached response is shared with every later
+   * hit on its key and with concurrent callers coalesced onto one handler call, so a
+   * cookie minted inside it would reach callers it was never minted for. The rest of
+   * the response is still cached.
    *
-   * Only cacheable requests (`GET`/`HEAD`) are affected: methods that bypass
-   * caching (e.g. `POST`) reach the handler with their request untouched and their
-   * `Set-Cookie` passed through.
+   * To mint a per-request cookie (a session id, a CSRF token), serve it from a request
+   * that bypasses the cache: only `GET`/`HEAD` are cacheable, so a `POST` (or any route
+   * excluded via `shouldBypassCache`) reaches the handler untouched and returns its
+   * `Set-Cookie` unchanged.
    *
    * Supersedes `varies: ["cookie"]` (which hashes the entire raw `Cookie` header).
    */
