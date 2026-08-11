@@ -174,6 +174,12 @@ reaches the handler untouched and its response passes straight through. Of the
 responses, only `200`, `203`, `301` and `308` are stored — and a status that isn't
 stored is never advertised with a synthesized `Cache-Control` either.
 
+A response that opts itself out is returned to the caller but never stored:
+`Cache-Control: no-store`, `private`, `no-cache`, a zero shared lifetime (`s-maxage` if
+present, else `max-age`), or `Vary: *`. `must-revalidate` is not an opt-out — such a
+response is stored and served fresh, but never served stale (it revalidates in the
+foreground once expired).
+
 **Parameters:**
 
 - **`handler`** — The event handler to cache.

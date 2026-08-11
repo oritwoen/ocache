@@ -379,8 +379,9 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * served from cache (SWR, `etag`, and `last-modified` all still apply), but no
    * `Cache-Control` header is emitted to clients/CDNs. This decouples internal
    * storage caching from downstream cache advertisement — unlike setting
-   * `Cache-Control: no-store`/`private` on the response, which also disqualifies
-   * the entry from storage via the built-in `validate` checks.
+   * `Cache-Control: no-store`/`private`/`no-cache`/`max-age=0` on the response,
+   * all of which also disqualify the entry from storage via the built-in
+   * `validate` checks.
    *
    * Only governs ocache's own synthesis: a `Cache-Control` the handler set
    * explicitly is left untouched (as always) and still sent.
@@ -424,8 +425,9 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    *
    * Runs *after* — and in addition to — the built-in response validation, which
    * always applies and cannot be bypassed (only `200`, `203`, `301` and `308`
-   * responses are storable at all; it also rejects `Cache-Control:
-   * no-store`/`private`, missing bodies, and absent
+   * responses are storable at all; it also rejects the response-side opt-outs
+   * `Cache-Control: no-store`/`private`/`no-cache`/`max-age=0`/`s-maxage=0` and
+   * `Vary: *`, missing bodies, and absent
    * `etag`/`last-modified`). Return `false` (or a Promise resolving to `false`)
    * to treat the response as non-cacheable; it is still returned to the caller,
    * just not stored. Receives the serialized response entry.

@@ -2184,6 +2184,316 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
+  // Response-side Cache-Control is *the* documented way for a handler to opt a response out
+  // of the cache, but only `no-store`/`private` (the two tests above) were ever recognized.
+  // `no-cache` and `max-age=0`/`s-maxage=0` — the commonest ways a developer writes "don't
+  // reuse this" — were stored and replayed while the directive was faithfully echoed to the
+  // client, i.e. the response advertised non-reusability while ocache was already sharing it.
+  describe("response Cache-Control opt-outs", () => {
+    /** Runs the same request twice and reports what the handler and the cache did. */
+    async function twice(cacheControl: string | undefined, opts: any = { maxAge: 10 }) {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: cacheControl ? { "cache-control": cacheControl } : undefined,
+        });
+      }, opts);
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+      return {
+        callCount,
+        first: { body: await r1.text(), status: r1.headers.get("x-cache") },
+        second: { body: await r2.text(), status: r2.headers.get("x-cache") },
+        cacheControl: r2.headers.get("cache-control"),
+      };
+    }
+
+    it("does not cache a response with Cache-Control: no-cache", async () => {
+      const result = await twice("no-cache");
+      // Rejected outright (see the TODO in `_cacheControlForbidsReuse` for the
+      // store-and-always-revalidate alternative): the handler runs on every request.
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      // Still returned to the caller, directive intact.
+      expect(result.second.body).toBe("v2");
+      expect(result.cacheControl).toBe("no-cache");
+    });
+
+    it("does not cache a response with Cache-Control: max-age=0", async () => {
+      const result = await twice("max-age=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.second.body).toBe("v2");
+    });
+
+    it("does not cache a response with Cache-Control: s-maxage=0", async () => {
+      const result = await twice("public, s-maxage=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("does not cache the common no-cache, max-age=0, must-revalidate combination", async () => {
+      const result = await twice("no-cache, max-age=0, must-revalidate");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it('rejects the qualified no-cache="field" form too', async () => {
+      // RFC 9111 §5.2.2.4 scopes the qualified form to the named fields, but ocache replays
+      // a stored response's headers verbatim, so honoring it would mean stripping those
+      // fields on every reuse. Rejecting is the fail-safe reading. Also a parser check: the
+      // comma inside the quoted value must not be read as a directive separator.
+      const result = await twice('no-cache="set-cookie, x-user"');
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("still caches a response with Cache-Control: max-age=600", async () => {
+      const result = await twice("public, max-age=600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+    });
+
+    it("does not read max-age=0600 as a zero lifetime", async () => {
+      // Leading zeros are digits, not octal: `delta-seconds` here is 600. A substring or
+      // prefix match on `max-age=0` would reject this.
+      const result = await twice("public, max-age=0600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("caches max-age=0, s-maxage=600 — s-maxage governs for a shared cache", async () => {
+      // The canonical "browsers revalidate, the shared cache keeps it" idiom. `s-maxage`
+      // overrides `max-age` for a shared cache (RFC 9111 §5.2.2.10) and ocache is one, so
+      // this is a request *to* be stored. Rejecting on the first zero of either directive
+      // refused it outright.
+      const result = await twice("public, max-age=0, s-maxage=600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+    });
+
+    it("caches s-maxage=600, max-age=0 too — order does not decide it", async () => {
+      const result = await twice("public, s-maxage=600, max-age=0");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("still rejects s-maxage=0, max-age=600 (s-maxage governs both ways)", async () => {
+      // Precedence, not "ignore a zero when the other directive is positive": with
+      // `s-maxage` present it alone decides, so a zero there is an opt-out however large
+      // `max-age` is.
+      const result = await twice("public, s-maxage=0, max-age=600");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("falls back to max-age when s-maxage is malformed", async () => {
+      // An unparseable `delta-seconds` states nothing (RFC 9111 §5.2), so it must not
+      // silently disable the zero-lifetime check by "being present".
+      const result = await twice("public, s-maxage=oops, max-age=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("does not reject on a zero in another directive's value", async () => {
+      const result = await twice("public, max-age=600, stale-while-revalidate=0");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("caches normally when the response has no Cache-Control at all", async () => {
+      const result = await twice(undefined);
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+      // ocache synthesizes its own lifetime when the handler didn't set one.
+      expect(result.cacheControl).toBe("max-age=10");
+    });
+
+    it("never stores a response with Vary: * — and never advertises one either", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`v${callCount}`, { headers: { vary: "*" } });
+        },
+        { maxAge: 60, swr: true, staleMaxAge: 600, name: "vary-wildcard" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // `Vary: *` is the strongest "do not share this" signal short of `no-store`: no
+      // stored response may ever match such a request (RFC 9111 §4.1). ocache keeps one
+      // entry per key and does not key on the response's `Vary`, so it must not store it.
+      expect(callCount).toBe(2);
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+      expect(r1.headers.get("vary")).toBe("*");
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(keys[0]!)).toBeNull();
+
+      // And no synthesized lifetime: unlike every other opt-out, a `Vary: *` response
+      // carries no `Cache-Control` of its own, so the "don't clobber the handler's header"
+      // check does not suppress synthesis here — the gate has to name `Vary: *` itself.
+      // Without that it shipped `s-maxage=60, stale-while-revalidate=600` for a response the
+      // origin was going to be asked for every single time.
+      expect(r1.headers.get("cache-control")).toBeNull();
+      expect(r2.headers.get("cache-control")).toBeNull();
+    });
+
+    it.each(["no-store", "private", "no-cache"])(
+      "does not synthesize a lifetime alongside an explicit %s",
+      async (directive) => {
+        // The other `validate` rejections need no gate of their own precisely because they
+        // are spelled in a `Cache-Control` the handler set — and we never clobber one, so
+        // synthesis is already suppressed. This locks that reasoning in: if the
+        // "preserve if present" rule ever changed, these would start advertising
+        // `s-maxage`/`stale-while-revalidate` for responses that are never stored.
+        const result = await twice(directive, { maxAge: 60, swr: true, staleMaxAge: 600 });
+        expect(result.callCount).toBe(2);
+        expect(result.second.status).toBe("MISS");
+        expect(result.cacheControl).toBe(directive);
+      },
+    );
+
+    it("stores a response with Cache-Control: must-revalidate (not an opt-out)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        { maxAge: 10, swr: true, staleMaxAge: 600, name: "must-revalidate-store" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // `must-revalidate` constrains *stale* serving, not storage — a fresh entry is a
+      // normal HIT.
+      expect(await r1.text()).toBe("v1");
+      expect(await r2.text()).toBe("v1");
+      expect(callCount).toBe(1);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+
+      // Expressed as a per-entry `staleMaxAge: 0` (the mechanism that disables the SWR
+      // window for this entry alone), persisted alongside the value.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      const entry = (await testStorage.get(keys[0]!)) as any;
+      expect(entry.staleMaxAge).toBe(0);
+      expect(entry.value.body).toBe("v1");
+    });
+
+    it("never serves a stale must-revalidate entry, revalidating in the foreground", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          // A slow resolver: under SWR a stale entry would be returned immediately (as the
+          // sibling test below shows), so a fresh body here proves the foreground path.
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        { maxAge: 0.02, swr: true, staleMaxAge: 10, name: "must-revalidate-stale" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(await r1.text()).toBe("v1");
+      expect(callCount).toBe(1);
+
+      // Past maxAge but well inside the configured 10s stale window.
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(callCount).toBe(2);
+      // The caller waited for the revalidated response instead of getting the stale one.
+      expect(await r2.text()).toBe("v2");
+      expect(r2.headers.get("x-cache")).not.toBe("STALE");
+    });
+
+    it("enforces must-revalidate even when the caller's getMaxAge throws", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const onError = vi.fn();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        {
+          maxAge: 0.02,
+          swr: true,
+          staleMaxAge: 10,
+          name: "must-revalidate-throwing-getmaxage",
+          getMaxAge: () => {
+            throw new Error("boom");
+          },
+          onError,
+        },
+      );
+
+      expect(await ((await handler(makeEvent(path))) as Response).text()).toBe("v1");
+
+      // ocache's own `staleMaxAge: 0` is computed independently of the caller's hook. With
+      // the caller's call awaited unguarded, `cache.ts` caught the throw and left *both*
+      // values undefined, taking the `must-revalidate` override down with it.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(((await testStorage.get(keys[0]!)) as any).staleMaxAge).toBe(0);
+
+      // Reported, not swallowed — through the same `onError` channel `cache.ts` uses for
+      // this hook, and exactly once.
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError.mock.calls[0]![0]).toBeInstanceOf(Error);
+
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r2.text()).toBe("v2");
+      expect(r2.headers.get("x-cache")).not.toBe("STALE");
+    });
+
+    it("serves stale within the window without must-revalidate (contrast)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60" },
+          });
+        },
+        { maxAge: 0.02, swr: true, staleMaxAge: 10, name: "no-must-revalidate-stale" },
+      );
+
+      expect(await ((await handler(makeEvent(path))) as Response).text()).toBe("v1");
+
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // Same setup minus `must-revalidate`: the stale body is served immediately while the
+      // refresh runs in the background.
+      expect(await r2.text()).toBe("v1");
+      expect(r2.headers.get("x-cache")).toBe("STALE");
+    });
+  });
+
   it("does not cache responses rejected by shouldCache", async () => {
     let callCount = 0;
     const path = uniquePath();
@@ -3839,9 +4149,49 @@ describe("defineCachedHandler", () => {
     expect(cc).toContain("stale-while-revalidate=0");
   });
 
-  it("no cache-control when no maxAge and no swr", async () => {
+  it("sets max-age=0 when maxAge: 0 and no swr (same rule as the swr branch)", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), { maxAge: 0, swr: false });
+
+    // The two synthesis branches treat `maxAge` identically: present (`0` included) is
+    // advertised, absent is not. This one used to emit nothing while the swr branch above
+    // emitted `s-maxage=0` for the very same option. See the storage consequence below.
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.headers.get("cache-control")).toBe("max-age=0");
+  });
+
+  it("does not store a maxAge: 0 response (its own zero lifetime is an opt-out)", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 0, swr: false },
+    );
+
+    await handler(makeEvent(path));
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // `validate` reads the synthesized `max-age=0` exactly as it reads a hand-written one,
+    // so a zero lifetime keeps the response out of storage on both branches now (it already
+    // did under `swr`, via `s-maxage=0`). The handler ran on every request before this too —
+    // the entry it used to write was already expired when written — so what changed is that
+    // there is no longer a dead entry in storage, not how often the origin is asked.
+    expect(callCount).toBe(2);
+    expect(await r2.text()).toBe("v2");
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("no cache-control when maxAge is absent and no swr", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: undefined,
+      swr: false,
+    });
 
     const res = (await handler(makeEvent(path))) as Response;
     expect(res.headers.get("cache-control")).toBeNull();

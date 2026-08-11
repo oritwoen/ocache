@@ -28,8 +28,16 @@ import { rolldown } from "rolldown";
 // Ceilings, not targets: they exist to catch an accidental blow-up (a fat dependency, a
 // tree-shaking regression), so they sit comfortably above the current numbers. Tighten
 // them when a deliberate size win lands.
+//
+// `raw` keeps every JSDoc block (rolldown drops `//` line comments but not `/** */`), so it
+// is part size and part prose budget — this codebase documents its decisions in-place, and a
+// documented internal helper costs `raw` far more than it costs a consumer (the response-side
+// `Cache-Control` opt-out fix: ~7 kB raw for ~1.1 kB min / ~0.4 kB gzip, most of it the RFC
+// rationale on the new `Cache-Control`/`Vary` predicates). The numbers that describe what is
+// actually downloaded are `min`/`minGzip`; keep those tight and let `raw` follow — 48_000
+// left it at 99% used, which is a tripwire on the next JSDoc paragraph, not a ceiling.
 const BUDGETS = {
-  raw: 46_000,
+  raw: 50_000,
   min: 21_000,
   minGzip: 8500,
 } as const;

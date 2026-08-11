@@ -42,6 +42,12 @@ function defaultCacheOptions() {
  * responses, only `200`, `203`, `301` and `308` are stored — and a status that isn't
  * stored is never advertised with a synthesized `Cache-Control` either.
  *
+ * A response that opts itself out is returned to the caller but never stored:
+ * `Cache-Control: no-store`, `private`, `no-cache`, a zero shared lifetime (`s-maxage` if
+ * present, else `max-age`), or `Vary: *`. `must-revalidate` is not an opt-out — such a
+ * response is stored and served fresh, but never served stale (it revalidates in the
+ * foreground once expired).
+ *
  * @param handler - The event handler to cache.
  * @param opts - Cache and HTTP-specific configuration options.
  * @returns A new event handler that serves cached responses when available. The handler
@@ -274,6 +280,57 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
           };
         }
       : undefined,
+    // Per-entry lifetime. Wraps the caller's `getMaxAge` (which still owns the numbers) to
+    // honor `Cache-Control: must-revalidate` on the response the handler just returned.
+    //
+    // `must-revalidate` is NOT a storage opt-out — RFC 9111 §5.2.2.2 constrains *stale*
+    // serving, not storage — so it deliberately does not reject in `validate`; the entry is
+    // stored and served fresh as before. What it forbids is reusing an *expired* entry
+    // without revalidating, which is exactly what SWR does. So it is expressed as a
+    // per-entry `staleMaxAge: 0`, persisted by the same `cache.ts` machinery that already
+    // persists the `getMaxAge` numbers: there, `readStaleMaxAge = 0` makes `staleTtl = 0`
+    // and hence `swr = false` for this entry alone — fresh reads still HIT, an expired one
+    // is re-resolved in the *foreground* and the caller gets the revalidated response.
+    //
+    // Chosen over a new `CacheEntry.mustRevalidate` flag: "no stale window" is already
+    // precisely what `staleMaxAge: 0` means, so this needs no new field, no `cache.ts`
+    // change and no second concept, and it flows through the storage-TTL and `expireCache`
+    // math (both of which already prefer the per-entry value) for free — each of which a
+    // flag would have to be taught separately.
+    //
+    // Only `must-revalidate` is read here; `proxy-revalidate`, its shared-cache
+    // counterpart, belongs in the same place but is left to a separate change.
+    //
+    // Our own override is computed *first* and independently of the caller's hook, and the
+    // caller's call is isolated in its own `try`. `cache.ts` handles a throwing `getMaxAge`
+    // by reporting it and leaving both values `undefined` — so with the caller's hook
+    // wrapped naively (awaited first, uncaught), one throwing caller hook took ocache's own
+    // `staleMaxAge: 0` down with it and the entry was served STALE, which is precisely what
+    // `must-revalidate` forbids. A throw must degrade to "no *caller* override", never to
+    // "no override at all". Reported through the same `onError`/`console.error` shape
+    // `cache.ts` uses for this hook, so the failure is never silent (and only once — the
+    // error does not propagate to `cache.ts`'s own catch).
+    getMaxAge: async (entry) => {
+      const res = entry.value;
+      // Headers only — the body is read exactly once, by `serialize`, which runs after this.
+      const override =
+        res instanceof Response && _requiresRevalidation(res.headers.get("cache-control"))
+          ? { staleMaxAge: 0 }
+          : undefined;
+      let dynamic: { maxAge?: number; staleMaxAge?: number } | undefined;
+      try {
+        const resolved = await opts.getMaxAge?.(entry);
+        // Normalize the caller's shorthand so the override below can merge with it.
+        dynamic = typeof resolved === "number" ? { maxAge: resolved } : resolved;
+      } catch (error) {
+        if (opts.onError) {
+          opts.onError(error);
+        } else {
+          console.error("[cache] getMaxAge hook error.", error);
+        }
+      }
+      return override ? { ...dynamic, ...override } : dynamic;
+    },
     // Write-side seam: consume the resolved `Response` body, synthesize the cache
     // headers, and build the storable `ResponseCacheEntry`. Runs exactly once per
     // resolution (shared across deduplicated callers), so `res.arrayBuffer()`'s one-shot
@@ -317,20 +374,43 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       // `s-maxage=60, stale-while-revalidate=600`, pinning the error at every shared cache
       // for 11 minutes, revalidating successfully the whole time — inverted on both sides.
       //
-      // Precisely what this does and does not claim: it is status-for-status identical with
-      // `validate`, not "synthesize only if `validate` passes". `validate` has four further
-      // rejections, none of which needs a gate here — an explicit `no-store`/`private`
-      // suppresses synthesis anyway (the `has("cache-control")` check above), a stored
-      // `set-cookie` is impossible by the time we get here (deleted below, and the `validate`
-      // arm is defense in depth for foreign entries), a missing body cannot occur on a value
-      // this hook just built, and the `shouldCache` hook is a caller's own storage policy,
-      // deliberately not a way to change what we advertise.
+      // `Vary: *` is gated for exactly the same reason, on the other header `validate`
+      // reads: such a response is never stored either, so advertising
+      // `s-maxage=60, stale-while-revalidate=600` on it published a shared lifetime for a
+      // response the origin was going to be asked for every single time — the same
+      // advertised-but-not-stored inversion as the status gate, one header over.
+      //
+      // Precisely what this does and does not claim: it covers the two `validate` rejections
+      // that a *fresh* response can trip and that carry no `Cache-Control` of their own —
+      // status and `Vary: *` — and it is not "synthesize only if `validate` passes".
+      // `validate`'s remaining rejections split three ways. Structurally impossible here: an
+      // explicit `no-store`/`private`/`no-cache`/zero-lifetime `Cache-Control` already
+      // suppresses synthesis via the `has("cache-control")` check below (it is the handler's
+      // own header, and we never clobber one), a stored `set-cookie` cannot exist by the time
+      // we get here (deleted below, and that `validate` arm is defense in depth for foreign
+      // entries), and a missing body cannot occur on a value this hook just built.
+      // Deliberately *not* gated: `shouldCache`. It is the caller's own storage policy, and
+      // "ocache doesn't keep this, but a CDN may" is a legitimate configuration — the inverse
+      // knob, `sendCacheControl: false`, is "ocache keeps this, but nobody downstream may".
+      // So this is the one arm where the advertisement and the storage decision are allowed
+      // to disagree, by the caller's explicit choice; every other disagreement is a bug.
       if (
         opts.sendCacheControl !== false &&
         _isCacheableStatus(res.status) &&
+        !_hasVaryWildcard(res.headers.get("vary")) &&
         !res.headers.has("cache-control")
       ) {
         const cacheControl = [];
+        // Both branches treat `maxAge` identically — present (including `0`) is advertised,
+        // absent is not. They used to disagree (`!= null` under SWR, truthy without it), so
+        // `{ swr: true, maxAge: 0 }` shipped `s-maxage=0` while `{ maxAge: 0 }` shipped
+        // nothing. A zero lifetime is a real thing to say, and saying it consistently also
+        // means `validate` reads the same opt-out out of our synthesized header as it does
+        // out of a hand-written one: `maxAge: 0` now keeps the response out of storage on
+        // both paths, instead of only under SWR. That is what a zero lifetime *means*
+        // (`cache.ts` clamps `<= 0` to "re-resolve on every access"), and it narrows what is
+        // stored rather than widening it — the entry it replaces was written already expired,
+        // so the handler ran on every request either way.
         if (opts.swr) {
           if (opts.maxAge != null) {
             cacheControl.push(`s-maxage=${opts.maxAge}`);
@@ -340,7 +420,7 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
           } else {
             cacheControl.push("stale-while-revalidate");
           }
-        } else if (opts.maxAge) {
+        } else if (opts.maxAge != null) {
           // For non-SWR, set max-age directly
           cacheControl.push(`max-age=${opts.maxAge}`);
         }
@@ -438,8 +518,10 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       if (!value) {
         return false;
       }
-      // Honor an explicit `Cache-Control: no-store` / `private` on the response — never cache it.
-      if (_forbidsSharedCaching(value.headers?.["cache-control"])) {
+      // Honor an explicit response-side opt-out — `Cache-Control: no-store` / `private` /
+      // `no-cache` / a zero shared lifetime (`s-maxage` if present, else `max-age`), or
+      // `Vary: *`. Never cache those.
+      if (_forbidsSharedCaching(value.headers)) {
         return false;
       }
       // Defense-in-depth for entries this version didn't write: cached before the
@@ -774,10 +856,13 @@ const _transportHeaders = [
 // became acceptable and no existing entry is invalidated by the change.
 const _cacheableStatuses = new Set([200, 203, 301, 308]);
 
-// The single source of truth for "may this response be stored?", consulted by `validate`
-// (storage) *and* by `serialize` (whether to advertise a synthesized lifetime). One predicate
-// on purpose: an advertised lifetime that outlives what ocache will actually store is the
-// exact defect this closes, so the two must be structurally incapable of disagreeing.
+// The single source of truth for "may this response be stored?" *on the status axis*,
+// consulted by `validate` (storage) *and* by `serialize` (whether to advertise a synthesized
+// lifetime). One predicate on purpose: an advertised lifetime that outlives what ocache will
+// actually store is the exact defect this closes, so on this axis the two are structurally
+// incapable of disagreeing. Status is not the only axis `validate` rejects on — see the gate
+// in `serialize` for how each of the others is covered (or, for `shouldCache`, deliberately
+// not).
 function _isCacheableStatus(status: number): boolean {
   return _cacheableStatuses.has(status);
 }
@@ -905,12 +990,14 @@ function _filterCookie(header: string | null | undefined, names: string[]): stri
 /**
  * Merges `names` into the response's `Vary` header, preserving any header names the
  * handler already declared and deduplicating case-insensitively. A wildcard
- * (`Vary: *`) is left untouched since it already varies on everything.
+ * (`Vary: *`) is left untouched since it already varies on everything — and since such a
+ * response is refused by `validate` anyway (see `_forbidsSharedCaching`), so what is
+ * preserved here is only what the direct caller is served.
  */
 function _appendVary(headers: Headers, names: string[]): void {
   const existing = headers.get("vary");
   // A `*` token means the response varies on everything — nothing to add.
-  if (existing && existing.split(",").some((part) => part.trim() === "*")) {
+  if (_hasVaryWildcard(existing)) {
     return;
   }
   const seen = new Set<string>();
@@ -936,17 +1023,195 @@ function _appendVary(headers: Headers, names: string[]): void {
 }
 
 /**
- * Whether a `Cache-Control` header value explicitly forbids storing the response in a
- * shared cache — `no-store` (never store anywhere) or `private` (not in a shared cache).
+ * Whether a response explicitly forbids being stored in — and reused from — a shared
+ * cache, i.e. an opt-out the handler wrote by hand.
+ *
+ * Takes the whole (serialized) header set rather than one header value, because the answer
+ * is spelled in **two** different headers; pretending otherwise would mean a misnamed
+ * `cacheControl` parameter or a `Vary` check hidden where it doesn't belong.
+ *
+ * - `Cache-Control` — see {@link _cacheControlForbidsReuse}.
+ * - `Vary: *` — the strongest "do not share this" signal short of `no-store` (RFC 9111
+ *   §4.1: a `*` variant never matches a stored response, so nothing may be reused). ocache
+ *   stores one entry per key and does not key on the response's own `Vary` at all, so the
+ *   only honest handling is to refuse the entry. Narrower than the general "honor the
+ *   handler's `Vary`" problem: an entry whose `Vary` names a header outside
+ *   `varyHeaderNames` is still stored today, tracked separately.
  */
-function _forbidsSharedCaching(cacheControl: unknown): boolean {
+function _forbidsSharedCaching(headers: ResponseCacheEntry["headers"] | undefined): boolean {
+  if (!headers) {
+    return false;
+  }
+  const vary = headers.vary;
+  if (typeof vary === "string" && _hasVaryWildcard(vary)) {
+    return true;
+  }
+  return _cacheControlForbidsReuse(headers["cache-control"]);
+}
+
+/**
+ * Whether a `Vary` header value contains the `*` token, i.e. "this response varies on
+ * everything". Three callers, one expression: `_appendVary` (nothing to merge into it),
+ * `_forbidsSharedCaching` (never store it) and `serialize`'s synthesis gate (never
+ * advertise a lifetime for it). The first two had it written out twice already, which is
+ * how the third came to be missing — a `Vary: *` response carries no `Cache-Control` of
+ * its own, so it sailed past the `has("cache-control")` check and was advertised
+ * shared-cacheable while being refused storage.
+ */
+function _hasVaryWildcard(value: string | null | undefined): boolean {
+  return !!value && value.split(",").some((part) => part.trim() === "*");
+}
+
+/**
+ * Whether a `Cache-Control` header value forbids reusing the response from a shared cache:
+ *
+ * - `no-store` — never store anywhere.
+ * - `private` — not in a shared cache. The qualified `private="field"` form technically
+ *   scopes the ban to those fields, but ocache replays a stored response's headers
+ *   verbatim, so it is rejected like the bare form (also the pre-existing behavior).
+ * - `no-cache` — rejected outright, see the TODO below.
+ * - a zero **shared** lifetime — the commonest way a developer writes "don't reuse this";
+ *   storing it meant the directive was faithfully echoed to the client while ocache was
+ *   already sharing the response with everyone else. Which directive states that lifetime
+ *   is not a matter of whichever comes first: `s-maxage` overrides `max-age` for a shared
+ *   cache (RFC 9111 §5.2.2.10) and ocache is one, so it governs whenever it is present and
+ *   `max-age` is ignored. Rejecting on the first zero of either broke the canonical
+ *   `public, max-age=0, s-maxage=600` idiom — "browsers revalidate, the shared cache keeps
+ *   it for 10 minutes" — which is a request *to* be stored, not an opt-out. Only a
+ *   parseable value counts (see {@link _deltaSeconds}), so a malformed `s-maxage` falls
+ *   through to `max-age` rather than silently disabling the check.
+ *
+ * `must-revalidate` is deliberately absent: it constrains stale serving, not storage, and
+ * is handled by the `getMaxAge` hook above (per-entry `staleMaxAge: 0`).
+ */
+function _cacheControlForbidsReuse(cacheControl: unknown): boolean {
   if (typeof cacheControl !== "string" || !cacheControl) {
     return false;
   }
-  return cacheControl.split(",").some((directive) => {
-    const name = directive.trim().split("=")[0]!.toLowerCase();
-    return name === "no-store" || name === "private";
-  });
+  // Collected, not decided, inside the loop: the lifetime verdict depends on which
+  // directives are present *together*, so it cannot be reached one directive at a time. The
+  // unconditional bans below still short-circuit — nothing later can un-ban them. A repeated
+  // directive keeps its first parseable value; duplicates are malformed either way, and this
+  // at least makes the result independent of how far the loop got.
+  let maxAge: number | undefined;
+  let sMaxAge: number | undefined;
+  for (const [name, value] of _cacheControlDirectives(cacheControl)) {
+    switch (name) {
+      case "no-store":
+      case "private": {
+        return true;
+      }
+      // TODO: RFC 9111 §5.2.2.4 actually permits storing a `no-cache` response, as long as
+      // it is revalidated with the origin before *every* reuse — which would keep SWR's
+      // `staleMaxAge` window meaningful (store with `maxAge: 0` so every read revalidates
+      // in the foreground, then serve on a 304). Deferred, not dismissed: ocache has no
+      // foreground-revalidation path at all today (no conditional request to the handler,
+      // no 304-refreshes-the-entry step), so that is genuinely new machinery rather than a
+      // change to this predicate, and "stored but always revalidated" buys nothing until it
+      // exists. Rejecting is the safe, honest interim: the response is still returned to
+      // the caller, just never reused.
+      case "no-cache": {
+        return true;
+      }
+      case "max-age": {
+        maxAge ??= _deltaSeconds(value);
+        break;
+      }
+      case "s-maxage": {
+        sMaxAge ??= _deltaSeconds(value);
+        break;
+      }
+    }
+  }
+  // The shared-cache lifetime: `s-maxage` when it says anything at all, `max-age` otherwise.
+  const shared = sMaxAge ?? maxAge;
+  return shared !== undefined && shared <= 0;
+}
+
+/**
+ * Splits a `Cache-Control` value into `[name, value]` pairs, lowercasing the names
+ * (directives are case-insensitive) and unquoting quoted values.
+ *
+ * Deliberately a parser and not `includes()` / a bare `split(",")`: a directive value may
+ * be a quoted string containing a comma (`no-cache="set-cookie, x-user"`), and a substring
+ * match confuses `max-age=0` with `max-age=0600`, `stale-while-revalidate=0` or a
+ * vendor-prefixed `x-no-cache`. The name must be matched as a whole token and the value
+ * parsed as a number, or the predicate above misfires in both directions.
+ */
+function _cacheControlDirectives(value: string): Array<[string, string | undefined]> {
+  const directives: Array<[string, string | undefined]> = [];
+  let token = "";
+  let quoted = false;
+  const flush = () => {
+    const directive = token.trim();
+    token = "";
+    if (!directive) {
+      return;
+    }
+    const eq = directive.indexOf("=");
+    const name = (eq < 0 ? directive : directive.slice(0, eq)).trim().toLowerCase();
+    if (!name) {
+      return;
+    }
+    let raw = eq < 0 ? undefined : directive.slice(eq + 1).trim();
+    if (raw !== undefined && raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+      raw = raw.slice(1, -1);
+    }
+    directives.push([name, raw]);
+  };
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i]!;
+    if (quoted) {
+      // A quoted-pair escapes the next character, including a closing quote.
+      if (char === "\\") {
+        token += char + (value[++i] ?? "");
+        continue;
+      }
+      if (char === '"') {
+        quoted = false;
+      }
+      token += char;
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      token += char;
+      continue;
+    }
+    if (char === ",") {
+      flush();
+      continue;
+    }
+    token += char;
+  }
+  flush();
+  return directives;
+}
+
+/**
+ * Parses a `delta-seconds` directive value (RFC 9111 §1.2.2: `1*DIGIT`), returning
+ * `undefined` for anything that isn't one — a valueless directive, an empty value, a
+ * float, junk — since a malformed directive states nothing we may act on (RFC 9111 §5.2:
+ * ignore what cannot be parsed). A leading `-` is accepted only so the malformed-but-common
+ * `max-age=-1` reads as "already expired" rather than as "no opinion". Leading zeros are
+ * digits, so `max-age=0600` is 600 seconds and not a zero lifetime.
+ */
+function _deltaSeconds(value: string | undefined): number | undefined {
+  if (value === undefined || !/^-?\d+$/.test(value)) {
+    return undefined;
+  }
+  return Number(value);
+}
+
+/**
+ * Whether a `Cache-Control` header value requires revalidation before a *stale* response
+ * is reused (`must-revalidate`). Not a storage opt-out — see the `getMaxAge` hook.
+ */
+function _requiresRevalidation(cacheControl: unknown): boolean {
+  if (typeof cacheControl !== "string" || !cacheControl) {
+    return false;
+  }
+  return _cacheControlDirectives(cacheControl).some(([name]) => name === "must-revalidate");
 }
 
 /**
