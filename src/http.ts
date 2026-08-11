@@ -479,6 +479,15 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
         if ((originalReq as any).runtime) {
           (event.req as any).runtime = (originalReq as any).runtime;
         }
+        // Inherit the runtime's background-task hook — *bound* to the original request,
+        // since a bare copy would run with the narrowed Request as its receiver (srvx and
+        // Cloudflare both implement it against the real request). Every background cache
+        // write, SWR refresh and eviction in `cache.ts` reads `event.req.waitUntil` *after*
+        // this swap, so dropping it makes all of them inert on exactly the runtimes that
+        // provide it: the isolate can be torn down before the write lands.
+        if (typeof originalReq.waitUntil === "function") {
+          event.req.waitUntil = originalReq.waitUntil.bind(originalReq);
+        }
         if (allowedQueryNames && event.url) {
           (event as any).url = new URL(_reqUrl);
         }

@@ -4529,3 +4529,111 @@ describe("getKey returning Object.prototype member names", () => {
     expect(calls).toBe(1);
   });
 });
+
+// Request narrowing swaps `event.req` for a plain `new Request(...)` and used to copy only
+// `runtime`, dropping `waitUntil`. Every background cache write, SWR refresh and eviction in
+// `cache.ts` reads `event.req.waitUntil` *after* that swap, so on the very runtimes that
+// provide it (Cloudflare Workers, srvx) none of them were ever handed to the runtime: the
+// isolate can be torn down before the write lands, making every request a MISS forever.
+// The copy must be *bound* to the original request — a bare copy loses the receiver.
+describe("waitUntil survives request narrowing", () => {
+  // The original request carries a cookie, which narrowing always strips (no `allowCookies`),
+  // so a receiver-dependent `waitUntil` can tell the original request from the narrowed one.
+  function makeWaitUntilEvent(path: string) {
+    const promises: Promise<unknown>[] = [];
+    const receivers: unknown[] = [];
+    const seenCookies: (string | null)[] = [];
+    const req = new Request(`http://localhost${path}`, { headers: { cookie: "sid=s1" } });
+    (req as any).waitUntil = function (this: Request, promise: Promise<unknown>) {
+      receivers.push(this);
+      seenCookies.push(this.headers.get("cookie"));
+      promises.push(promise);
+    };
+    return { event: { req } as HTTPEvent, req, promises, receivers, seenCookies };
+  }
+
+  it("registers exactly one waitUntil call for the cache write on a MISS", async () => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response("ok");
+      },
+      { maxAge: 10, name: "wuMiss" },
+    );
+
+    const { event, promises } = makeWaitUntilEvent("/wu-miss");
+    const r1 = (await handler(event)) as Response;
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(calls).toBe(1);
+    // The cache write — and nothing else — was handed to the runtime.
+    expect(promises).toHaveLength(1);
+
+    await Promise.all(promises);
+    const r2 = (await handler({ req: new Request("http://localhost/wu-miss") })) as Response;
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(calls).toBe(1);
+  });
+
+  it("registers the SWR background refresh on a stale read", async () => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`v${calls}`);
+      },
+      { maxAge: 0.01, swr: true, staleMaxAge: 10, name: "wuSwr" },
+    );
+
+    const first = makeWaitUntilEvent("/wu-swr");
+    await handler(first.event);
+    await Promise.all(first.promises);
+    expect(calls).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const second = makeWaitUntilEvent("/wu-swr");
+    const stale = (await handler(second.event)) as Response;
+    expect(stale.headers.get("x-cache")).toBe("STALE");
+    expect(await stale.text()).toBe("v1");
+    // The background revalidation was handed to the runtime instead of being left to run
+    // untracked (where the isolate would be free to die before it finishes).
+    expect(second.promises.length).toBeGreaterThanOrEqual(1);
+
+    await Promise.all(second.promises);
+    // The refresh's own cache write is registered too; drain it as the runtime would.
+    await Promise.all(second.promises);
+    expect(calls).toBe(2);
+  });
+
+  it("hands waitUntil to the resolver bound to the original request", async () => {
+    let seenInHandler: unknown;
+    const handler = defineCachedHandler(
+      (event: HTTPEvent) => {
+        seenInHandler = event.req.waitUntil;
+        return new Response("ok");
+      },
+      { maxAge: 10, name: "wuBound" },
+    );
+
+    const { event, req, promises, receivers, seenCookies } = makeWaitUntilEvent("/wu-bound");
+    await handler(event);
+
+    // The resolver ran against the narrowed request (cookie stripped) and still saw waitUntil.
+    expect(event.req).not.toBe(req);
+    expect(typeof seenInHandler).toBe("function");
+    expect(event.req.headers.get("cookie")).toBe(null);
+
+    // Bound: every call ran with the ORIGINAL request as `this`, so a receiver-dependent
+    // implementation still sees the real request. A bare copy would pass the narrowed one.
+    expect(receivers.length).toBeGreaterThan(0);
+    expect(receivers.every((r) => r === req)).toBe(true);
+    expect(seenCookies.every((c) => c === "sid=s1")).toBe(true);
+
+    // Still reachable and callable after the handler returned.
+    const later = Promise.resolve("later");
+    event.req.waitUntil!(later);
+    expect(promises.at(-1)).toBe(later);
+    expect(receivers.at(-1)).toBe(req);
+  });
+});

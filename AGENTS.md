@@ -92,7 +92,7 @@ Never touch contents inside `<!-- automd -->` in README.md. They are auto genera
 ## Design Decisions
 
 - No h3/srvx/unstorage dependency — fully standalone
-- `waitUntil` is typed as optional on `ServerRequest` (`event.req`) — runtime-specific (srvx ServerRequest, Cloudflare), accessed via `event?.req.waitUntil?.(promise)`
+- `waitUntil` is typed as optional on `ServerRequest` (`event.req`) — runtime-specific (srvx ServerRequest, Cloudflare), accessed via `event?.req.waitUntil?.(promise)`. `http.ts`'s request narrowing replaces `event.req` with a fresh `Request`, so it carries `waitUntil` over alongside `runtime`, **bound to the original request** (a bare copy would run with the narrowed `Request` as its receiver; srvx/Cloudflare implement it against the real one). All four `cache.ts` call sites — cache write, SWR background refresh, and both evictions — read `event.req.waitUntil` _after_ that swap, so dropping it made every background write inert on exactly the runtimes that provide it: the isolate can be torn down before the write lands, i.e. every request a MISS forever, with SWR refreshes and post-failure evictions cancelled the same way
 - `event.url` is optional — `http.ts` falls back to `new URL(event.req.url)`
 - Storage methods are `get`/`set` (not `getItem`/`setItem`)
 - `base` supports `string | string[]` — multi-tier: reads try each prefix in order (first hit wins), writes go to all prefixes
