@@ -271,6 +271,11 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    *
    * Varying headers stay visible to the handler: their value is part of the cache key,
    * so the handler can safely render from them (a per-value entry is stored for each).
+   * This includes the credential headers — listing `cookie` (with no {@link allowCookies})
+   * or `authorization` here is a **coarse opt-in**: the raw header composes the key *and*
+   * reaches the handler. The cost is one cached entry per distinct raw header value, which
+   * for `Cookie` is effectively per visitor; prefer {@link allowCookies}, which keys on and
+   * forwards a named subset instead.
    */
   varies?: string[] | readonly string[];
 
@@ -324,7 +329,10 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * excluded via `shouldBypassCache`) reaches the handler untouched and returns its
    * `Set-Cookie` unchanged.
    *
-   * Supersedes `varies: ["cookie"]` (which hashes the entire raw `Cookie` header).
+   * Supersedes `varies: ["cookie"]` — the coarse opt-in, which keys on *and* forwards the
+   * entire raw `Cookie` header (one entry per distinct header value). When both are set the
+   * allowlist wins in both directions: the key carries the subset hash, and the handler sees
+   * the filtered header, never the raw one.
    */
   allowCookies?: string[] | readonly string[];
 

@@ -80,11 +80,15 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   // varies by them. Conflating the two is what made an `allowCookies` route advertise
   // shared-cacheability it hadn't earned.
   //
-  // 1. Key composition (`_resolveKey`), plus handler visibility for the credential headers.
-  //    `allowCookies` supersedes `varies: ["cookie"]` here: the key already carries a
-  //    `cookie.<hash>` component over the *allowlisted subset*, so hashing the coarse raw
+  // 1. Key composition (`_resolveKey`), plus handler visibility for the credential *and*
+  //    cookie headers — one rule, stated once: a handler may read exactly what the key
+  //    covers. `allowCookies` supersedes `varies: ["cookie"]` here: the key already carries
+  //    a `cookie.<hash>` component over the *allowlisted subset*, so hashing the coarse raw
   //    header on top of it would re-admit exactly the unlisted cookies (analytics, A/B, a
-  //    session id) the allowlist exists to keep out of the key.
+  //    session id) the allowlist exists to keep out of the key. Absent an allowlist,
+  //    `cookie` staying in this list is a coarse opt-in: the raw header composes the key and
+  //    is forwarded untouched, exactly as `varies: ["authorization"]` already equals
+  //    `allowAuthorization: true`.
   const keyHeaderNames = allowedCookieNames
     ? _declaredHeaderNames.filter((h) => h !== "cookie")
     : _declaredHeaderNames;
@@ -436,13 +440,13 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     // the handler untouched (cookies, varied headers, full query, body — the rewritten
     // Request below carries no body).
     if (!_shouldBypassCache(event)) {
-      // Strip the credential headers the handler didn't opt into, and narrow the Cookie
-      // header to the allowlist, so the handler can't depend on credentials outside the
-      // cache key (mirrors allowQuery). Everything else — including the `varies` headers —
-      // is forwarded as-is: those values *are* in the cache key, so letting the handler
-      // read them is both safe and the whole point of declaring them (previously they were
-      // filtered out, so e.g. `varies: ["accept-language"]` keyed per language but every
-      // entry held the default rendering).
+      // Strip the credential headers and the cookies the handler didn't opt into, so it
+      // can't depend on anything outside the cache key (mirrors allowQuery). Everything
+      // else — including the `varies` headers — is forwarded as-is: those values *are* in
+      // the cache key, so letting the handler read them is both safe and the whole point of
+      // declaring them (previously they were filtered out, so e.g.
+      // `varies: ["accept-language"]` keyed per language but every entry held the default
+      // rendering).
       const filteredHeaders = [...event.req.headers.entries()].flatMap(([key, value]) => {
         const name = key.toLowerCase();
         // Not in `keyHeaderNames` (neither `allowAuthorization` nor `varies`) means the
@@ -455,7 +459,25 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
         if (name !== "cookie") {
           return [[key, value] as [string, string]];
         }
-        const cookie = allowedCookieNames ? _filterCookie(value, allowedCookieNames) : "";
+        // Cookies are the same rule, three-way because they have a finer form:
+        //   1. `allowCookies` — the allowlisted subset, which is exactly the
+        //      `cookie.<hash>` component the key carries.
+        //   2. no allowlist but `cookie` still in `keyHeaderNames` (i.e. the caller wrote
+        //      `varies: ["cookie"]`) — the raw header, forwarded untouched, because the raw
+        //      header *is* the key component. A coarse opt-in, symmetric with
+        //      `varies: ["authorization"]` == `allowAuthorization: true`, and the caller owns
+        //      its cost: one entry per distinct `Cookie` header value. Hashing it while
+        //      stripping it (the old behavior) was strictly worse than either option — the
+        //      handler rendered the cookie-less default variant into every per-cookie entry
+        //      (N identical entries, zero variation), and re-deriving the key from an
+        //      already-served event drifted to a *different* key than the one just written,
+        //      so the documented `.invalidate(event)`-after-`handler(event)` purge silently
+        //      hit nothing.
+        //   3. neither — stripped (the secure default: no cookie in the key, none visible).
+        if (!allowedCookieNames) {
+          return keyHeaderNames.includes("cookie") ? [[key, value] as [string, string]] : [];
+        }
+        const cookie = _filterCookie(value, allowedCookieNames);
         return cookie ? [["cookie", cookie] as [string, string]] : [];
       });
 

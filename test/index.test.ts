@@ -2981,6 +2981,143 @@ describe("defineCachedHandler", () => {
     expect(await r2.text()).toBe("call-2");
   });
 
+  it("forwards the raw Cookie header to the handler for varies: ['cookie'] (coarse opt-in)", async () => {
+    // `varies: ["cookie"]` without an allowlist is a coarse opt-in, symmetric with
+    // `varies: ["authorization"]` == `allowAuthorization: true`: the raw header composes the
+    // key, so the handler may read it. It used to be hashed into the key *and* stripped from
+    // the request, so every per-cookie entry held the identical cookie-less default
+    // rendering — pure fragmentation, and a contradiction of the documented "`varies`
+    // headers are forwarded to the handler" rule.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const cookie = event.req.headers.get("cookie");
+        seen.push(cookie);
+        return new Response(`call-${callCount}:${cookie}`);
+      },
+      { maxAge: 10, varies: ["cookie"] },
+    );
+
+    const a = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=1; theme=dark" } }),
+    )) as Response;
+    const b = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=2; theme=light" } }),
+    )) as Response;
+    const aAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=1; theme=dark" } }),
+    )) as Response;
+
+    // The handler sees the full raw header, unfiltered — this is the bug: it used to see
+    // nothing at all.
+    expect(seen).toEqual(["sid=1; theme=dark", "sid=2; theme=light"]);
+    // Two distinct headers -> two entries AND two distinct renderings.
+    expect(callCount).toBe(2);
+    expect(await a.text()).toBe("call-1:sid=1; theme=dark");
+    expect(await b.text()).toBe("call-2:sid=2; theme=light");
+    // The same header again is a hit.
+    expect(await aAgain.text()).toBe("call-1:sid=1; theme=dark");
+    // And the response advertises the dimension it varies on.
+    expect(a.headers.get("vary")).toBe("cookie");
+  });
+
+  it("derives the same key from an already-served event under varies: ['cookie'] (no drift)", async () => {
+    // The documented issue-#71 pattern: serve, then purge with the very same event.
+    // Narrowing mutates `event.req`, so while the Cookie header was stripped from the
+    // handler-visible request but still hashed into the key, re-deriving the key from the
+    // served event produced the *no-cookie* key — a different one than the entry had just
+    // been written under, so the purge silently hit nothing and the stale entry kept being
+    // served for the rest of the TTL.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, swr: false, varies: ["cookie"] },
+    );
+
+    const event = makeEvent(path, { headers: { cookie: "sid=1" } });
+    await handler(event);
+    expect(callCount).toBe(1);
+
+    // Re-derived AFTER the event was served: still the key the entry lives under.
+    const [key] = await handler.resolveKeys(event);
+    expect(await testStorage.get(key!)).toBeDefined();
+
+    await handler.invalidate(event);
+
+    expect(await testStorage.get(key!)).toBeNull();
+    // ... so the next request for that cookie is a genuine miss.
+    const res = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    expect(callCount).toBe(2);
+    expect(await res.text()).toBe("call-2");
+  });
+
+  it("allowCookies supersedes varies: ['cookie'] for handler visibility too", async () => {
+    // The allowlist is the finer form and stays in charge in both directions: unlisted
+    // cookies neither vary the key nor reach the handler, even with the coarse
+    // `varies: ["cookie"]` opt-in also set.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"], allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const darkOtherSid = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=2; theme=dark" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light; sid=3" } }),
+    )) as Response;
+
+    // Only `theme` is forwarded — the raw header never reaches the handler.
+    expect(seen).toEqual(["theme=dark", "theme=light"]);
+    // ... and only `theme` varies the key: the differing `sid` doesn't split the entry.
+    expect(callCount).toBe(2);
+    expect(await dark.text()).toBe("call-1");
+    expect(await darkOtherSid.text()).toBe("call-1");
+    expect(await light.text()).toBe("call-2");
+  });
+
+  it("keeps cookies out of caching entirely with neither varies: ['cookie'] nor allowCookies", async () => {
+    // The untouched secure default: no cookie in the key, none visible to the handler, and
+    // nothing advertised downstream.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10 },
+    );
+
+    const r1 = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    const r2 = (await handler(makeEvent(path, { headers: { cookie: "sid=2" } }))) as Response;
+
+    expect(seen).toEqual([null]);
+    expect(callCount).toBe(1);
+    expect(await r2.text()).toBe("call-1");
+    expect(r1.headers.get("vary")).toBeNull();
+    expect(r2.headers.get("vary")).toBeNull();
+  });
+
   it("advertises the credential headers alongside cookie when both are opted into", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), {
