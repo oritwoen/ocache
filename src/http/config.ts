@@ -63,6 +63,19 @@ export interface HandlerConfig<E extends HTTPEvent> {
    * Scoped to this handler instance, so a shared event can't pick up another's allowlist.
    */
   searchCache: WeakMap<HTTPEvent, string>;
+
+  /**
+   * The *composed* bypass verdict (built-in ∨ the caller's `shouldBypassCache`) for the
+   * call in flight: written by `resolveBypass`, read by `narrowRequest`. Two consumers,
+   * one evaluation — `cache.ts` short-circuits to the raw resolver on `true`, and the
+   * resolver must gate narrowing on the very same answer, while the caller's hook may be
+   * async, expensive or side-effecting and must not be asked twice.
+   *
+   * Keyed by the event and scoped to this handler instance (the {@link searchCache}
+   * pattern), which is what makes it per-call state: a module-level slot would leak one
+   * request's verdict into the next.
+   */
+  bypassed: WeakMap<HTTPEvent, boolean>;
 }
 
 // Derives the per-handler configuration from the caller's options. `name` is resolved BEFORE
@@ -123,6 +136,7 @@ export function resolveHandlerConfig<E extends HTTPEvent>(
     varyHeaderNames,
     statusHeader,
     searchCache: new WeakMap<HTTPEvent, string>(),
+    bypassed: new WeakMap<HTTPEvent, boolean>(),
   };
 }
 

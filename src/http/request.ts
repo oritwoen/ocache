@@ -1,7 +1,8 @@
 // Everything decided from the incoming request: whether it is cached at all, and what the
-// handler may see of it (`narrowRequest` runs exactly when `shouldBypassCache` says no). One
-// rule, shared with `key.ts`: a handler may read exactly what the key covers — otherwise it
-// renders content from an input that never reaches the key. Filters live in `filters.ts`.
+// handler may see of it (`narrowRequest` narrows exactly when `resolveBypass` said no —
+// it gates itself on that verdict, so the two cannot disagree). One rule, shared with
+// `key.ts`: a handler may read exactly what the key covers — otherwise it renders content
+// from an input that never reaches the key. Filters live in `filters.ts`.
 
 import type { HandlerConfig } from "./config.ts";
 import { authHeaderNames } from "./config.ts";
@@ -10,24 +11,50 @@ import { cacheableMethods } from "./key.ts";
 
 import type { HTTPEvent } from "../types.ts";
 
-// The built-in bypass (a caller's `shouldBypassCache` composes on top, never replaces it),
-// shared by the option and the resolver so narrowing can't disagree with it. Derived from
-// `cacheableMethods` rather than repeating the method check. `Range` bypasses too: it is
+// The built-in half of the bypass (a caller's `shouldBypassCache` composes on top in
+// `resolveBypass`, never replaces it). Derived from `cacheableMethods` rather than repeating
+// the method check, and never consulted alone outside it. `Range` bypasses too: it is
 // neither in the key nor a `Vary` dimension, so one `curl -r 0-0` stored a one-byte body that
 // every later `Range`-less GET was served — `validate` refusing 206 is the other half.
-export function shouldBypassCache(event: HTTPEvent): boolean {
+function shouldBypassCache(event: HTTPEvent): boolean {
   return !cacheableMethods.includes(event.req.method) || event.req.headers.has("range");
 }
 
-// Narrows the request the handler sees, for cacheable requests only (a bypassed one is never
-// keyed, so it must reach the handler untouched — including the body, which the rewritten
-// `Request` drops). MUTATES the caller's event and never restores it: a handler's body
-// producer can run *after* the resolver returns, and handing it back the credentialed request
-// would re-open what narrowing closes. Narrowing a copy instead is tracked separately.
+// The composed verdict: the built-in bypass OR the caller's hook. Composed rather than
+// clobbered (assigning the built-in used to discard `opts.shouldBypassCache`, issue #50),
+// and evaluated EXACTLY ONCE per call — `cache.ts` awaits this to decide whether to
+// short-circuit to the raw resolver, so the answer is memoized on the event for
+// `narrowRequest` to read instead of the caller's hook being asked a second time (it may be
+// async, expensive or side-effecting). See `config.bypassed` for why the memo lives there.
+export async function resolveBypass<E extends HTTPEvent>(
+  config: HandlerConfig<E>,
+  event: HTTPEvent,
+): Promise<boolean> {
+  const bypass =
+    shouldBypassCache(event) || (await config.opts.shouldBypassCache?.(event as E)) === true;
+  config.bypassed.set(event, bypass);
+  return bypass;
+}
+
+// Narrows the request the handler sees — and NO-OPS on a bypassed call, which is never keyed
+// and so must reach the handler untouched, including its body (the rewritten `Request` drops
+// it) and its credentials (`shouldBypassCache` is the documented alternative to
+// `allowAuthorization`, and stripping there left it serving the anonymous page to every
+// authenticated user). The gate reads the *composed* verdict `resolveBypass` memoized, never
+// the built-in half alone; the fallback only covers a resolver reached without it, which
+// `cache.ts` cannot do.
+//
+// MUTATES the caller's event and never restores it: a handler's body producer can run *after*
+// the resolver returns, and handing it back the credentialed request would re-open what
+// narrowing closes. Narrowing a copy instead is tracked separately.
 export function narrowRequest<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   event: HTTPEvent,
 ): void {
+  if (config.bypassed.get(event) ?? shouldBypassCache(event)) {
+    return;
+  }
+
   const { keyHeaderNames, allowedCookieNames, allowedQueryNames } = config;
 
   // Strip the credential headers and the cookies the handler didn't opt into. Everything

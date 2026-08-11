@@ -3969,6 +3969,190 @@ describe("defineCachedHandler", () => {
     ]);
   });
 
+  // --- Narrowing is gated on the *composed* bypass (finding 09) ---
+  //
+  // Narrowing used to consult the built-in method/Range check alone, so a GET the caller
+  // excluded via `shouldBypassCache` still reached the handler stripped — breaking the one
+  // escape hatch the credential defaults document ("set `allowAuthorization`, or bypass
+  // those requests"): the handler served the anonymous page to every authenticated user.
+
+  /** The finding's fixture: bypass on `Authorization`, narrow the query to `page`. */
+  function bypassOnAuth(seen: Array<Record<string, string | null>>) {
+    return defineCachedHandler(
+      (event) => {
+        seen.push({
+          auth: event.req.headers.get("authorization"),
+          cookie: event.req.headers.get("cookie"),
+          url: event.req.url,
+        });
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        allowQuery: ["page"],
+        shouldBypassCache: (event) => event.req.headers.has("authorization"),
+      },
+    );
+  }
+
+  it("does not narrow a request the caller's shouldBypassCache excluded (finding 09)", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = bypassOnAuth(seen);
+
+    await handler(
+      makeEvent(`${path}?page=2&token=abc`, {
+        headers: { authorization: "Bearer t0ken", cookie: "sid=s1" },
+      }),
+    );
+
+    // Excluded from the cache, so it is never keyed: credentials and the full query must
+    // arrive intact, exactly as they do for a POST.
+    expect(seen).toEqual([
+      {
+        auth: "Bearer t0ken",
+        cookie: "sid=s1",
+        url: `http://localhost${path}?page=2&token=abc`,
+      },
+    ]);
+  });
+
+  it("still narrows a cacheable request when a caller shouldBypassCache is set", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = bypassOnAuth(seen);
+
+    // Same handler, same request minus the credential the bypass keys on: this one *is*
+    // cached, so the unchanged guard applies — cookie stripped, query narrowed.
+    await handler(makeEvent(`${path}?page=2&token=abc`, { headers: { cookie: "sid=s1" } }));
+
+    expect(seen).toEqual([{ auth: null, cookie: null, url: `http://localhost${path}?page=2` }]);
+  });
+
+  it("evaluates an async caller shouldBypassCache exactly once per call", async () => {
+    let hookCalls = 0;
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        // Async, and counted: narrowing must read the verdict this produced, not ask again.
+        shouldBypassCache: async (event) => {
+          hookCalls++;
+          await Promise.resolve();
+          return event.req.headers.has("x-bypass");
+        },
+      },
+    );
+
+    await handler(makeEvent(path));
+    expect(hookCalls).toBe(1);
+    await handler(makeEvent(path, { headers: { "x-bypass": "1" } }));
+    expect(hookCalls).toBe(2);
+    expect(callCount).toBe(2);
+  });
+
+  it("evaluates a caller shouldBypassCache once per call under concurrent deduplication", async () => {
+    let hookCalls = 0;
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      async () => {
+        callCount++;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        shouldBypassCache: async (event) => {
+          hookCalls++;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return event.req.headers.has("x-bypass");
+        },
+      },
+    );
+
+    await Promise.all(Array.from({ length: 5 }, () => handler(makeEvent(path))));
+
+    // One hook call per request (the hook is per-request by contract — it may answer
+    // differently for each), and one handler call for all five: they coalesce onto the
+    // leader's resolution, whose narrowing reuses the verdict rather than re-asking.
+    expect(hookCalls).toBe(5);
+    expect(callCount).toBe(1);
+  });
+
+  it("keeps the bypass contract for a caller-excluded request: not stored, not serialized", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const original = new Response("live");
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return original;
+      },
+      { maxAge: 10, shouldBypassCache: (event) => event.req.headers.has("x-bypass") },
+    );
+
+    const headers = { "x-bypass": "1" };
+    const res = (await handler(makeEvent(path, { headers }))) as Response;
+
+    // The live Response instance flows straight back out — no `serialize`, so no
+    // synthesized cache headers — and nothing is stored, so the handler runs every time.
+    expect(res).toBe(original);
+    expect(res.headers.has("etag")).toBe(false);
+    expect(res.headers.has("last-modified")).toBe(false);
+    expect(res.headers.has("cache-control")).toBe(false);
+    expect(res.headers.has("x-cache")).toBe(false);
+    await handler(makeEvent(path, { headers }));
+    expect(callCount).toBe(2);
+    // And a later cacheable request still misses: the bypassed one wrote no entry.
+    const cacheable = (await handler(makeEvent(path))) as Response;
+    expect(cacheable.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(3);
+  });
+
+  it("a Range request still narrows nothing and caches nothing (built-in bypass)", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push({
+          auth: event.req.headers.get("authorization"),
+          cookie: event.req.headers.get("cookie"),
+          range: event.req.headers.get("range"),
+          url: event.req.url,
+        });
+        return new Response("ok");
+      },
+      { maxAge: 10, allowQuery: ["page"], allowCookies: ["theme"] },
+    );
+
+    const headers = {
+      range: "bytes=0-0",
+      authorization: "Bearer t0ken",
+      cookie: "sid=s1; theme=dark",
+    };
+    const res = (await handler(makeEvent(`${path}?page=2&token=abc`, { headers }))) as Response;
+
+    expect(seen).toEqual([
+      {
+        auth: "Bearer t0ken",
+        cookie: "sid=s1; theme=dark",
+        range: "bytes=0-0",
+        url: `http://localhost${path}?page=2&token=abc`,
+      },
+    ]);
+    expect(res.headers.has("x-cache")).toBe(false);
+    await handler(makeEvent(`${path}?page=2&token=abc`, { headers }));
+    expect(callCount).toBe(2);
+  });
+
   it("by default hides Authorization from the handler so token content is never shared", async () => {
     let callCount = 0;
     const seen: (string | null)[] = [];

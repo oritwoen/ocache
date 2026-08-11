@@ -11,7 +11,7 @@ import { integrityOpts, resolveHandlerConfig } from "./config.ts";
 import { defaultHandleCacheHeaders, notModifiedHeaders } from "./conditional.ts";
 import { deserializeEntry, serializeResponse } from "./entry.ts";
 import { cacheableMethods, methodKey, resolveKey } from "./key.ts";
-import { narrowRequest, shouldBypassCache } from "./request.ts";
+import { narrowRequest, resolveBypass } from "./request.ts";
 import { validateEntry } from "./validate.ts";
 
 import type {
@@ -114,14 +114,10 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     // the entry. Runs once per resolution, and outside the resolver so bypassed requests —
     // which never reach it — get their live `Response` back untouched.
     serialize: (entry) => serializeResponse(config, entry.value as unknown as Response),
-    // Compose the built-in bypass with the caller's check rather than clobbering it:
-    // assigning the built-in here used to discard `opts.shouldBypassCache` (issue #50).
-    shouldBypassCache: async (event: HTTPEvent) => {
-      if (shouldBypassCache(event)) {
-        return true;
-      }
-      return (await opts.shouldBypassCache?.(event as E)) === true;
-    },
+    // The built-in bypass composed with the caller's check (see `request.ts`). The single
+    // evaluation of that composition per call: `cache.ts` short-circuits to the raw resolver
+    // on `true`, and the resolver's narrowing reads the same memoized verdict.
+    shouldBypassCache: (event: HTTPEvent) => resolveBypass(config, event),
     // Key = resource identity + method component; see `key.ts` for both halves.
     getKey: async (event: HTTPEvent) =>
       methodKey(await resolveKey(config, event), event.req.method),
@@ -136,9 +132,9 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   // `Response`. Serialization happens in the `serialize` hook above, which a bypassed
   // request skips entirely — so it flows back out untouched.
   const cachedFn = cachedFunction<Response>(async (event: HTTPEvent) => {
-    if (!shouldBypassCache(event)) {
-      narrowRequest(config, event);
-    }
+    // Cacheable calls only — `narrowRequest` gates itself on the composed bypass verdict, so
+    // a request the caller excluded reaches the handler with its credentials and query intact.
+    narrowRequest(config, event);
 
     // Call handler
     const rawValue = await handler(event as E);

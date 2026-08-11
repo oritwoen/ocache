@@ -374,8 +374,9 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * is genuinely per-user and shouldn't be shared, don't opt in: bypass those requests
    * instead (`shouldBypassCache: (event) => event.req.headers.has("authorization")`).
    *
-   * Only cacheable requests (`GET`/`HEAD`) are affected: methods that bypass caching
-   * (e.g. `POST`) reach the handler with their credentials untouched.
+   * Only cacheable requests are affected: a request that bypasses the cache — a `POST`, a
+   * ranged request, or one your own `shouldBypassCache` excludes — reaches the handler
+   * with its credentials (and its full query) untouched.
    */
   allowAuthorization?: boolean;
 
