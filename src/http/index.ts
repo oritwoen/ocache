@@ -30,7 +30,8 @@ import type {
  * Only `GET`/`HEAD` without a `Range` header is cacheable (everything else passes through
  * untouched), only `200`/`203`/`301`/`308` is stored, and a response opting itself out
  * (`no-store`, `private`, `no-cache`, zero shared lifetime, `Vary: *`) is served but never
- * stored. `must-revalidate` is not an opt-out — stored, served fresh, never served stale.
+ * stored — nor is one whose own `Vary` names a header outside `varies`, which a single entry
+ * cannot honor. `must-revalidate` is not an opt-out — stored, served fresh, never served stale.
  *
  * @param handler - The event handler to cache.
  * @param opts - Cache and HTTP-specific configuration options.
@@ -126,7 +127,7 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       methodKey(await resolveKey(config, event), event.req.method),
     // Always inspects the serialized shape: on write right after `serialize`, on read the
     // entry as persisted.
-    validate: (entry) => validateEntry(opts, entry.value as unknown as ResponseCacheEntry),
+    validate: (entry) => validateEntry(config, entry.value as unknown as ResponseCacheEntry),
     group: opts.group || "handlers",
     integrity: opts.integrity || hash([handler, integrityOpts(opts)]),
   };

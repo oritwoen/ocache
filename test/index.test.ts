@@ -2865,6 +2865,175 @@ describe("defineCachedHandler", () => {
     expect(res.headers.get("vary")).toBe("User-Agent, *");
   });
 
+  describe("handler-declared Vary", () => {
+    /**
+     * ocache *writes* `Vary` but keys only on `varies`/`allowCookies`, so a handler that
+     * declares a header ocache doesn't key on used to get one entry served to every value of
+     * it — while that very `Vary` was attached for downstream caches to propagate. The
+     * fail-closed fix: refuse the entry, and refuse to advertise a lifetime for it.
+     */
+    async function twice(
+      responseVary: string | undefined,
+      opts: any,
+      reqHeaders: (i: number) => Record<string, string> = () => ({}),
+    ) {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: responseVary ? { vary: responseVary } : undefined,
+        });
+      }, opts);
+
+      const r1 = (await handler(makeEvent(path, { headers: reqHeaders(1) }))) as Response;
+      const r2 = (await handler(makeEvent(path, { headers: reqHeaders(2) }))) as Response;
+      return {
+        callCount,
+        first: { body: await r1.text(), status: r1.headers.get("x-cache") },
+        second: { body: await r2.text(), status: r2.headers.get("x-cache") },
+        cacheControl: r1.headers.get("cache-control"),
+        vary: r1.headers.get("vary"),
+      };
+    }
+
+    it("never stores a response whose Vary names an unkeyed header", async () => {
+      const result = await twice("Accept-Language", { maxAge: 60 });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.second.body).toBe("v2");
+      // Still returned to the caller, its own `Vary` intact.
+      expect(result.vary).toBe("Accept-Language");
+    });
+
+    it("renders per language when the handler declares Vary: Accept-Language", async () => {
+      // The finding's exact scenario: `en` rendered, then `de` got `x-cache: HIT` with the
+      // English body. Failing closed costs the hit rate on this (misconfigured) route and
+      // gives every language its own rendering again.
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        (event) => {
+          callCount++;
+          return new Response(`lang=${event.req.headers.get("accept-language") ?? "none"}`, {
+            headers: { vary: "Accept-Language" },
+          });
+        },
+        { maxAge: 60, name: "handler-vary-lang" },
+      );
+
+      const en = (await handler(
+        makeEvent(path, { headers: { "accept-language": "en" } }),
+      )) as Response;
+      const de = (await handler(
+        makeEvent(path, { headers: { "accept-language": "de" } }),
+      )) as Response;
+
+      expect(await en.text()).toBe("lang=en");
+      expect(await de.text()).toBe("lang=de");
+      expect(de.headers.get("x-cache")).toBe("MISS");
+      expect(callCount).toBe(2);
+      // And nothing under the key either variant reads.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(keys[0]!)).toBeNull();
+    });
+
+    it("never advertises a lifetime for a response whose Vary is unkeyed", async () => {
+      // The gate, and the reason it is needed: unlike the `Cache-Control` opt-outs, a
+      // handler declaring `Vary: Accept-Language` sets no `Cache-Control` of its own, so
+      // the "don't clobber the handler's header" check does not suppress synthesis. Without
+      // this the response was refused storage — origin takes every request — while being
+      // advertised `s-maxage=60, stale-while-revalidate=600` to every shared cache.
+      const result = await twice("Accept-Language", { maxAge: 60, swr: true, staleMaxAge: 600 });
+
+      expect(result.callCount).toBe(2);
+      expect(result.cacheControl).toBeNull();
+    });
+
+    it("caches normally when the handler's Vary is a subset of the advertised names", async () => {
+      const result = await twice("Accept-Language", {
+        maxAge: 60,
+        varies: ["accept-language"],
+      });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.cacheControl).toBe("max-age=60");
+      // Merged, not duplicated: the handler's casing wins, ours is deduped away.
+      expect(result.vary).toBe("Accept-Language");
+    });
+
+    it("caches a handler-declared Vary: Cookie under allowCookies", async () => {
+      // The two-list distinction: `allowCookies` drops `cookie` from `keyHeaderNames` (the
+      // key carries the finer allowlisted subset) but keeps it in `varyHeaderNames`, which
+      // is what this check reads — so the response is keyed at least as finely as it claims.
+      const result = await twice("Cookie", { maxAge: 60, allowCookies: ["theme"] }, () => ({
+        cookie: "theme=dark",
+      }));
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.vary).toBe("Cookie");
+    });
+
+    it.each([
+      "accept-language",
+      "ACCEPT-LANGUAGE",
+      "  Accept-Language  ",
+      "accept-language,x-custom",
+      "Accept-Language , X-Custom",
+      "accept-language, x-custom,",
+    ])("matches %o case-insensitively and whitespace-tolerantly", async (responseVary) => {
+      const result = await twice(responseVary, {
+        maxAge: 60,
+        varies: ["accept-language", "x-custom"],
+      });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("rejects a Vary that mixes keyed and unkeyed names", async () => {
+      const result = await twice("Accept-Language, User-Agent", {
+        maxAge: 60,
+        varies: ["accept-language"],
+      });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.cacheControl).toBeNull();
+    });
+
+    it("still rejects Vary: * — a different verdict on the same header", async () => {
+      // Unchanged guard (landed with the `Cache-Control` opt-outs). `hasUnkeyedVary`
+      // deliberately skips the `*` token, so this is `hasVaryWildcard` alone.
+      const result = await twice("*", { maxAge: 60, varies: ["accept-language"] });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.cacheControl).toBeNull();
+      expect(result.vary).toBe("*");
+    });
+
+    it("caches normally when the handler declares no Vary at all", async () => {
+      const result = await twice(undefined, { maxAge: 60 });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.cacheControl).toBe("max-age=60");
+      expect(result.vary).toBeNull();
+    });
+
+    it("caches an empty Vary header", async () => {
+      // Nothing is named, so nothing is unkeyed — an empty list must not fail closed.
+      const result = await twice(" , ", { maxAge: 60 });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+  });
+
   it("echoes the Vary header on a 304 response", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), {

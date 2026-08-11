@@ -6,7 +6,7 @@ import { hash } from "ohash";
 
 import type { HandlerConfig } from "./config.ts";
 import { isCacheableStatus } from "./validate.ts";
-import { appendVary, hasVaryWildcard } from "./vary.ts";
+import { appendVary, hasUnkeyedVary, hasVaryWildcard } from "./vary.ts";
 
 import type { HTTPEvent, ResponseCacheEntry } from "../types.ts";
 
@@ -52,11 +52,19 @@ export async function serializeResponse<E extends HTTPEvent>(
 
   // Synthesize only when the handler set no `cache-control`, and never for a response we
   // won't store — `validate` shares these predicates so the two can't drift (an unstored 500
-  // once shipped `s-maxage=60`). `sendCacheControl: false` opts out entirely (issue #49).
+  // once shipped `s-maxage=60`). Both `Vary` verdicts need a gate for the same reason and
+  // neither is caught by the `has("cache-control")` check: a handler declaring `Vary: *` or
+  // `Vary: Accept-Language` typically sets no `Cache-Control` at all, so without this the
+  // response would be refused storage — origin takes every request — while being advertised
+  // `s-maxage=…, stale-while-revalidate=…` to every shared cache downstream. Read here
+  // *before* `appendVary` merges our own names in, which is the same verdict on a shorter
+  // list. `sendCacheControl: false` opts out entirely (issue #49).
+  const declaredVary = res.headers.get("vary");
   if (
     opts.sendCacheControl !== false &&
     isCacheableStatus(res.status) &&
-    !hasVaryWildcard(res.headers.get("vary")) &&
+    !hasVaryWildcard(declaredVary) &&
+    !hasUnkeyedVary(declaredVary, varyHeaderNames) &&
     !res.headers.has("cache-control")
   ) {
     const cacheControl = [];

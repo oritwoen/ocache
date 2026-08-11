@@ -4,9 +4,10 @@
 // is parsed in `cache-control.ts`; the read path's null-body statuses are `entry.ts`'s.
 
 import { cacheControlForbidsReuse } from "./cache-control.ts";
-import { hasVaryWildcard } from "./vary.ts";
+import { hasUnkeyedVary, hasVaryWildcard } from "./vary.ts";
 
-import type { HTTPEvent, CachedEventHandlerOptions, ResponseCacheEntry } from "../types.ts";
+import type { HandlerConfig } from "./config.ts";
+import type { HTTPEvent, ResponseCacheEntry } from "../types.ts";
 
 // The statuses ocache stores, and identically the only ones it advertises a lifetime for. An
 // allowlist because "not obviously bad" isn't "a complete, reusable representation of what was
@@ -17,8 +18,13 @@ import type { HTTPEvent, CachedEventHandlerOptions, ResponseCacheEntry } from ".
 const cacheableStatuses = new Set([200, 203, 301, 308]);
 
 // The single source of truth on the status axis, read by `validateEntry` (storage) and by
-// `serializeResponse` (advertisement) so the two cannot disagree. Not the only axis `validate`
-// rejects on — see the synthesis gate for how the others are covered, or deliberately not.
+// `serializeResponse` (advertisement) so the two cannot disagree. One of three shared axes,
+// alongside `hasVaryWildcard` and `hasUnkeyedVary` — every rejection a *fresh* response can
+// trip while carrying no `Cache-Control` of its own has to be gated there too, or the entry
+// is advertised as reusable and then not stored. The explicit `Cache-Control` opt-outs need
+// no gate (they *are* the handler's header, and we never clobber one) and `shouldCache` is
+// deliberately ungated — "ocache doesn't store this, but a CDN may" is a real configuration,
+// with `sendCacheControl: false` as the inverse knob.
 export function isCacheableStatus(status: number): boolean {
   return cacheableStatuses.has(status);
 }
@@ -26,15 +32,22 @@ export function isCacheableStatus(status: number): boolean {
 // Whether a `ResponseCacheEntry` may be stored (on write, right after `serialize`) and
 // served (on read, as persisted).
 export async function validateEntry<E extends HTTPEvent>(
-  opts: CachedEventHandlerOptions<E>,
+  config: HandlerConfig<E>,
   value: ResponseCacheEntry | undefined,
 ): Promise<boolean> {
+  const { opts, varyHeaderNames } = config;
   if (!value) {
     return false;
   }
   // Explicit response-side opt-outs: `no-store`/`private`/`no-cache`, a zero shared
   // lifetime, or `Vary: *`.
   if (forbidsSharedCaching(value.headers)) {
+    return false;
+  }
+  // Not an opt-out — the handler asked to be cached *per variant* of a header we don't key
+  // on, which one entry cannot honor, so refuse it rather than serve one variant to all of
+  // them (see `hasUnkeyedVary`). On read too: an entry written by an older ocache heals.
+  if (hasUnkeyedVary(value.headers?.vary, varyHeaderNames)) {
     return false;
   }
   // Defense in depth for entries this version didn't write (an older ocache kept allowlisted
@@ -80,8 +93,10 @@ export async function validateEntry<E extends HTTPEvent>(
  * Whether a response explicitly forbids being stored in — and reused from — a shared cache.
  * Takes the whole header set because the answer is spelled in two of them: `Cache-Control`
  * (see {@link cacheControlForbidsReuse}) and `Vary: *`, which never matches a stored response
- * (RFC 9111 §4.1), so refusing the entry is the only honest handling. Honoring a `Vary` that
- * names a header outside `varyHeaderNames` is the wider problem, tracked separately.
+ * (RFC 9111 §4.1), so refusing the entry is the only honest handling. A `Vary` naming a
+ * header outside `varyHeaderNames` is refused too, but by `hasUnkeyedVary` in
+ * {@link validateEntry}: that response forbids nothing — it is cacheable, we just can't key
+ * it — so it is a separate verdict, not another arm of this one.
  */
 function forbidsSharedCaching(headers: ResponseCacheEntry["headers"] | undefined): boolean {
   if (!headers) {

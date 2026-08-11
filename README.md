@@ -161,34 +161,22 @@ function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   opts: CachedEventHandlerOptions<E> =
 ```
 
-Wraps an HTTP event handler with response caching.
+Wraps an HTTP event handler with response caching: keys by request origin, path, varied
+headers and method, synthesizes `cache-control`/`etag`/`last-modified`, and answers `304`.
 
-Automatically generates cache keys from the request origin (scheme, host and port, as
-resolved by the adapter — so one handler instance serving several hostnames keeps them
-apart), the URL path, variable headers and the request method (`GET` and `HEAD` are
-cached separately), sets `cache-control`, `etag`, and `last-modified` headers, and
-handles `304 Not Modified` responses via conditional request headers.
-
-Only `GET`/`HEAD` requests without a `Range` header are cacheable; everything else
-reaches the handler untouched and its response passes straight through. Of the
-responses, only `200`, `203`, `301` and `308` are stored — and a status that isn't
-stored is never advertised with a synthesized `Cache-Control` either.
-
-A response that opts itself out is returned to the caller but never stored:
-`Cache-Control: no-store`, `private`, `no-cache`, a zero shared lifetime (`s-maxage` if
-present, else `max-age`), or `Vary: *`. `must-revalidate` is not an opt-out — such a
-response is stored and served fresh, but never served stale (it revalidates in the
-foreground once expired).
+Only `GET`/`HEAD` without a `Range` header is cacheable (everything else passes through
+untouched), only `200`/`203`/`301`/`308` is stored, and a response opting itself out
+(`no-store`, `private`, `no-cache`, zero shared lifetime, `Vary: *`) is served but never
+stored — nor is one whose own `Vary` names a header outside `varies`, which a single entry
+cannot honor. `must-revalidate` is not an opt-out — stored, served fresh, never served stale.
 
 **Parameters:**
 
 - **`handler`** — The event handler to cache.
 - **`opts`** — Cache and HTTP-specific configuration options.
 
-**Returns:** — A new event handler that serves cached responses when available. The handler
-also exposes `.resolveKeys(event)`, `.invalidate(event)`, and `.expire(event)` for
-on-demand revalidation, keyed exactly as the handler caches (no key reconstruction);
-they cover every method variant of the event's resource.
+**Returns:** — A cached event handler, also exposing `.resolveKeys(event)`, `.invalidate(event)`
+and `.expire(event)` — keyed exactly as it caches, covering every method variant.
 
 ---
 

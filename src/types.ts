@@ -278,6 +278,13 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * These names are also merged into the response's `Vary` header so downstream
    * caches/CDNs/browsers store a separate variant per value.
    *
+   * This list is also what a **handler-set `Vary` is checked against**: a response
+   * declaring a header that is not varied on here (nor `Cookie` under
+   * {@link allowCookies}) is returned to the caller but never stored, and gets no
+   * synthesized `Cache-Control` — one entry cannot honor a variance the key doesn't
+   * capture, and replaying the first variant to every other one is the bug that rule
+   * prevents. Declare the header here and the response caches normally.
+   *
    * Varying headers stay visible to the handler: their value is part of the cache key,
    * so the handler can safely render from them (a per-value entry is stored for each).
    * This includes the credential headers — listing `cookie` (with no {@link allowCookies})
