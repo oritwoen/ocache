@@ -1,5 +1,5 @@
 import { hash } from "ohash";
-import { cachedFunction } from "./cache.ts";
+import { cachedFunction, expireCache, invalidateCache, resolveCacheKeys } from "./cache.ts";
 
 import type {
   HTTPEvent,
@@ -24,15 +24,17 @@ function defaultCacheOptions() {
 /**
  * Wraps an HTTP event handler with response caching.
  *
- * Automatically generates cache keys from the URL path and variable headers,
- * sets `cache-control`, `etag`, and `last-modified` headers, and handles
- * `304 Not Modified` responses via conditional request headers.
+ * Automatically generates cache keys from the URL path, variable headers and the request
+ * method (`GET` and `HEAD` are cached separately), sets `cache-control`, `etag`, and
+ * `last-modified` headers, and handles `304 Not Modified` responses via conditional
+ * request headers.
  *
  * @param handler - The event handler to cache.
  * @param opts - Cache and HTTP-specific configuration options.
  * @returns A new event handler that serves cached responses when available. The handler
  *   also exposes `.resolveKeys(event)`, `.invalidate(event)`, and `.expire(event)` for
- *   on-demand revalidation, keyed exactly as the handler caches (no key reconstruction).
+ *   on-demand revalidation, keyed exactly as the handler caches (no key reconstruction);
+ *   they cover every method variant of the event's resource.
  */
 export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   handler: EventHandler<E>,
@@ -77,13 +79,14 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     ? [...new Set(opts.allowQuery.filter(Boolean))]
     : undefined;
 
-  // Non-GET/HEAD requests skip the cache entirely. Shared between the
-  // `shouldBypassCache` option and the resolver so the request-narrowing
-  // step below can't disagree with the bypass decision. This is the built-in
-  // method check only — a caller's `opts.shouldBypassCache` is composed on top
-  // of it in `_opts` below, never in place of it.
-  const _shouldBypassCache = (event: HTTPEvent) =>
-    event.req.method !== "GET" && event.req.method !== "HEAD";
+  // Requests outside `_cacheableMethods` skip the cache entirely. Derived from that one
+  // list rather than repeating the method check, so the bypass decision and the per-method
+  // key variants can never disagree — making a further method cacheable is a one-line
+  // change there. Shared between the `shouldBypassCache` option and the resolver so the
+  // request-narrowing step below can't disagree with the bypass decision either. This is
+  // the built-in method check only — a caller's `opts.shouldBypassCache` is composed on
+  // top of it in `_opts` below, never in place of it.
+  const _shouldBypassCache = (event: HTTPEvent) => !_cacheableMethods.includes(event.req.method);
 
   // Memoize the filtered query per request so getKey and the handler-facing URL
   // rewrite don't recompute it. Scoped to this handler instance so a shared
@@ -96,6 +99,45 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       _searchCache.set(event, search);
     }
     return search;
+  };
+
+  // Resource identity: everything about the request that selects a representation except
+  // the method. Split out of `getKey` so the method component below can wrap *both* key
+  // branches (auto and custom) and so the revalidation helpers can enumerate every method
+  // variant of one resource from a single event, without cloning or mutating it.
+  const _resolveKey = async (event: HTTPEvent): Promise<string> => {
+    // Custom user-defined key
+    const customKey = await opts.getKey?.(event as E);
+    if (customKey) {
+      const _key = escapeKey(customKey);
+      // If escaping was a no-op the key is already storage-safe and can't collide,
+      // so keep it as-is. Otherwise escaping is lossy (distinct keys can collapse to
+      // the same segment), so append a hash of the raw key to keep them distinct.
+      // The `.` separator only appears in the hashed form, so an escaped-clean key
+      // (pure `\w`, never contains `.`) and a hashed key can never overlap.
+      return _key === customKey ? _key : `${_key.slice(0, 64)}.${hash(customKey)}`;
+    }
+    // Auto-generated key
+    const _url = event.url ?? new URL(event.req.url);
+    const _search = allowedQueryNames ? _filteredSearch(event, _url) : _url.search;
+    const _path = _url.pathname + _search;
+    let _pathname: string;
+    try {
+      _pathname =
+        escapeKey(decodeURI(new URL(_path, "http://localhost").pathname)).slice(0, 16) || "index";
+    } catch {
+      _pathname = "-";
+    }
+    const _hashedPath = `${_pathname}.${hash(_path)}`;
+    const _headers = variableHeaderNames
+      .map((header) => [header, event.req.headers.get(header)])
+      .map(([name, value]) => `${escapeKey(name as string)}.${hash(value)}`);
+    // Vary the key by the allowlisted cookie subset only (sorted, order-independent),
+    // never the full raw Cookie header. Omitted entirely when no cookies are allowed.
+    const _cookies = allowedCookieNames
+      ? [`cookie.${hash(_filterCookie(event.req.headers.get("cookie"), allowedCookieNames))}`]
+      : [];
+    return [_hashedPath, ..._headers, ..._cookies].join(":");
   };
 
   const _toResponse =
@@ -261,40 +303,20 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       }
       return (await opts.shouldBypassCache?.(event as E)) === true;
     },
-    getKey: async (event: HTTPEvent) => {
-      // Custom user-defined key
-      const customKey = await opts.getKey?.(event as E);
-      if (customKey) {
-        const _key = escapeKey(customKey);
-        // If escaping was a no-op the key is already storage-safe and can't collide,
-        // so keep it as-is. Otherwise escaping is lossy (distinct keys can collapse to
-        // the same segment), so append a hash of the raw key to keep them distinct.
-        // The `.` separator only appears in the hashed form, so an escaped-clean key
-        // (pure `\w`, never contains `.`) and a hashed key can never overlap.
-        return _key === customKey ? _key : `${_key.slice(0, 64)}.${hash(customKey)}`;
-      }
-      // Auto-generated key
-      const _url = event.url ?? new URL(event.req.url);
-      const _search = allowedQueryNames ? _filteredSearch(event, _url) : _url.search;
-      const _path = _url.pathname + _search;
-      let _pathname: string;
-      try {
-        _pathname =
-          escapeKey(decodeURI(new URL(_path, "http://localhost").pathname)).slice(0, 16) || "index";
-      } catch {
-        _pathname = "-";
-      }
-      const _hashedPath = `${_pathname}.${hash(_path)}`;
-      const _headers = variableHeaderNames
-        .map((header) => [header, event.req.headers.get(header)])
-        .map(([name, value]) => `${escapeKey(name as string)}.${hash(value)}`);
-      // Vary the key by the allowlisted cookie subset only (sorted, order-independent),
-      // never the full raw Cookie header. Omitted entirely when no cookies are allowed.
-      const _cookies = allowedCookieNames
-        ? [`cookie.${hash(_filterCookie(event.req.headers.get("cookie"), allowedCookieNames))}`]
-        : [];
-      return [_hashedPath, ..._headers, ..._cookies].join(":");
-    },
+    // Key = resource identity + method component. GET is the implicit default and stays
+    // unprefixed (so its keys are byte-identical to pre-fix ones — existing entries stay
+    // warm); every other cacheable method contributes its own component, which today means
+    // exactly `head:`. Without it a GET and a HEAD for the same URL share one entry, and a
+    // spec-compliant host framework (h3's `toResponse`, and every other one) nulls the body
+    // of a HEAD response — precisely the `Response` that `serialize` then stores. So a
+    // single anonymous `HEAD /page` seeds the shared entry with a zero-byte body plus a
+    // synthesized `public, max-age=N` and a weak etag computed over that empty body, and
+    // every GET for the rest of the TTL is served a blank 200 that downstream CDNs and
+    // browsers then cache and successfully revalidate (h3#1524 audit, finding #3). Applied
+    // around *both* key branches: a custom `getKey` expresses content identity, so
+    // preventing the method collision stays ocache's job there too. The cost is one origin
+    // dispatch per method per resource per TTL — the accepted trade.
+    getKey: async (event: HTTPEvent) => _methodKey(await _resolveKey(event), event.req.method),
     validate: async (entry) => {
       // `validate` always inspects the serialized shape: on write it runs right after
       // `serialize` (entry.value is the freshly built `ResponseCacheEntry`), on read it
@@ -321,6 +343,14 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       if (value.status >= 400) {
         return false;
       }
+      // Only a *missing* body (`serialize` never ran / a malformed foreign entry) is
+      // rejected — an empty string is a legitimate entry and stays cacheable. A zero-byte
+      // 200 is a valid GET response, so rejecting `""` would only cost hit rate. The one
+      // dangerous empty body — a body-less HEAD response replayed to GET clients — is
+      // handled where it belongs, in `getKey`'s method component: an empty entry is now
+      // only ever readable by requests of the method that produced it (h3#1524 audit,
+      // finding #3). Rejecting `""` here would neither have closed that hole (the poisoned
+      // entry would just be re-poisoned on the next HEAD) nor be the right layer for it.
       if (value.body === undefined) {
         return false;
       }
@@ -479,15 +509,50 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     });
   };
 
-  // Forward the on-demand revalidation methods from the internal cached function so
-  // callers can `.expire(event)` / `.invalidate(event)` / `.resolveKeys(event)` without
-  // reconstructing the auto-generated key (which internal escaping makes error-prone —
-  // issue #71). The internal resolver's args are `[event]`, so these accept the event
-  // directly and derive the exact keys the handler stores under.
+  // On-demand revalidation without reconstructing the auto-generated key (which internal
+  // escaping makes error-prone — issue #71): these accept the request event directly and
+  // derive the exact keys the handler stores under.
+  //
+  // They target the *resource*, not one method variant of it: `getKey` splits GET and HEAD
+  // into separate entries (see above), but that is an internal key-shape decision the
+  // caller never asked for — "this URL's cached representation is dead" must not leave a
+  // sibling HEAD entry advertising the old etag/last-modified for downstream caches to
+  // revalidate against. So every cacheable method's variant of the event's resource key is
+  // covered, whichever method the passed event carries (`_resolveKey` is method-free, so
+  // this needs no cloned or mutated event — never mutate a caller's event). `resolveKeys`
+  // enumerates the same set, the event's own variant first, so `keys[0]` is still exactly
+  // the key this event reads and writes.
+  //
+  // The keys are handed to the standalone `cache.ts` helpers as a fixed `getKey`; going
+  // through `_cachedHandler.*` would re-derive only the event's own variant.
+  const _variantOptions = async (event: E) => {
+    const key = await _resolveKey(event);
+    const methods = _cacheableMethods.includes(event.req.method)
+      ? [event.req.method, ..._cacheableMethods.filter((m) => m !== event.req.method)]
+      : // A non-cacheable event (e.g. a POST webhook used as the invalidation trigger)
+        // has no variant of its own — purge the cacheable ones in their canonical order.
+        _cacheableMethods;
+    return methods.map((method) => {
+      const _key = _methodKey(key, method);
+      return { ..._opts, getKey: () => _key };
+    });
+  };
+
   const _revalidate = cachedHandler as CachedEventHandler<E>;
-  _revalidate.resolveKeys = (event: E) => _cachedHandler.resolveKeys(event);
-  _revalidate.invalidate = (event: E) => _cachedHandler.invalidate(event);
-  _revalidate.expire = (event: E) => _cachedHandler.expire(event);
+  _revalidate.resolveKeys = async (event: E) => {
+    const keys = await Promise.all(
+      (await _variantOptions(event)).map((options) => resolveCacheKeys({ options })),
+    );
+    return keys.flat();
+  };
+  _revalidate.invalidate = async (event: E) => {
+    await Promise.all(
+      (await _variantOptions(event)).map((options) => invalidateCache({ options })),
+    );
+  };
+  _revalidate.expire = async (event: E) => {
+    await Promise.all((await _variantOptions(event)).map((options) => expireCache({ options })));
+  };
 
   return _revalidate;
 }
@@ -497,6 +562,28 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 // Transport/framing headers stripped from a cached entry: the body is stored fully
 // decoded and re-buffered, so these no longer describe it (see `serialize`).
 const _transportHeaders = ["content-encoding", "content-length", "transfer-encoding"];
+
+// The methods whose responses reach the cache. Single source of truth: `_shouldBypassCache`
+// is derived from it, and it enumerates every method variant one resource can be stored
+// under (see the revalidation helpers). Making a further method cacheable is a one-line
+// addition here; the key scheme below already accommodates it.
+const _cacheableMethods = ["GET", "HEAD"];
+
+/**
+ * Prefixes a resource key with its method component. GET is the implicit default and
+ * carries none, so its keys are unchanged; every other cacheable method gets a
+ * `<METHOD>:` component of its own. Methods are used verbatim, not case-folded: unlike
+ * header names and `cache-control` directives (case-insensitive, so normalized elsewhere
+ * in this file), HTTP methods are case-sensitive and canonically uppercase, and `Request`
+ * already normalizes the cacheable ones — so the key matches `_cacheableMethods` with no
+ * transformation in between. Method components are alphabetic and a resource key's first
+ * `:`-segment never is (an auto key's leading segment always contains a `.`; an escaped
+ * custom key never contains a `:` at all), so the per-method key spaces cannot overlap.
+ * See `getKey` for why the split exists.
+ */
+function _methodKey(key: string, method: string): string {
+  return method === "GET" ? key : `${method}:${key}`;
+}
 
 // Fatal decoder so invalid UTF-8 throws (→ binary) instead of substituting replacement
 // characters. `ignoreBOM` keeps a leading BOM in the string so it re-encodes byte-for-byte,

@@ -1487,7 +1487,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
-  it("allows HEAD requests to use cache", async () => {
+  it("allows HEAD requests to use cache (keyed apart from GET)", async () => {
     let callCount = 0;
     const path = uniquePath();
     const handler = defineCachedHandler(
@@ -1499,8 +1499,12 @@ describe("defineCachedHandler", () => {
     );
 
     await handler(makeEvent(path));
+    // A HEAD response is a different representation (a spec-compliant host strips its
+    // body), so it gets its own entry — one origin dispatch per method per TTL.
     await handler(makeEvent(path, { method: "HEAD" }));
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
+    await handler(makeEvent(path, { method: "HEAD" }));
+    expect(callCount).toBe(2);
   });
 
   it("honors a user-supplied shouldBypassCache (issue #50)", async () => {
@@ -3092,7 +3096,8 @@ describe("defineCachedHandler", () => {
     await handler(event);
 
     const keys = await handler.resolveKeys(event);
-    expect(keys.length).toBe(1);
+    // The event's own (GET) key first, then the sibling HEAD variant of the same resource.
+    expect(keys.length).toBe(2);
     const stored = await useStorage().get(keys[0]!);
     expect(stored).toBeTruthy();
     expect((stored as any).value.body).toBe("ok");
@@ -3183,6 +3188,246 @@ describe("defineCachedHandler", () => {
       expect(res.headers.get("content-type")).toBe("text/plain");
     }
     expect(await r2.text()).toBe("decoded body");
+  });
+
+  // --- GET/HEAD cache key separation (h3#1524 audit, finding #3) ---
+
+  // Every real framework integration nulls the body of a HEAD response in `toResponse`
+  // (h3 does), and that body-less `Response` is exactly what ocache stores. ocache's own
+  // default `toResponse` does not strip it, so the poisoning is only reproducible through
+  // the integration hook — simulate a spec-compliant host here.
+  function headStrippingToResponse(value: unknown, event: HTTPEvent): Response {
+    const res = value instanceof Response ? value : new Response(String(value));
+    return event.req.method === "HEAD"
+      ? new Response(null, {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+        })
+      : res;
+  }
+
+  it("does not let a HEAD request poison the GET entry with an empty body", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world", { status: 200 });
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    // Attacker-controlled HEAD lands first and stores a body-less entry.
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+
+    // The GET must not be served that entry.
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(get.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+
+    // ...and the GET entry it wrote is the one replayed to later GETs.
+    const get2 = (await handler(makeEvent(path))) as Response;
+    expect(await get2.text()).toBe("hello world");
+    expect(get2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+  });
+
+  it("serves HEAD from its own entry without disturbing the GET entry", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(callCount).toBe(1);
+
+    // HEAD does not reuse the GET entry: it costs its own origin dispatch.
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head.headers.get("x-cache")).toBe("MISS");
+    expect(await head.text()).toBe("");
+    expect(callCount).toBe(2);
+
+    // ...but it is cached under its own key.
+    const head2 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+
+    // ...and the GET entry is untouched.
+    const get2 = (await handler(makeEvent(path))) as Response;
+    expect(await get2.text()).toBe("hello world");
+    expect(get2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+  });
+
+  it("separates HEAD from GET under a custom getKey", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      {
+        maxAge: 100,
+        // A custom key expresses *content* identity — the GET/HEAD split is still ocache's
+        // to enforce, or a custom-key user is exposed to exactly the poisoning above.
+        getKey: () => `custom-key${path}`,
+        toResponse: headStrippingToResponse,
+      },
+    );
+
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(await head.text()).toBe("");
+
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(get.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(keys[1]).toBe(keys[0]!.replace(":handlers:_:", ":handlers:_:HEAD:"));
+  });
+
+  it("composes the HEAD discriminator with varies and allowCookies key components", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      {
+        maxAge: 100,
+        varies: ["accept-language"],
+        allowCookies: ["sid"],
+        toResponse: headStrippingToResponse,
+      },
+    );
+    const event = (method: string, lang: string, sid: string) =>
+      makeEvent(path, { method, headers: { "accept-language": lang, cookie: `sid=${sid}` } });
+
+    await handler(event("GET", "en", "1"));
+    expect(callCount).toBe(1);
+    await handler(event("GET", "en", "1")); // hit
+    expect(callCount).toBe(1);
+    await handler(event("GET", "fr", "1")); // varies component still splits the key
+    expect(callCount).toBe(2);
+    await handler(event("GET", "en", "2")); // allowCookies component still splits the key
+    expect(callCount).toBe(3);
+
+    // The HEAD discriminator is orthogonal to both: one HEAD entry per variant.
+    await handler(event("HEAD", "en", "1"));
+    expect(callCount).toBe(4);
+    await handler(event("HEAD", "en", "1")); // hit
+    expect(callCount).toBe(4);
+    await handler(event("HEAD", "fr", "1"));
+    expect(callCount).toBe(5);
+
+    // Key shape: the HEAD key is the GET key with the `HEAD:` discriminator, so the
+    // vary/cookie components are preserved verbatim on both sides.
+    const [getKey, getSibling] = await handler.resolveKeys(event("GET", "en", "1"));
+    const [headKey, headSibling] = await handler.resolveKeys(event("HEAD", "en", "1"));
+    expect(headKey).toBe(getKey!.replace(":handlers:_:", ":handlers:_:HEAD:"));
+    expect(getSibling).toBe(headKey);
+    expect(headSibling).toBe(getKey);
+    expect(getKey).toMatch(/:acceptlanguage\.[^:]+:cookie\.[^:]+\.json$/);
+  });
+
+  // Populates both the GET and the HEAD entry of one path and returns their storage keys.
+  // The keys are derived from the key shape itself (`HEAD:` component) rather than read
+  // back from `.resolveKeys`, so the assertions below check actual storage state.
+  async function primeBothVariants(handler: ReturnType<typeof defineCachedHandler>, path: string) {
+    await handler(makeEvent(path));
+    await handler(makeEvent(path, { method: "HEAD" }));
+    const getKey = (await handler.resolveKeys(makeEvent(path)))[0]!;
+    const keys = [getKey, getKey.replace(":handlers:_:", ":handlers:_:HEAD:")];
+    for (const key of keys) {
+      expect(await useStorage().get(key)).toBeTruthy();
+    }
+    return keys;
+  }
+
+  it(".resolveKeys(event) enumerates every method variant, the event's own first", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 100,
+      toResponse: headStrippingToResponse,
+    });
+
+    const getKeys = await handler.resolveKeys(makeEvent(path));
+    const headKeys = await handler.resolveKeys(makeEvent(path, { method: "HEAD" }));
+    expect(getKeys).toHaveLength(2);
+    expect(headKeys).toHaveLength(2);
+    expect(headKeys[0]).toBe(getKeys[1]);
+    expect(headKeys[1]).toBe(getKeys[0]);
+
+    // keys[0] is still exactly the key that event reads/writes.
+    await handler(makeEvent(path));
+    expect(await useStorage().get(getKeys[0]!)).toBeTruthy();
+    expect(await useStorage().get(getKeys[1]!)).toBeFalsy();
+    await handler(makeEvent(path, { method: "HEAD" }));
+    expect(await useStorage().get(headKeys[0]!)).toBeTruthy();
+  });
+
+  it(".invalidate(event) clears every method variant of the resource", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    // Invalidating from a GET event must not leave the HEAD entry behind — it would keep
+    // advertising the dead etag/last-modified for downstream caches to revalidate against.
+    const keys = await primeBothVariants(handler, path);
+    await handler.invalidate(makeEvent(path));
+    for (const key of keys) {
+      expect(await useStorage().get(key)).toBeFalsy();
+    }
+
+    // ...and the same in the other direction, from a HEAD event.
+    await primeBothVariants(handler, path);
+    await handler.invalidate(makeEvent(path, { method: "HEAD" }));
+    for (const key of keys) {
+      expect(await useStorage().get(key)).toBeFalsy();
+    }
+  });
+
+  it(".expire(event) marks every method variant of the resource stale", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 100,
+      swr: true,
+      staleMaxAge: 100,
+      toResponse: headStrippingToResponse,
+    });
+
+    const keys = await primeBothVariants(handler, path);
+    await handler.expire(makeEvent(path));
+    for (const key of keys) {
+      expect(await useStorage().get(key)).toMatchObject({ stale: true });
+    }
+
+    // ...and from a HEAD event.
+    await handler.invalidate(makeEvent(path));
+    await primeBothVariants(handler, path);
+    await handler.expire(makeEvent(path, { method: "HEAD" }));
+    for (const key of keys) {
+      expect(await useStorage().get(key)).toMatchObject({ stale: true });
+    }
   });
 });
 

@@ -88,9 +88,13 @@ type CachedEventHandler<E extends HTTPEvent = HTTPEvent> = EventHandler<E> &
 
 Cached event handler returned by `defineCachedHandler`.
 
-An [`EventHandler`](#eventhandler) augmented with on-demand revalidation methods forwarded from
-the underlying cached function. Each accepts the [`HTTPEvent`](#httpevent) directly and derives
-the exact storage key the handler caches under, so no manual key reconstruction is needed.
+An [`EventHandler`](#eventhandler) augmented with on-demand revalidation methods. Each accepts the
+[`HTTPEvent`](#httpevent) directly and derives the exact storage keys the handler caches under,
+so no manual key reconstruction is needed.
+
+They target the resource rather than one method variant of it: `GET` and `HEAD` responses
+are cached under separate keys, but all of a resource's variants are covered whichever
+method the passed event carries.
 
 ---
 
@@ -159,9 +163,10 @@ function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 
 Wraps an HTTP event handler with response caching.
 
-Automatically generates cache keys from the URL path and variable headers,
-sets `cache-control`, `etag`, and `last-modified` headers, and handles
-`304 Not Modified` responses via conditional request headers.
+Automatically generates cache keys from the URL path, variable headers and the request
+method (`GET` and `HEAD` are cached separately), sets `cache-control`, `etag`, and
+`last-modified` headers, and handles `304 Not Modified` responses via conditional
+request headers.
 
 **Parameters:**
 
@@ -170,7 +175,8 @@ sets `cache-control`, `etag`, and `last-modified` headers, and handles
 
 **Returns:** — A new event handler that serves cached responses when available. The handler
 also exposes `.resolveKeys(event)`, `.invalidate(event)`, and `.expire(event)` for
-on-demand revalidation, keyed exactly as the handler caches (no key reconstruction).
+on-demand revalidation, keyed exactly as the handler caches (no key reconstruction);
+they cover every method variant of the event's resource.
 
 ---
 
