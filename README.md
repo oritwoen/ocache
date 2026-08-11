@@ -163,10 +163,11 @@ function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 
 Wraps an HTTP event handler with response caching.
 
-Automatically generates cache keys from the URL path, variable headers and the request
-method (`GET` and `HEAD` are cached separately), sets `cache-control`, `etag`, and
-`last-modified` headers, and handles `304 Not Modified` responses via conditional
-request headers.
+Automatically generates cache keys from the request origin (scheme, host and port, as
+resolved by the adapter — so one handler instance serving several hostnames keeps them
+apart), the URL path, variable headers and the request method (`GET` and `HEAD` are
+cached separately), sets `cache-control`, `etag`, and `last-modified` headers, and
+handles `304 Not Modified` responses via conditional request headers.
 
 **Parameters:**
 

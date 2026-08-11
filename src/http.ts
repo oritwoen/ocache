@@ -31,10 +31,11 @@ function defaultCacheOptions() {
 /**
  * Wraps an HTTP event handler with response caching.
  *
- * Automatically generates cache keys from the URL path, variable headers and the request
- * method (`GET` and `HEAD` are cached separately), sets `cache-control`, `etag`, and
- * `last-modified` headers, and handles `304 Not Modified` responses via conditional
- * request headers.
+ * Automatically generates cache keys from the request origin (scheme, host and port, as
+ * resolved by the adapter — so one handler instance serving several hostnames keeps them
+ * apart), the URL path, variable headers and the request method (`GET` and `HEAD` are
+ * cached separately), sets `cache-control`, `etag`, and `last-modified` headers, and
+ * handles `304 Not Modified` responses via conditional request headers.
  *
  * @param handler - The event handler to cache.
  * @param opts - Cache and HTTP-specific configuration options.
@@ -175,7 +176,29 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     } catch {
       _pathname = "-";
     }
-    const _hashedPath = `${_pathname}.${hash(_path)}`;
+    // The authority (scheme + host + port) is part of the resource identity, not just the
+    // path. One handler instance serving several hostnames — the normal vhost deployment —
+    // used to store *one* entry per path across all of them, so tenant A's rendering was
+    // served to tenant B, and an attacker-supplied Host that reached a rendered absolute
+    // URL (canonical link, `<script src>`, a password-reset link) was stored under the
+    // shared key and published with the synthesized `s-maxage`/`stale-while-revalidate`
+    // and no `Vary` for shared CDNs to propagate. This reopened the cross-app body leak of
+    // h3#1524 finding #2 at a finer granularity: per-instance storage closed it between
+    // processes, not between hosts on one instance. `varies: ["host"]` was the only
+    // mitigation, off by default and *silently* a no-op on adapters that don't put `Host`
+    // in `req.headers` (a bare `new Request(absoluteUrl)` has none).
+    //
+    // Derived from `event.url` — what the adapter resolved — never from the `Host` request
+    // header, which is attacker-controlled at the edge. On adapters that build `url` *from*
+    // that header the two coincide, so a reverse proxy must still be trusted to normalize
+    // it; that is the deployment's contract, and this at least gives it somewhere to land.
+    //
+    // It goes in the hashed component, not the human-readable `_pathname` prefix, which
+    // exists purely for debuggability. **Breaking key change**: GET keys move once, so
+    // every existing entry goes cold — not a behavior change, and cheap against the
+    // exposure. Hashed as a tuple rather than a concatenation so an origin/path boundary
+    // can never be read two ways (an opaque-scheme pathname need not start with `/`).
+    const _hashedPath = `${_pathname}.${hash([_origin(_url), _path])}`;
     const _headers = keyHeaderNames
       .map((header) => [header, event.req.headers.get(header)])
       .map(([name, value]) => `${escapeKey(name as string)}.${hash(value)}`);
@@ -733,6 +756,25 @@ function _base64ToBytes(base64: string): Uint8Array {
 
 function escapeKey(key: string | string[]) {
   return String(key).replace(/\W/g, "");
+}
+
+/**
+ * The authority component of the auto cache key: scheme + host + port, canonicalized.
+ *
+ * `URL.origin` is the right answer wherever it exists — it lowercases the host and
+ * normalizes the default port away, so `http://a:80/x` and `http://a/x` stay one entry.
+ * But it is the literal string `"null"` for every *opaque* origin, and that includes any
+ * non-special scheme, where a real authority is present and simply not exposed:
+ * `new URL("x-proxy://a.example/p").origin === "null"` — as does `.../b.example/p`. Using
+ * `origin` alone would collapse those onto one shared `"null"` bucket, i.e. re-create the
+ * exact cross-authority collision this component exists to prevent. So opaque origins fall
+ * back to `protocol//host`, which is verbatim and therefore never collapses. Schemes with
+ * no authority at all (`file:`, `data:`, `about:`) land on a per-scheme constant, which is
+ * correct: their whole identity is in the path, already hashed alongside this.
+ */
+function _origin(url: URL): string {
+  const origin = url.origin;
+  return origin && origin !== "null" ? origin : `${url.protocol}//${url.host}`;
 }
 
 /** Rebuilds the query string from only the allowlisted param names, order-independent. */

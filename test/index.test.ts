@@ -2652,6 +2652,200 @@ describe("defineCachedHandler", () => {
     expect(seen).toEqual(["?color=red"]);
   });
 
+  // The request authority (scheme/host/port) is part of the resource identity. One handler
+  // instance serving several hostnames — the normal vhost deployment — used to store one
+  // entry per path across all of them (tenant A's rendering served to tenant B, and an
+  // attacker-supplied Host reaching a rendered absolute URL published under the shared key).
+  describe("request authority in the cache key", () => {
+    const originEvent = (origin: string, path: string, opts?: RequestInit) => ({
+      req: new Request(`${origin}${path}`, opts),
+    });
+
+    it("keys two hosts apart on one handler instance", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://shop.example.com", path))) as Response;
+      const r2 = (await handler(originEvent("http://evil.attacker.test", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(r1.headers.get("x-cache")).toBe("MISS");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://shop.example.com", path));
+      const [k2] = await handler.resolveKeys(originEvent("http://evil.attacker.test", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("keys two schemes apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://a.example", path))) as Response;
+      const r2 = (await handler(originEvent("https://a.example", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://a.example", path));
+      const [k2] = await handler.resolveKeys(originEvent("https://a.example", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("keys two ports apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://a.example:8080", path))) as Response;
+      const r2 = (await handler(originEvent("http://a.example:9090", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://a.example:8080", path));
+      const [k2] = await handler.resolveKeys(originEvent("http://a.example:9090", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("never serves one host's rendered absolute URL to another", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        (event) => {
+          const url = event.url ?? new URL(event.req.url);
+          return new Response(`<link rel="canonical" href="${url.origin}${url.pathname}">`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://evil.attacker.test", path));
+      const victim = (await handler(originEvent("http://shop.example.com", path))) as Response;
+
+      const body = await victim.text();
+      expect(body).toBe(`<link rel="canonical" href="http://shop.example.com${path}">`);
+      expect(body).not.toContain("evil.attacker.test");
+    });
+
+    it("still HITs for the same origin and path", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://a.example", path));
+      const r2 = (await handler(originEvent("http://a.example", path))) as Response;
+
+      expect(callCount).toBe(1);
+      expect(await r2.text()).toBe("call-1");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    it("normalizes the default port (http://h:80 is http://h)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://a.example", path));
+      const r2 = (await handler(originEvent("http://a.example:80", path))) as Response;
+
+      expect(callCount).toBe(1);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    // An opaque origin (`URL.origin === "null"`) still carries a real authority for every
+    // non-special scheme, so the key falls back to `protocol//host` rather than collapsing
+    // every such request onto one shared "null" bucket.
+    it("keys opaque-origin authorities apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      expect(new URL(`x-proxy://a.example${path}`).origin).toBe("null");
+
+      const r1 = (await handler(originEvent("x-proxy://a.example", path))) as Response;
+      const r2 = (await handler(originEvent("x-proxy://b.example", path))) as Response;
+      const r3 = (await handler(originEvent("x-proxy://a.example", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(await r3.text()).toBe("call-1");
+    });
+
+    it("still narrows the search component by allowQuery within one origin", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10, allowQuery: ["color"] },
+      );
+
+      const r1 = (await handler(
+        originEvent("http://a.example", `${path}?color=red&lang=en`),
+      )) as Response;
+      const r2 = (await handler(
+        originEvent("http://a.example", `${path}?color=red&lang=de&_=1`),
+      )) as Response;
+      const r3 = (await handler(originEvent("http://a.example", `${path}?color=blue`))) as Response;
+      // ...but the narrowed search is still scoped to one authority.
+      const r4 = (await handler(
+        originEvent("http://b.example", `${path}?color=red&lang=en`),
+      )) as Response;
+
+      expect(callCount).toBe(3);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-1");
+      expect(await r3.text()).toBe("call-2");
+      expect(await r4.text()).toBe("call-3");
+    });
+  });
+
   it("by default strips the Cookie header before the handler and never varies the key", async () => {
     const seen: (string | null)[] = [];
     let callCount = 0;
