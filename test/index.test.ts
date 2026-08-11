@@ -2893,6 +2893,121 @@ describe("defineCachedHandler", () => {
     expect(seen).toEqual(["theme=dark"]);
   });
 
+  it("advertises Vary: cookie when allowCookies is set", async () => {
+    // `allowCookies` keys on a hash of the allowlisted *subset* rather than on the raw
+    // header, so `cookie` is dropped from the key list — but the response still varies by
+    // the `Cookie` request header, which is the only granularity a downstream cache
+    // understands. Without the advertisement a CDN stores one visitor's variant and serves
+    // it to everyone under the `s-maxage` we synthesize.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 60, swr: true, allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light; sid=2" } }),
+    )) as Response;
+    const darkAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=3; theme=dark" } }),
+    )) as Response;
+
+    // The advertisement ...
+    expect(dark.headers.get("vary")).toBe("cookie");
+    expect(light.headers.get("vary")).toBe("cookie");
+    // ... accompanies a shared-cacheability claim, which is exactly why it must be there.
+    expect(dark.headers.get("cache-control")).toBe("s-maxage=60, stale-while-revalidate");
+    // ... and it is true: two `theme` values are two entries, while the unlisted `sid`
+    // still doesn't split them (key composition unchanged).
+    expect(callCount).toBe(2);
+    expect(await dark.text()).toBe("call-1");
+    expect(await light.text()).toBe("call-2");
+    expect(await darkAgain.text()).toBe("call-1");
+  });
+
+  it("advertises Vary: cookie exactly once for varies: ['cookie'] + allowCookies", async () => {
+    // The allowlist supersedes the coarse `varies` entry for *keying* only; the caller's
+    // explicit `varies: ["cookie"]` must not silently lose its `Vary`, and must not be
+    // duplicated by the allowlist adding the same name back.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"], allowCookies: ["theme"] },
+    );
+
+    const r1 = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const r2 = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=2" } }),
+    )) as Response;
+
+    expect(r1.headers.get("vary")).toBe("cookie");
+    expect(r2.headers.get("vary")).toBe("cookie");
+    // Still keyed by the allowlisted subset, never the raw header: `sid` doesn't split.
+    expect(callCount).toBe(1);
+    expect(await r2.text()).toBe("call-1");
+  });
+
+  it("advertises Vary: cookie for varies: ['cookie'] without an allowlist", async () => {
+    // Regression guard for the unchanged half: with no `allowCookies`, `cookie` is in both
+    // lists and the raw header keys the entry.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"] },
+    );
+
+    const r1 = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    const r2 = (await handler(makeEvent(path, { headers: { cookie: "sid=2" } }))) as Response;
+
+    expect(r1.headers.get("vary")).toBe("cookie");
+    expect(callCount).toBe(2);
+    expect(await r2.text()).toBe("call-2");
+  });
+
+  it("advertises the credential headers alongside cookie when both are opted into", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 10,
+      allowCookies: ["theme"],
+      allowAuthorization: true,
+    });
+
+    const res = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark", authorization: "Bearer t" } }),
+    )) as Response;
+
+    expect(res.headers.get("vary")).toBe("authorization, cookie, proxy-authorization");
+  });
+
+  it("merges Vary: cookie into a handler-set Vary without clobbering it", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => new Response("ok", { headers: { vary: "User-Agent" } }),
+      { maxAge: 10, allowCookies: ["theme"] },
+    );
+
+    const res = (await handler(makeEvent(path, { headers: { cookie: "theme=dark" } }))) as Response;
+
+    expect(res.headers.get("vary")).toBe("User-Agent, cookie");
+  });
+
   it("does not narrow requests that bypass caching (non-GET/HEAD)", async () => {
     const seen: Array<{ cookie: string | null; varied: string | null; url: string; body: string }> =
       [];

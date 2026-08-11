@@ -298,6 +298,19 @@ export interface CachedEventHandlerOptions<E extends HTTPEvent = HTTPEvent> exte
    * selects a *representation* — a `theme`/`locale` preference that becomes part of the
    * key — not a per-user secret: everyone presenting the same value shares one entry.
    *
+   * ⚠️ **Setting this emits `Vary: Cookie` on the response**, because the response really
+   * does vary by the `Cookie` request header and `Vary` has no finer granularity than the
+   * header name — a shared cache cannot be told "only the `theme` cookie matters". This is
+   * correctness, but it has a price: `Vary: Cookie` is notoriously destructive to CDN /
+   * shared-proxy hit rates, since any unrelated cookie (analytics, A/B, consent) makes a
+   * request its own variant, so downstream caching effectively stops. Previously ocache
+   * omitted the header and advertised `s-maxage`/`max-age` regardless — shared caches
+   * cached more, and served one visitor's variant to everyone. **If downstream hit rate is
+   * what you need, do not key by cookie at all**: drop `allowCookies` (the default strips
+   * the header) and select the representation from the URL instead ({@link allowQuery}, or
+   * distinct paths). {@link sendCacheControl}`: false` is the other option — keep the
+   * cookie-keyed server-side cache and advertise nothing downstream.
+   *
    * **This option has no effect on the response.** No `Set-Cookie` ever survives a
    * cacheable response, allowlisted or not: it is stripped before the entry is stored
    * *and* before the response is returned, mirroring how shared caches / CDNs drop

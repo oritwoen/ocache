@@ -60,22 +60,46 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   // key, so the first caller's response is stored under the anonymous key, replayed to
   // everyone, and (via the synthesized `public, s-maxage=N`) propagated by shared CDNs —
   // whereas the same route behind a cookie fails safe. `allowAuthorization` opts them back
-  // in by folding both names into `variableHeaderNames` below, which is what makes them
+  // in by folding both names into the header lists below, which is what makes them
   // key-varying, `Vary`-advertised and handler-visible all at once.
   const _authHeaderNames = ["authorization", "proxy-authorization"];
 
-  const variableHeaderNames = [
+  // The request header names the caller declared, before the two consumers below take
+  // their differing views of them.
+  const _declaredHeaderNames = [
     ...new Set([
       ...(opts.varies || []).filter(Boolean).map((h) => h.toLowerCase()),
       // Deduped against `varies`: a caller who already listed a credential header has
       // opted into keying on it, so `allowAuthorization` must not add it twice.
       ...(opts.allowAuthorization ? _authHeaderNames : []),
     ]),
-  ]
-    // `allowCookies` supersedes `varies: ["cookie"]`: when set, cookie key-scoping and
-    // handler-visibility are driven by the allowlist, so drop the coarse full-header vary.
-    .filter((h) => !(allowedCookieNames && h === "cookie"))
-    .sort();
+  ].sort();
+
+  // Two consumers, two lists, differing on exactly one name — `cookie` — because
+  // `allowCookies` changes *how* cookies are keyed without changing *whether* the response
+  // varies by them. Conflating the two is what made an `allowCookies` route advertise
+  // shared-cacheability it hadn't earned.
+  //
+  // 1. Key composition (`_resolveKey`), plus handler visibility for the credential headers.
+  //    `allowCookies` supersedes `varies: ["cookie"]` here: the key already carries a
+  //    `cookie.<hash>` component over the *allowlisted subset*, so hashing the coarse raw
+  //    header on top of it would re-admit exactly the unlisted cookies (analytics, A/B, a
+  //    session id) the allowlist exists to keep out of the key.
+  const keyHeaderNames = allowedCookieNames
+    ? _declaredHeaderNames.filter((h) => h !== "cookie")
+    : _declaredHeaderNames;
+
+  // 2. The response `Vary` advertisement, which is about the *request header* a downstream
+  //    cache must key on, not about our internal key shape. With an allowlist the response
+  //    does vary by `Cookie` (two `theme` values produce two entries), so a shared cache
+  //    that isn't told stores one visitor's variant and serves it to everyone under the
+  //    `s-maxage`/`max-age` we synthesize. `cookie` is deduped against a `varies` entry the
+  //    caller already wrote. Note the honest cost: `Vary: Cookie` collapses downstream hit
+  //    rates, since any unrelated cookie makes a request its own variant — a route that
+  //    needs CDN caching should not key by cookie at all.
+  const varyHeaderNames = allowedCookieNames
+    ? [...new Set([..._declaredHeaderNames, "cookie"])].sort()
+    : _declaredHeaderNames;
 
   const allowedQueryNames = opts.allowQuery
     ? [...new Set(opts.allowQuery.filter(Boolean))]
@@ -131,7 +155,7 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       _pathname = "-";
     }
     const _hashedPath = `${_pathname}.${hash(_path)}`;
-    const _headers = variableHeaderNames
+    const _headers = keyHeaderNames
       .map((header) => [header, event.req.headers.get(header)])
       .map(([name, value]) => `${escapeKey(name as string)}.${hash(value)}`);
     // Vary the key by the allowlisted cookie subset only (sorted, order-independent),
@@ -243,9 +267,11 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       // caches/CDNs/browsers store a separate variant per value — merging with any
       // `Vary` the handler already set rather than clobbering it (mirrors the
       // "preserve if present" behavior of the etag / last-modified / cache-control
-      // synthesis above).
-      if (variableHeaderNames.length > 0) {
-        _appendVary(res.headers, variableHeaderNames);
+      // synthesis above). This is `varyHeaderNames`, not the key list: `allowCookies`
+      // keys on a hashed subset of `Cookie` but the response still varies by the header
+      // itself, and a downstream cache can only be told at header granularity.
+      if (varyHeaderNames.length > 0) {
+        _appendVary(res.headers, varyHeaderNames);
       }
 
       // Strip EVERY Set-Cookie — allowlisted or not — BEFORE the headers are serialized.
@@ -403,9 +429,11 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       // entry held the default rendering).
       const filteredHeaders = [...event.req.headers.entries()].flatMap(([key, value]) => {
         const name = key.toLowerCase();
-        // Not in `variableHeaderNames` (neither `allowAuthorization` nor `varies`) means
-        // the credential can't vary the key, so the handler must not see it either.
-        if (_authHeaderNames.includes(name) && !variableHeaderNames.includes(name)) {
+        // Not in `keyHeaderNames` (neither `allowAuthorization` nor `varies`) means the
+        // credential can't vary the key, so the handler must not see it either. The *key*
+        // list is the right one here — visibility must follow what is actually keyed on,
+        // never the `Vary` advertisement.
+        if (_authHeaderNames.includes(name) && !keyHeaderNames.includes(name)) {
           return [];
         }
         if (name !== "cookie") {
