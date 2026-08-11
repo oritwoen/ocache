@@ -1,5 +1,11 @@
 import { hash } from "ohash";
-import { cachedFunction, expireCache, invalidateCache, resolveCacheKeys } from "./cache.ts";
+import {
+  _resolveName,
+  cachedFunction,
+  expireCache,
+  invalidateCache,
+  resolveCacheKeys,
+} from "./cache.ts";
 import { _resolveStorage } from "./storage.ts";
 
 import type {
@@ -41,7 +47,18 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   handler: EventHandler<E>,
   opts: CachedEventHandlerOptions<E> = {},
 ): CachedEventHandler<E> {
-  opts = { ...defaultCacheOptions(), ...opts };
+  // Resolve `name` from the caller's opts BEFORE merging the defaults below, which set a
+  // truthy `name: "_"`. Merging first (the previous behavior) made `opts.name` always `"_"`
+  // by the time `cachedFunction` re-derived it, so the `fn.name`/source-hash fallback was
+  // unreachable and *every* handler keyed as `_` — issue #53's fix never reached the HTTP
+  // layer. Two handlers sharing one `storage` on the same path then collided: identical
+  // sources hash to the same integrity too, so one served the other's cached response;
+  // differing sources failed each other's integrity check on every read (0% hit rate).
+  // Same rule as `defineCachedFunction`, via the same helper so the two cannot drift — see
+  // `_resolveName` in `cache.ts`, including the documented caveat that same-source handlers
+  // from one factory still share a name (pass an explicit `name`).
+  const name = _resolveName(opts.name, handler);
+  opts = { ...defaultCacheOptions(), ...opts, name };
 
   // Allowlist of cookie names that may participate in caching — the *request* side only.
   // `undefined` means "no cookies allowed": the Cookie request header is stripped before

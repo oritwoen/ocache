@@ -36,18 +36,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   fn: (...args: ArgsT) => T | Promise<T>,
   opts: CacheOptions<T, ArgsT> = {},
 ): CachedFunction<T, ArgsT> {
-  // Resolve `name` from the caller's opts BEFORE merging defaults: defaultCacheOptions()
-  // sets a truthy `name: "_"`, so if defaults were merged first `opts.name` would always
-  // be `"_"` and the `fn.name` fallback would be unreachable (silent cache-key collision
-  // across every unnamed cached function — https://github.com/unjs/ocache/issues/53).
-  //
-  // For anonymous functions (no `opts.name`, no `fn.name`) fall back to a hash of the
-  // function source instead of a shared literal: two distinct inline arrows would
-  // otherwise resolve to the same key and thrash each other (each read fails the
-  // integrity check and re-resolves). This can't disambiguate same-source functions
-  // that only differ by closed-over variables — pass an explicit `name`/`getKey` for
-  // those (the integrity hash collides there too, so it's unfixable from the source alone).
-  const name = opts.name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
+  // Resolve `name` from the caller's opts BEFORE merging defaults — see `_resolveName`.
+  const name = _resolveName(opts.name, fn);
   // Keep a handle on the caller's own options object *before* the defaults merge clones
   // it: that object is the memo slot for the resolved storage, so a caller who hands the
   // same object to `invalidateCache`/`expireCache` reaches this instance's store (see
@@ -519,6 +509,34 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
 }
 
 // --- Internal helpers ---
+
+// Cache-key `name` resolution, shared by `defineCachedFunction` and `defineCachedHandler`
+// (which passes the wrapped `EventHandler` as `fn`) so the two paths cannot drift.
+// Deliberately commented with `//`, not JSDoc, so docs4ts keeps it out of the API docs.
+//
+// MUST be called on the *caller's* options, BEFORE `defaultCacheOptions()` is merged in:
+// those defaults set a truthy `name: "_"`, so merging first makes `opts.name` always `"_"`
+// and the `fn.name` fallback dead code — a silent cache-key collision across every unnamed
+// cached function/handler (https://github.com/unjs/ocache/issues/53). `defineCachedHandler`
+// merged its defaults first and so shipped exactly that bug for handlers: every handler
+// keyed as `_`, and two handlers sharing one `storage` (the configuration the `storage`
+// docs recommend) either thrashed each other's entries or — when their sources match, so
+// the integrity hash matches too — served each other's cached responses.
+//
+// For anonymous functions (no `opts.name`, no `fn.name`) fall back to a hash of the
+// function source instead of a shared literal: two distinct inline arrows would
+// otherwise resolve to the same key and thrash each other (each read fails the
+// integrity check and re-resolves). A source hash is the right fallback precisely because
+// it is *stable* — keys must survive a process restart for persistent/shared backends, so
+// nothing per-instance (counter, WeakMap, randomness) is admissible here. The cost is that
+// it can't disambiguate same-source functions that only differ by closed-over variables
+// (the classic factory: `const make = (t) => defineCachedHandler(() => render(t))`) — pass
+// an explicit `name`/`getKey` for those. The integrity hash collides there too, so it is
+// unfixable from the source alone, and with a shared `storage` it is a cross-instance leak
+// rather than mere thrash.
+export function _resolveName(name: string | undefined, fn: (...args: any[]) => any): string {
+  return name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
+}
 
 // Storage for the standalone purge helpers, which — unlike `resolveCacheKeys` (pure key
 // derivation, no storage) — are useless without the backend the entries were written to.

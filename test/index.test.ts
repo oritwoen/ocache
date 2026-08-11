@@ -954,6 +954,110 @@ describe("cache key name resolution (#53)", () => {
   });
 });
 
+// Regression: `defineCachedHandler` merged `defaultCacheOptions()` (`name: "_"`) before
+// delegating to `cachedFunction`, so the `opts.name || fn.name || anon_<hash>` resolution
+// above was unreachable and EVERY handler keyed as `_`. Two handlers sharing one storage
+// (the configuration the `storage` docs recommend) then collided on the same path: same
+// source => same integrity => one served the other's cached response; different sources =>
+// each read failed the other's integrity check => 0% hit rate.
+describe("handler cache key name resolution", () => {
+  const handlerEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+
+  it("gives two handlers sharing one storage distinct keys on the same path", async () => {
+    const storage = createMemoryStorage();
+    const acme = _defineCachedHandler(() => new Response("tenant=ACME"), { maxAge: 60, storage });
+    const globex = _defineCachedHandler(() => new Response("tenant=GLOBEX; other source"), {
+      maxAge: 60,
+      storage,
+    });
+
+    const acmeKey = (await acme.resolveKeys(handlerEvent("/dashboard")))[0]!;
+    const globexKey = (await globex.resolveKeys(handlerEvent("/dashboard")))[0]!;
+    expect(acmeKey).not.toBe(globexKey);
+    expect(acmeKey).toMatch(/^\/cache:handlers:anon_[\w-]{16}:dashboard\./);
+
+    // …and they never serve each other's responses, in either order.
+    expect(await ((await acme(handlerEvent("/dashboard"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex(handlerEvent("/dashboard"))) as Response).text()).toBe(
+      "tenant=GLOBEX; other source",
+    );
+    expect(await ((await acme(handlerEvent("/dashboard"))) as Response).text()).toBe("tenant=ACME");
+  });
+
+  it("uses handler.name in the storage key when no name option is given", async () => {
+    const storage = createMemoryStorage();
+    const dashboard = _defineCachedHandler(
+      async function dashboard() {
+        return new Response("dash");
+      },
+      { maxAge: 60, storage },
+    );
+    const profile = _defineCachedHandler(
+      async function profile() {
+        return new Response("profile");
+      },
+      { maxAge: 60, storage },
+    );
+
+    expect((await dashboard.resolveKeys(handlerEvent("/x")))[0]).toMatch(
+      /^\/cache:handlers:dashboard:/,
+    );
+    expect((await profile.resolveKeys(handlerEvent("/x")))[0]).toMatch(
+      /^\/cache:handlers:profile:/,
+    );
+  });
+
+  it("explicit name option still overrides handler.name", async () => {
+    const storage = createMemoryStorage();
+    const handler = _defineCachedHandler(
+      async function actualName() {
+        return new Response("v");
+      },
+      { maxAge: 60, name: "custom", storage },
+    );
+    expect((await handler.resolveKeys(handlerEvent("/x")))[0]).toMatch(/^\/cache:handlers:custom:/);
+  });
+
+  // DOCUMENTED CAVEAT, not a bug: the anonymous fallback hashes the handler *source*, and
+  // two handlers built by one factory have identical source — only their closed-over
+  // variables differ, which no source hash can see. They therefore share a name (and, since
+  // the integrity hash is derived from the same source, share entries outright when they
+  // also share a storage). A per-instance discriminator (counter/WeakMap/random) is not an
+  // option: keys must be stable across process restarts for persistent/shared backends.
+  // The fix is an explicit `name`, asserted in the second half of this test.
+  it("same-factory handlers share a key unless given an explicit name", async () => {
+    const storage = createMemoryStorage();
+    const make = (tenant: string) =>
+      _defineCachedHandler(() => new Response(`tenant=${tenant}`), { maxAge: 60, storage });
+
+    const acme = make("ACME");
+    const globex = make("GLOBEX");
+    expect((await acme.resolveKeys(handlerEvent("/dash")))[0]).toBe(
+      (await globex.resolveKeys(handlerEvent("/dash")))[0],
+    );
+    // Same source => same integrity too, so the collision is a cross-handler HIT.
+    expect(await ((await acme(handlerEvent("/dash"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex(handlerEvent("/dash"))) as Response).text()).toBe("tenant=ACME");
+
+    // The documented fix: name the instances.
+    const namedMake = (tenant: string) =>
+      _defineCachedHandler(() => new Response(`tenant=${tenant}`), {
+        maxAge: 60,
+        name: `tenant-${tenant}`,
+        storage,
+      });
+    const acme2 = namedMake("ACME");
+    const globex2 = namedMake("GLOBEX");
+    expect((await acme2.resolveKeys(handlerEvent("/dash2")))[0]).not.toBe(
+      (await globex2.resolveKeys(handlerEvent("/dash2")))[0],
+    );
+    expect(await ((await acme2(handlerEvent("/dash2"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex2(handlerEvent("/dash2"))) as Response).text()).toBe(
+      "tenant=GLOBEX",
+    );
+  });
+});
+
 describe("getMaxAge (dynamic per-entry TTL)", () => {
   it("derives maxAge from the resolved value for the freshness check", async () => {
     let callCount = 0;
@@ -1634,6 +1738,12 @@ describe("defineCachedHandler", () => {
   }
   function uniquePath() {
     return `/test-${++testId}-${Date.now()}`;
+  }
+  // The `HEAD:` component is inserted right after the name segment. That segment is the
+  // resolved handler name (`fn.name` / `anon_<hash>` — see "handler cache key name
+  // resolution (#53)"), not the old shared `_` literal, so match it structurally.
+  function headVariantKey(getKey: string) {
+    return getKey.replace(/^(\/cache:handlers:[^:]+:)/, "$1HEAD:");
   }
 
   it("caches GET responses", async () => {
@@ -3922,7 +4032,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
 
     const keys = await handler.resolveKeys(makeEvent(path));
-    expect(keys[1]).toBe(keys[0]!.replace(":handlers:_:", ":handlers:_:HEAD:"));
+    expect(keys[1]).toBe(headVariantKey(keys[0]!));
   });
 
   it("composes the HEAD discriminator with varies and allowCookies key components", async () => {
@@ -3964,7 +4074,7 @@ describe("defineCachedHandler", () => {
     // vary/cookie components are preserved verbatim on both sides.
     const [getKey, getSibling] = await handler.resolveKeys(event("GET", "en", "1"));
     const [headKey, headSibling] = await handler.resolveKeys(event("HEAD", "en", "1"));
-    expect(headKey).toBe(getKey!.replace(":handlers:_:", ":handlers:_:HEAD:"));
+    expect(headKey).toBe(headVariantKey(getKey!));
     expect(getSibling).toBe(headKey);
     expect(headSibling).toBe(getKey);
     expect(getKey).toMatch(/:acceptlanguage\.[^:]+:cookie\.[^:]+\.json$/);
@@ -3977,7 +4087,7 @@ describe("defineCachedHandler", () => {
     await handler(makeEvent(path));
     await handler(makeEvent(path, { method: "HEAD" }));
     const getKey = (await handler.resolveKeys(makeEvent(path)))[0]!;
-    const keys = [getKey, getKey.replace(":handlers:_:", ":handlers:_:HEAD:")];
+    const keys = [getKey, headVariantKey(getKey)];
     for (const key of keys) {
       expect(await testStorage.get(key)).toBeTruthy();
     }

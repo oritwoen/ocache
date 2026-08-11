@@ -89,7 +89,16 @@ export interface CacheEntry<T = any> {
  * Options for configuring cached functions created by `defineCachedFunction`.
  */
 export interface CacheOptions<T = any, ArgsT extends unknown[] = any[]> {
-  /** Name used as part of the cache key. Defaults to the function name or `"_"`. */
+  /**
+   * Name used as part of the cache key.
+   *
+   * Defaults to the cached function's (or handler's) own `name`, falling back to a hash of
+   * its source for anonymous ones. A source hash cannot distinguish same-source functions
+   * that differ only by a closed-over variable (the classic factory:
+   * `const make = (tenant) => defineCachedHandler(() => render(tenant), { storage })`) —
+   * those share a key, and with a shared `storage` they share entries outright. Pass an
+   * explicit `name` whenever instances are built in a factory or a loop.
+   */
   name?: string;
   /** Custom cache key generator. Receives the same arguments as the cached function. */
   getKey?: (...args: ArgsT) => string | Promise<string>;
