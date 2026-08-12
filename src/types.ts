@@ -87,6 +87,12 @@ export interface CacheEntry<T = any> {
 
 /**
  * Options for configuring cached functions created by `defineCachedFunction`.
+ *
+ * **An option explicitly set to `undefined` is treated as unset** and takes its default —
+ * `{ maxAge: undefined }` caches exactly like `{}`. This matters because that spelling comes
+ * from plumbing rather than from anyone's keyboard: `{ maxAge: routeConfig.maxAge }` where the
+ * rule sets no `maxAge`. `null` is not `undefined` and is left as written. Same rule for
+ * {@link CachedEventHandlerOptions}.
  */
 export interface CacheOptions<T = any, ArgsT extends unknown[] = any[]> {
   /**
@@ -156,19 +162,44 @@ export interface CacheOptions<T = any, ArgsT extends unknown[] = any[]> {
   group?: string;
   /** Custom integrity value. Auto-generated from the function and options by default. */
   integrity?: any;
-  /** Number of seconds to cache the response. Defaults to `1`. */
+  /**
+   * Number of seconds to cache the response. Defaults to `1` — including when it is passed
+   * as an explicit `undefined` (see the note on this interface).
+   *
+   * A lifetime of `0` means **nothing is stored**: such an entry is expired the moment it is
+   * written, so the value is re-resolved on every access either way, and persisting it would
+   * leave behind an entry with neither an expiry nor a storage TTL, which nothing could ever
+   * serve or reclaim.
+   */
   maxAge?: number;
-  /** Enable stale-while-revalidate behavior. When `true`, returns stale cache while refreshing in the background. Defaults to `false` (an expired entry is re-resolved in the foreground before returning). */
+  /**
+   * Enable stale-while-revalidate behavior. When `true`, returns stale cache while refreshing
+   * in the background. Defaults to `false` (an expired entry is re-resolved in the foreground
+   * before returning).
+   *
+   * With no {@link staleMaxAge} there is no point at which the value becomes too old to
+   * serve: the last successful resolution keeps being served until a background refresh
+   * replaces it (the ISR shape), and the entry is retained until the storage backend evicts
+   * it. Set `staleMaxAge` for a hard cutoff and a storage TTL of `maxAge + staleMaxAge`.
+   */
   swr?: boolean;
-  /** Maximum number of seconds a stale entry can be served while revalidating. `0` means stale is never served — once expired, revalidation blocks the request. */
+  /**
+   * Maximum number of seconds a stale entry can be served while revalidating, and the extra
+   * time it stays in storage (the TTL is `maxAge + staleMaxAge`). `0` means stale is never
+   * served — once expired, revalidation blocks the request.
+   *
+   * Unset is **not** the same as `0`: it means the stale window is unbounded — under
+   * {@link swr} the entry is served stale for as long as the storage backend keeps it.
+   */
   staleMaxAge?: number;
   /**
    * Derive the per-entry cache lifetime from the resolved value. Runs after the resolver and before
    * the entry is persisted. Return a number (seconds) as shorthand for `maxAge`, or an object to also
    * override `staleMaxAge`. The resolved values override the static options for that entry and drive
    * both the read freshness check and the storage TTL. Return `undefined` (or omit a field) to fall
-   * back to the static option. A resolved value `<= 0` disables caching for that entry (re-resolves
-   * on every access); negatives are clamped to `0` rather than treated as "cache forever".
+   * back to the static option. A resolved value `<= 0` disables caching for that entry — it is
+   * re-resolved on every access and never written to storage; negatives are clamped to `0`
+   * rather than treated as "cache forever".
    *
    * @example
    * ```ts

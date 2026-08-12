@@ -509,7 +509,10 @@ describe("cachedFunction", () => {
     expect(callCount).toBe(2);
   });
 
-  it("no maxAge caches indefinitely", async () => {
+  // Named "caches indefinitely" for years, but `{}` merges the `maxAge: 1` default, so this
+  // is the 1-second cache, not a no-expiry one — the only test that ever looked like it
+  // covered cache-forever, and it never did (see "the no-lifetime invariant" describe).
+  it("no maxAge option caches with the 1s default", async () => {
     let callCount = 0;
     const fn = defineCachedFunction(() => {
       callCount++;
@@ -786,6 +789,11 @@ describe("cachedFunction", () => {
     expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 180 });
   });
 
+  // The ISR shape, asserted from the storage side: the entry IS written (so it can be served
+  // stale later — see "SWR without staleMaxAge serves stale indefinitely") but with no TTL,
+  // so nothing deletes it at `maxAge`. Arming `{ ttl: maxAge }` here (finding 14.3's proposed
+  // fix) would drop the entry the instant it goes stale and turn SWR into foreground
+  // revalidation; the bound on this shape is storage capacity (14.1), not a timer.
   it("does not set storage TTL when SWR without staleMaxAge", async () => {
     const setSpy = vi.fn();
     useTestStorage({
@@ -798,7 +806,12 @@ describe("cachedFunction", () => {
       swr: true,
     });
     await fn();
-    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), undefined);
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ value: "value" }),
+      undefined,
+    );
   });
 
   it("SWR with staleMaxAge: 0 never serves stale", async () => {
@@ -1203,9 +1216,11 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(await fn()).toBe(2);
     expect(callCount).toBe(2);
 
+    // A clamped-to-zero lifetime is not stored at all now: the entry could never be served
+    // (zero maxAge reads as expired on arrival), and writing it left storage holding an entry
+    // with neither an expiry nor a TTL — dead weight only a manual purge removed.
     const keys = await fn.resolveKeys();
-    const entry = (await testStorage.get(keys[0]!)) as any;
-    expect(entry.maxAge).toBe(0);
+    expect(await testStorage.get(keys[0]!)).toBeNull();
   });
 
   it("respects per-entry TTL when expiring via expireCache", async () => {
@@ -1228,6 +1243,352 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(entry.stale).toBe(true);
     // Entry value is preserved for SWR to keep serving
     expect(entry.value).toBe("value");
+  });
+});
+
+// One rule, checked from both sides: a write gets a storage TTL covering exactly the window
+// the entry may still be served in, and an entry with neither an expiry nor a TTL is never
+// written at all (findings 14.3 and 10.6).
+describe("storage TTL and the no-lifetime invariant", () => {
+  let testId = 0;
+  const makeEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+  const uniquePath = () => `/ttl-${++testId}-${Date.now()}`;
+
+  // The ISR semantic end to end: `revalidate` marks an entry eligible for regeneration, it
+  // never deletes it. Finding 14.3 proposed bounding this shape with a `{ ttl: maxAge }`
+  // storage TTL — that would delete the entry at the exact moment this test reads it stale,
+  // so SWR would degrade to foreground revalidation. The bound is storage capacity (14.1).
+  it("swr with no staleMaxAge serves STALE past maxAge and refreshes in the background", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 0.05, swr: true },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(await r1.text()).toBe("v1");
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    await new Promise((r) => setTimeout(r, 80));
+    // Past `maxAge` and still resident: no storage TTL was armed, so nothing reclaimed it.
+    expect(await testStorage.get(key!)).not.toBeNull();
+
+    const r2 = (await handler(makeEvent(path))) as Response;
+    expect(r2.headers.get("x-cache")).toBe("STALE");
+    expect(await r2.text()).toBe("v1");
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(callCount).toBe(2); // refreshed in the background
+    const r3 = (await handler(makeEvent(path))) as Response;
+    expect(r3.headers.get("x-cache")).toBe("HIT");
+    expect(await r3.text()).toBe("v2");
+  });
+
+  it("swr with staleMaxAge and a zero maxAge caches nothing, for a function", async () => {
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { swr: true, staleMaxAge: 600, maxAge: 0, getKey: () => "swr-zero-maxage" },
+    );
+
+    // A zero lifetime under SWR used to store an entry with no expiry and no storage TTL —
+    // cached forever while advertising itself as immediately stale. Nothing is stored now.
+    // (`maxAge: undefined` is NOT this config: an explicitly-undefined option reads as unset,
+    // so it takes the `maxAge: 1` default — see "explicitly-undefined options".)
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+    const keys = await fn.resolveKeys();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("swr with staleMaxAge and a zero maxAge caches nothing, for a handler (and says so)", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { swr: true, staleMaxAge: 600, maxAge: 0 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The zero lifetime is advertised (`s-maxage=0`), and `validate` reads it back as the
+    // storage opt-out it is — so the handler runs every time and nothing is stored.
+    expect(r1.headers.get("cache-control")).toBe("s-maxage=0, stale-while-revalidate=600");
+    expect(await r2.text()).toBe("v2");
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("swr with a getMaxAge hook and no static maxAge still caches (the hook is the lifetime)", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      // The documented per-route ISR shape: the window comes from the value, not a static
+      // option, so this is not a "missing maxAge" and must not read as a zero lifetime.
+      { swr: true, getMaxAge: () => 60 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+    // Stored, and — being the SWR-with-no-`staleMaxAge` (ISR) shape — with no storage TTL.
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), undefined);
+  });
+
+  it("a getMaxAge hook that supplies no lifetime falls back to the refused write", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      // The hook declines to give this entry a lifetime, so the static option decides — and
+      // that one is a refused write.
+      { swr: true, maxAge: 0, getMaxAge: () => undefined, getKey: () => "hook-nothing" },
+    );
+
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v2");
+    expect(setSpy).not.toHaveBeenCalled();
+  });
+
+  it("never writes an entry with neither an expiry nor a storage TTL", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { maxAge: 0, swr: false, getKey: () => "no-lifetime" },
+    );
+
+    expect(await fn()).toBe("v1");
+    await new Promise((r) => setTimeout(r, 20));
+    // A zero (or nullish) lifetime used to store an entry with no `expires` and no TTL and
+    // serve it as a permanent HIT — indistinguishable from a leak. Refused outright now, so
+    // the value is simply re-resolved.
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+    expect(setSpy).not.toHaveBeenCalled();
+    const keys = await fn.resolveKeys();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("evicts a pre-existing no-lifetime entry instead of rewriting it", async () => {
+    const fn = defineCachedFunction(() => "fresh", {
+      maxAge: 0,
+      getKey: () => "legacy",
+    });
+    const [key] = await fn.resolveKeys();
+    // What an older ocache left behind: a value with no expiry, no TTL, and a stale integrity.
+    await testStorage.set(key!, { value: "legacy", mtime: Date.now(), integrity: "old" });
+
+    expect(await fn()).toBe("fresh");
+
+    expect(await testStorage.get(key!)).toBeNull();
+  });
+
+  it("treats staleMaxAge: 0 as a named zero window, not as unset", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { maxAge: 0.05, swr: true, staleMaxAge: 0, getKey: () => "zero-stale" },
+    );
+
+    // Stored and served fresh...
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v1");
+    expect(callCount).toBe(1);
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 0.05 });
+
+    // ...but never served stale: the zero window revalidates in the foreground.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+  });
+
+  it("stores a must-revalidate response with a TTL of maxAge (per-entry staleMaxAge: 0)", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: { "cache-control": "public, max-age=60, must-revalidate" },
+        });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The internal `getMaxAge` wrapper persists `staleMaxAge: 0` on this entry, and a
+    // per-entry `0` is a real window — not a missing one — so the TTL is `maxAge` alone
+    // (60), never `maxAge + 600` from the static option it overrides.
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 60 });
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+  });
+});
+
+// `{ ...defaults(), ...opts }` copies undefined-valued own properties, so an explicit
+// `undefined` used to clobber a default an absent key would have kept — the spelling plumbing
+// produces (`{ maxAge: routeConfig.maxAge }` with an unset rule), never one anybody types.
+// `definedOptions` drops them at both merge sites so the two spellings are indistinguishable.
+describe("explicitly-undefined options are treated as unset", () => {
+  let testId = 0;
+  const makeEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+
+  /** Runs a cached function twice; reports resolver calls and the TTL of every storage write. */
+  async function runFn(opts: Record<string, unknown>) {
+    const name = `undef-fn-${++testId}`;
+    const setSpy = vi.spyOn(testStorage, "set");
+    let calls = 0;
+    const fn = defineCachedFunction(
+      () => {
+        calls++;
+        return `v${calls}`;
+      },
+      // A per-run name/key: same-source functions would otherwise share both key and integrity.
+      { name, getKey: () => name, ...opts },
+    );
+    await fn();
+    await fn();
+    const writes = setSpy.mock.calls.filter(([, value]) => value != null).map(([, , o]) => o);
+    setSpy.mockRestore();
+    return { calls, writes };
+  }
+
+  /** The same for a handler, plus what it advertised and how the second request was served. */
+  async function runHandler(opts: Record<string, unknown>) {
+    const path = `/undef-h-${++testId}`;
+    const setSpy = vi.spyOn(testStorage, "set");
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`v${calls}`);
+      },
+      { name: `undef-h-${testId}`, ...opts },
+    );
+    await handler(makeEvent(path));
+    const res = (await handler(makeEvent(path))) as Response;
+    const writes = setSpy.mock.calls.filter(([, value]) => value != null).map(([, , o]) => o);
+    setSpy.mockRestore();
+    return {
+      calls,
+      writes,
+      body: await res.text(),
+      cacheControl: res.headers.get("cache-control"),
+      status: res.headers.get("x-cache"),
+    };
+  }
+
+  it("maxAge: undefined caches exactly like an absent maxAge (function)", async () => {
+    // The measured divergence: `{}` resolved once and wrote `{ ttl: 1 }`, while
+    // `{ maxAge: undefined }` resolved on every call and wrote nothing at all.
+    expect(await runFn({ maxAge: undefined })).toEqual(await runFn({}));
+    expect(await runFn({})).toEqual({ calls: 1, writes: [{ ttl: 1 }] });
+  });
+
+  it("maxAge: undefined caches exactly like an absent maxAge (handler)", async () => {
+    const absent = await runHandler({});
+    const explicit = await runHandler({ maxAge: undefined });
+    expect(explicit).toEqual(absent);
+    expect(absent).toMatchObject({
+      calls: 1,
+      writes: [{ ttl: 1 }],
+      body: "v1",
+      cacheControl: "max-age=1",
+      status: "HIT",
+    });
+  });
+
+  it("swr: undefined and staleMaxAge: undefined behave like absent ones", async () => {
+    const absent = await runFn({ maxAge: 10 });
+    expect(await runFn({ maxAge: 10, swr: undefined })).toEqual(absent);
+    expect(await runFn({ maxAge: 10, staleMaxAge: undefined })).toEqual(absent);
+    expect(await runFn({ maxAge: 10, swr: undefined, staleMaxAge: undefined })).toEqual(absent);
+    expect(absent).toEqual({ calls: 1, writes: [{ ttl: 10 }] });
+
+    // Same for the handler, where `swr` also decides which directive is synthesized.
+    const swrAbsent = await runHandler({ maxAge: 60, staleMaxAge: 600 });
+    expect(await runHandler({ maxAge: 60, staleMaxAge: 600, swr: undefined })).toEqual(swrAbsent);
+    expect(swrAbsent.cacheControl).toBe("max-age=60");
+  });
+
+  it("storage: undefined still gets the per-instance default storage", async () => {
+    let calls = 0;
+    // The raw import: the test wrapper's `storage ??=` would fill an undefined one in itself.
+    const fn = _defineCachedFunction(
+      () => {
+        calls++;
+        return `v${calls}`;
+      },
+      { maxAge: 10, storage: undefined, name: "undef-storage", getKey: () => "k" },
+    );
+
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v1");
+    expect(calls).toBe(1);
+  });
+
+  it("an option set to a real value still wins over the default", async () => {
+    // The guard against over-stripping: only `undefined` goes, never a falsy value.
+    expect(await runFn({ maxAge: 10 })).toEqual({ calls: 1, writes: [{ ttl: 10 }] });
+    expect(await runFn({ maxAge: 60, swr: true, staleMaxAge: 600 })).toEqual({
+      calls: 1,
+      writes: [{ ttl: 660 }],
+    });
+    expect(await runHandler({ maxAge: 30 })).toMatchObject({ cacheControl: "max-age=30" });
+    // `swr: false` and `maxAge: 0` are values, not absences: the zero lifetime is advertised
+    // and keeps the response out of storage (the 10.6 invariant, unaffected by the strip).
+    expect(await runFn({ maxAge: 0, swr: false })).toEqual({ calls: 2, writes: [] });
+    expect(await runHandler({ maxAge: 0, swr: false })).toMatchObject({
+      calls: 2,
+      writes: [],
+      cacheControl: "max-age=0",
+      status: "MISS",
+    });
+  });
+
+  it("preserves an explicit null lifetime, which is not the same as undefined", async () => {
+    // Only `undefined` reads as unset. A `null` maxAge stays nullish, so it names no lifetime
+    // and the write is refused — the opposite outcome from `maxAge: undefined` above.
+    expect(await runFn({ maxAge: null })).toEqual({ calls: 2, writes: [] });
+    expect(await runFn({ maxAge: undefined })).toEqual({ calls: 1, writes: [{ ttl: 1 }] });
   });
 });
 
@@ -4539,7 +4900,11 @@ describe("defineCachedHandler", () => {
     expect(await testStorage.get(keys[0]!)).toBeNull();
   });
 
-  it("no cache-control when maxAge is absent and no swr", async () => {
+  // Was "no cache-control when maxAge is absent and no swr", asserting `null` for
+  // `{ maxAge: undefined }`. That was the old undefined-vs-absent divergence, not an absent
+  // `maxAge`: an unset `maxAge` has always taken the `maxAge: 1` default (`{}` did), and an
+  // explicit `undefined` now does too. Silence is `sendCacheControl: false`, tested above.
+  it("advertises the maxAge default when maxAge is explicitly undefined and no swr", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), {
       maxAge: undefined,
@@ -4547,7 +4912,7 @@ describe("defineCachedHandler", () => {
     });
 
     const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-control")).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("max-age=1");
   });
 
   it("uses custom toResponse hook", async () => {
@@ -5655,6 +6020,25 @@ describe("expireCache", () => {
       expect.any(String),
       expect.objectContaining({ stale: true, value: "value" }),
       { ttl: 180 },
+    );
+  });
+
+  it("expiring an SWR entry with no staleMaxAge leaves it TTL-less, as the write did", async () => {
+    const opts = { maxAge: 60, swr: true, name: "myFn", getKey: () => "k" };
+    const fn = defineCachedFunction(() => "value", opts);
+    await fn();
+
+    const setSpy = vi.spyOn(testStorage, "set");
+    await fn.expire();
+
+    // `expireCache` rewrites the entry, so it derives its TTL from the same `storageTtl` the
+    // write path uses. Inventing a `{ ttl: 60 }` here would delete the entry at `maxAge` —
+    // the opposite of what `.expire()` means for the ISR shape (serve it stale once more,
+    // refresh in the background).
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ stale: true, value: "value" }),
+      undefined,
     );
   });
 

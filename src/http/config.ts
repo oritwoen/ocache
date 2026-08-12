@@ -2,7 +2,7 @@
 // the cookie/query allowlists, the key header list, the `Vary` list and the status header.
 // Computed once at definition time, so no module re-derives a list of its own.
 
-import { resolveName } from "../cache.ts";
+import { definedOptions, resolveName } from "../cache.ts";
 
 import type { HTTPEvent, EventHandler, CachedEventHandlerOptions } from "../types.ts";
 
@@ -87,7 +87,14 @@ export function resolveHandlerConfig<E extends HTTPEvent>(
   callerOpts: CachedEventHandlerOptions<E>,
 ): HandlerConfig<E> {
   const name = resolveName(callerOpts.name, handler);
-  const opts: CachedEventHandlerOptions<E> = { ...defaultHandlerOptions(), ...callerOpts, name };
+  // `definedOptions` (from `cache.ts`, the same helper `defineCachedFunction` merges through):
+  // an option explicitly set to `undefined` reads as unset, so `{ maxAge: routeConfig.maxAge }`
+  // with an unset rule gets the `maxAge: 1` default rather than clobbering it with nothing.
+  const opts: CachedEventHandlerOptions<E> = {
+    ...defaultHandlerOptions(),
+    ...definedOptions(callerOpts),
+    name,
+  };
 
   // Names are trimmed/deduped; an empty (or whitespace-only) list normalizes to the
   // "no cookies allowed" default.

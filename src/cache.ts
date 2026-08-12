@@ -44,7 +44,10 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   // `resolveStorage`). The clone below is kept in sync as a mirror, since it is what the
   // `.invalidate()`/`.expire()` methods delegate with.
   const _optsRef = opts;
-  opts = { ...defaultCacheOptions(), ...opts, name };
+  // `definedOptions` first: an option explicitly set to `undefined` must read as unset, not
+  // as "override the default with nothing". Applied to a *copy*, so `_optsRef` above is still
+  // the caller's own object and the storage memo lands where the helpers can see it.
+  opts = { ...defaultCacheOptions(), ...definedOptions(opts), name };
 
   // Storage is resolved on first actual read/write, never at definition time: the `storage`
   // option may be a factory precisely because the real backend is often only configured
@@ -260,22 +263,15 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           entry.maxAge = resolved.maxAge;
           entry.staleMaxAge = resolved.staleMaxAge;
         }
-        if ((await validate(entry, validateCtx)) !== false) {
-          // Per-entry TTL (from the `getMaxAge` hook) falls back to static options when not provided.
-          const writeMaxAge = entry.maxAge ?? opts.maxAge;
-          const writeStaleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
-          let setOpts: { ttl?: number } | undefined;
-          if (writeMaxAge != null && writeMaxAge > 0) {
-            if (opts.swr) {
-              // With SWR, storage TTL must cover maxAge + staleMaxAge window
-              if (writeStaleMaxAge != null && writeStaleMaxAge >= 0) {
-                setOpts = { ttl: writeMaxAge + writeStaleMaxAge };
-              }
-              // If staleMaxAge is not set, no storage TTL (entry lives until manually evicted)
-            } else {
-              setOpts = { ttl: writeMaxAge };
-            }
-          }
+        // Storage options for this write — `false` when the entry must not be stored at all,
+        // `undefined` when it is stored with no TTL (see `storageTtl`). Per-entry lifetimes
+        // from `getMaxAge` take precedence over the static options, as on the read path above.
+        const setOpts = storageTtl(
+          entry.maxAge ?? opts.maxAge,
+          entry.staleMaxAge ?? opts.staleMaxAge,
+          opts.swr,
+        );
+        if ((await validate(entry, validateCtx)) !== false && setOpts !== false) {
           // Multi-tier write: only write to tiers up to the one that matched.
           // If no tier had a hit (hitIndex === -1), write to all tiers.
           // If tier N matched, write to tiers 0..N (promote upward + refresh hit tier).
@@ -295,10 +291,12 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           })();
           event?.req.waitUntil?.(promise);
         } else if (hitIndex >= 0) {
-          // A prior cached entry existed but revalidation produced an invalid result —
-          // evict it so SWR doesn't keep serving the stale value. When there was no
-          // cache hit (hitIndex === -1) nothing is stored, so skip the redundant delete
-          // (e.g. a handler returning `Cache-Control: no-store`/`private` on every request).
+          // A prior cached entry existed but this resolution isn't storable — `validate`
+          // refused it, or it has no lifetime at all (`storageTtl` → `false`). Evict it
+          // so SWR doesn't keep serving the stale value, which also clears out entries an
+          // older ocache wrote with no expiry and no TTL. When there was no cache hit
+          // (hitIndex === -1) nothing is stored, so skip the redundant delete (e.g. a handler
+          // returning `Cache-Control: no-store`/`private` on every request).
           const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
             (error) => {
               onError("[cache] Cache eviction error.", error);
@@ -538,6 +536,41 @@ export function resolveName(name: string | undefined, fn: (...args: any[]) => an
   return name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
 }
 
+// Drops own properties whose value is `undefined`, so an option explicitly set to `undefined`
+// is indistinguishable from an absent one. Shared by both defaults merges (`defineCachedFunction`
+// here and `resolveHandlerConfig` in `http/config.ts`) so the two can't drift.
+//
+// Object spread copies own properties *including* undefined-valued ones, so
+// `{ ...defaults(), ...opts }` let `{ maxAge: undefined }` clobber the `maxAge: 1` default
+// while `{}` kept it. That spelling is what plumbing produces, never what anyone types —
+// `defineCachedHandler(h, { maxAge: routeConfig.maxAge })` with an unset rule — and the route
+// then silently stopped caching entirely (before finding 10.6 it silently cached *forever*:
+// same divergence, opposite harm). Applies to every option, not just the lifetimes:
+// `swr`/`staleMaxAge`/`storage`/`getKey`/`varies` all had the same shape.
+//
+// Idempotent, which is what makes the handler path safe: it merges twice (here, then again
+// when `defineCachedHandler` hands its `_opts` to `cachedFunction`), and the second pass only
+// ever sees an already-cleaned object plus the hooks `http/index.ts` sets itself — of which
+// `transform: undefined` ("no cache-status header") is the one undefined-valued key, dropped
+// to no effect since the defaults name no `transform` to restore.
+//
+// Only `undefined` is dropped; `null` is left as the caller wrote it. Returns a fresh object —
+// the caller's own options object is never mutated (it is the storage memo slot, see
+// `resolveStorage`), and the copy keeps symbol keys, exactly as a spread would.
+//
+// Costs one integrity hash: ohash walks an undefined-valued key, so an options object that
+// carries one hashes differently once the key is gone. That is exactly the set of configs this
+// fixes, and the effect is a single cold read per entry.
+export function definedOptions<T extends object>(opts: T): T {
+  const cleaned = { ...opts } as Record<string, unknown>;
+  for (const key of Object.keys(cleaned)) {
+    if (cleaned[key] === undefined) {
+      delete cleaned[key];
+    }
+  }
+  return cleaned as T;
+}
+
 // Storage for the standalone purge helpers, which — unlike `resolveCacheKeys` (pure key
 // derivation, no storage) — are useless without the backend the entries were written to.
 // Since storage became per-instance there is no ambient store to fall back on, so an unset
@@ -596,29 +629,70 @@ async function evictFromStorage(
   await Promise.all(bases.map((b) => storage.set(buildCacheKey(key, { group, name }, b), null)));
 }
 
+// The storage options a write gets: `{ ttl }`, `undefined` for "store it, with no storage
+// TTL", or `false` for "do not store it at all". One helper, so the write path and
+// `remainingTtl` (which rewrites an entry on the `expireCache` path) cannot drift.
+//
+// The rule is **never persist an entry that has neither an expiry nor a storage TTL** — such
+// an entry is unservable-as-fresh *and* unreclaimable, a permanent HIT indistinguishable from
+// a leak (finding 10.6). The two shapes that look alike under it are genuinely different and
+// must stay distinguished:
+//
+// - `{ swr: true, maxAge: 60 }` -> the entry HAS an expiry (`entry.expires`, from `maxAge`)
+//   and deliberately no TTL. It is merely *retained* past the moment it goes stale, which is
+//   the whole of ISR: the last good value keeps being served while a background refresh
+//   replaces it, and a *failed* refresh keeps serving the last success. `revalidate` marks an
+//   entry eligible for regeneration; it never deletes it. **Allowed.** Do not "fix" this into
+//   a `maxAge` TTL (finding 14.3's proposed fix): the entry would be dropped at the exact
+//   moment it went stale, so SWR would degrade to foreground revalidation and nothing would
+//   ever be served stale. The bound on this shape is the storage backend's *capacity*
+//   (finding 14.1's byte budget) — never a timer.
+// - `{ maxAge: 0 }` (or a `getMaxAge` clamped to it) -> neither an expiry nor a TTL: the read
+//   path treats it as expired on arrival, so the entry could never be served, only purged by
+//   hand. **Refused**, and a prior entry on that key is evicted instead (which also clears out
+//   what an older ocache left behind). A nullish `maxAge` is refused with it — unreachable
+//   from the two defaults merges (they always supply `maxAge: 1`, and `definedOptions` means
+//   an explicit `undefined` no longer defeats that), but reachable through the standalone
+//   `expireCache`, which merges nothing. It is also why `swr` with no `maxAge` needs no special
+//   case of its own: there is no such configuration to normalize.
+//
+// `!swr` rather than `swr === false` so an unset `swr` aligns with the SWR-off default on the
+// standalone `expireCache` path, which doesn't merge `defaultCacheOptions`. A negative
+// `staleMaxAge` states no window and is treated as unset.
+function storageTtl(
+  maxAge: number | undefined,
+  staleMaxAge: number | undefined,
+  swr: boolean | undefined,
+): { ttl: number } | undefined | false {
+  if (maxAge == null || maxAge <= 0) {
+    return false;
+  }
+  if (!swr) {
+    return { ttl: maxAge };
+  }
+  // Under SWR a TTL has to cover the whole window the entry may still be served in; with no
+  // stale window named there is no such moment, so no TTL is armed (the ISR shape above).
+  return staleMaxAge != null && staleMaxAge >= 0 ? { ttl: maxAge + staleMaxAge } : undefined;
+}
+
 /** Computes remaining storage TTL (seconds) so expiring an entry doesn't extend its original lifetime. */
 function remainingTtl(
   entry: CacheEntry,
   opts: Pick<CacheOptions, "maxAge" | "swr" | "staleMaxAge">,
 ): { ttl: number } | undefined {
-  // Prefer the per-entry TTL persisted by `getMaxAge`, falling back to static options.
-  const maxAge = entry.maxAge ?? opts.maxAge;
-  const staleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
-  if (!entry.mtime || maxAge == null || maxAge <= 0) {
+  // The same decision the write path makes (`storageTtl`), so expiring an entry can neither
+  // extend its lifetime nor strip a TTL off it — nor arm one the write deliberately withheld,
+  // which would delete the ISR entry the moment it goes stale. Prefers the per-entry values
+  // `getMaxAge` persisted, falling back to static options.
+  const ttlOpts = storageTtl(
+    entry.maxAge ?? opts.maxAge,
+    entry.staleMaxAge ?? opts.staleMaxAge,
+    opts.swr,
+  );
+  if (!entry.mtime || !ttlOpts) {
     return undefined;
   }
-  // Mirrors the TTL window used on cache writes (see `get` in defineCachedFunction).
-  // `!opts.swr` (rather than `=== false`) so an unset `swr` aligns with the SWR-off
-  // default on the standalone `expireCache` path, which doesn't merge defaultCacheOptions.
-  const ttlWindow = !opts.swr
-    ? maxAge
-    : staleMaxAge != null && staleMaxAge >= 0
-      ? maxAge + staleMaxAge
-      : undefined;
-  if (ttlWindow === undefined) {
-    return undefined;
-  }
-  return { ttl: Math.max(Math.ceil((entry.mtime + ttlWindow * 1000 - Date.now()) / 1000), 1) };
+  return { ttl: Math.max(Math.ceil((entry.mtime + ttlOpts.ttl * 1000 - Date.now()) / 1000), 1) };
 }
 
 /**
