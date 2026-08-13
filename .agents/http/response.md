@@ -264,6 +264,31 @@ same reason and **not** because a 206 could reach storage (it can't — `Range` 
 meaningless at best and a lie about the served bytes at worst. Realistic source: a proxying
 handler copying upstream headers onto a 200.
 
+## The header set is copied, never mutated in place
+
+`serialize` builds the entry from `new Headers(res.headers)` — one copy taken before the first
+synthesis — and the handler's own `Response` is left exactly as it was handed over.
+
+It used to write straight onto `res.headers`: `set` for `etag`/`last-modified`/`cache-control`,
+`appendVary`, `delete` for `set-cookie` and the transport headers. Every `Response` produced by
+`fetch()`, `Response.redirect()` or `Response.error()` carries the spec's **immutable** header
+guard, so the first of those threw a `TypeError` inside `serialize` → the shared resolution
+rejected → the entry was evicted → the next request repeated it, forever. That is not a corner:
+a reverse proxy over `fetch()` is the canonical use of an HTTP response cache, and `301`/`308`
+are on the cacheable-status allowlist specifically so `Response.redirect` can be cached. **No
+configuration avoided it** — `sendCacheControl: false` plus an upstream `etag`/`last-modified`
+still hit the unconditional `set-cookie` / `appendVary` / transport deletes.
+
+Sound because nothing reads `res.headers` after `serialize`: `getMaxAge` (which does read them,
+for `must-revalidate`) runs strictly before it, `validate` and `transform` see the serialized
+entry, the serve path rebuilds from storage via `createResponse`, and a bypassed call skips
+`serialize` entirely. So for a mutable response the copy is behavior-identical — it only stops
+ocache scribbling on an object the caller still owns.
+
+Coverage gap that hid it: every 301 test constructed a mutable `new Response(...)`. The
+regression tests now assert the premise (`Response.redirect` really is immutable) alongside the
+behavior, since they prove nothing on a runtime that stops enforcing the guard.
+
 ## Body encoding
 
 `serialize` decides by **byte validity, not content-type** — a valid-UTF-8 body (fatal

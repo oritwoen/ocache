@@ -39,24 +39,31 @@ export async function serializeResponse<E extends HTTPEvent>(
   const base64 = text === undefined;
   const body = base64 ? bytesToBase64(bytes) : text;
 
-  if (!res.headers.has("etag")) {
-    res.headers.set("etag", `W/"${hash(body)}"`);
+  // Copied, never mutated in place: a `Response` from `fetch()`, `Response.redirect()` or
+  // `Response.error()` carries the spec's *immutable* header guard, so the first `set` below
+  // threw — taking the whole resolution down and evicting the entry, on every request. A
+  // reverse proxy over `fetch()` and cacheable `Response.redirect(…, 301)` are both exactly
+  // that shape. Nothing reads `res.headers` after this point, so the copy is otherwise a no-op.
+  const headers = new Headers(res.headers);
+
+  if (!headers.has("etag")) {
+    headers.set("etag", `W/"${hash(body)}"`);
   }
 
-  if (!res.headers.has("last-modified")) {
-    res.headers.set("last-modified", new Date().toUTCString());
+  if (!headers.has("last-modified")) {
+    headers.set("last-modified", new Date().toUTCString());
   }
 
   // Mirrors `validate`'s predicates (can't drift — an unstored 500 once shipped `s-maxage=60`),
   // closing findings 08/13's gap for `Vary`-only responses. Opt-out: `sendCacheControl` (issue #49).
   // Raw `Vary` here vs. merged in `validate`: same verdict, since `appendVary` only adds keyed names.
-  const declaredVary = res.headers.get("vary");
+  const declaredVary = headers.get("vary");
   if (
     opts.sendCacheControl !== false &&
     isCacheableStatus(res.status) &&
     !hasVaryWildcard(declaredVary) &&
     !hasUnkeyedVary(declaredVary, varyHeaderNames) &&
-    !res.headers.has("cache-control")
+    !headers.has("cache-control")
   ) {
     // Same precedence `cache.ts` uses for freshness/TTL (finding 10.2): `opts` alone advertised
     // the static lifetime while a dynamic one was enforced; `http/index.ts` always wraps `getMaxAge`.
@@ -82,30 +89,30 @@ export async function serializeResponse<E extends HTTPEvent>(
       cacheControl.push(`stale-while-revalidate=${staleMaxAge}`);
     }
     if (cacheControl.length > 0) {
-      res.headers.set("cache-control", cacheControl.join(", "));
+      headers.set("cache-control", cacheControl.join(", "));
     }
   }
 
   // `varyHeaderNames`, not the key list: `allowCookies` keys a hashed cookie subset, but
   // `Vary` can only state header names.
   if (varyHeaderNames.length > 0) {
-    appendVary(res.headers, varyHeaderNames);
+    appendVary(headers, varyHeaderNames);
   }
 
   // Always stripped, allowlisted or not (issue #61: minted cookies leak to coalesced/later
   // callers). Exempting `allowCookies` reopened this as session fixation (h3#1524 finding #15c).
-  res.headers.delete("set-cookie");
+  headers.delete("set-cookie");
 
   // Deleted here, not just excluded above — a stale value would desync headers from the
   // re-buffered body (nitro#2109); runtime recomputes `content-length` on read.
   for (const header of transportHeaders) {
-    res.headers.delete(header);
+    headers.delete(header);
   }
 
   const cacheEntry: ResponseCacheEntry = {
     status: res.status,
     statusText: res.statusText,
-    headers: Object.fromEntries(res.headers.entries()),
+    headers: Object.fromEntries(headers.entries()),
     body,
     // Only set for binary bodies — text entries stay flag-free, byte-identical to
     // pre-binary-support ones.

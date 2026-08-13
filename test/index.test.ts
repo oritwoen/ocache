@@ -5787,6 +5787,100 @@ describe("defineCachedHandler", () => {
     expect(await r2.text()).toBe("decoded body");
   });
 
+  // --- immutable response headers ---
+
+  // `serialize` used to synthesize/strip headers on the handler's live `Response`. Anything
+  // built by `fetch()`, `Response.redirect()` or `Response.error()` carries the spec's
+  // *immutable* header guard, so the very first write threw, the shared resolution rejected
+  // and the entry was evicted — every request, no configuration avoiding it (the
+  // `set-cookie`/`Vary`/transport deletes are unconditional, so even `sendCacheControl: false`
+  // plus an upstream `etag` still threw). Every other 301 test here builds a mutable
+  // `new Response(...)`, which is why this went unnoticed.
+  describe("immutable response headers", () => {
+    // Guard the premise: if a runtime ever stops enforcing it, these tests prove nothing.
+    it("Response.redirect really is header-immutable", () => {
+      expect(() => Response.redirect("http://localhost/elsewhere", 301).headers.set("x", "1")) //
+        .toThrow();
+    });
+
+    it("caches a Response.redirect (301) instead of throwing", async () => {
+      const path = uniquePath();
+      let callCount = 0;
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return Response.redirect("http://localhost/elsewhere", 301);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(r1.status).toBe(301);
+      expect(r1.headers.get("x-cache")).toBe("MISS");
+      expect(r2.status).toBe(301);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+      expect(r2.headers.get("location")).toBe("http://localhost/elsewhere");
+      // Synthesis still lands on the entry — it just happens on the copy.
+      expect(r2.headers.get("cache-control")).toBe("max-age=10");
+      expect(r2.headers.get("etag")).toBeTruthy();
+      expect(callCount).toBe(1);
+    });
+
+    it("caches an immutable-headers response with cookies and transport headers stripped", async () => {
+      const path = uniquePath();
+      // The `fetch()` shape: a reverse-proxy handler returning an upstream response verbatim.
+      // `Response.redirect` is the only immutable response constructible without a network,
+      // so proxy the strip path through a hand-frozen `Headers` instead.
+      const frozen = () => {
+        const res = new Response("upstream body", {
+          headers: {
+            "set-cookie": "sid=s1",
+            "content-encoding": "gzip",
+            "content-type": "text/plain",
+          },
+        });
+        for (const method of ["set", "append", "delete"] as const) {
+          Object.defineProperty(res.headers, method, {
+            value: () => {
+              throw new TypeError("immutable");
+            },
+          });
+        }
+        return res;
+      };
+      const handler = defineCachedHandler(frozen, { maxAge: 10, varies: ["accept-language"] });
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      for (const res of [r1, r2]) {
+        expect(res.status).toBe(200);
+        // The unconditional strips must still apply — they just apply to the copy.
+        expect(res.headers.get("set-cookie")).toBeNull();
+        expect(res.headers.get("content-encoding")).toBeNull();
+        expect(res.headers.get("content-type")).toBe("text/plain");
+        expect(res.headers.get("vary")).toBe("accept-language");
+      }
+      expect(await r2.text()).toBe("upstream body");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    it("does not mutate the handler's own Response headers", async () => {
+      const path = uniquePath();
+      const res = new Response("body");
+      const handler = defineCachedHandler(() => res, { maxAge: 10 });
+
+      await handler(makeEvent(path));
+
+      // The copy absorbs the synthesis; the handler's object is left as it was handed over.
+      expect(res.headers.get("etag")).toBeNull();
+      expect(res.headers.get("cache-control")).toBeNull();
+      expect(res.headers.get("last-modified")).toBeNull();
+    });
+  });
+
   // --- GET/HEAD cache key separation (h3#1524 audit, finding #3) ---
 
   // Every real framework integration nulls the body of a HEAD response in `toResponse`
