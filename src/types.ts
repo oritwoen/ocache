@@ -218,6 +218,26 @@ export interface CacheOptions<T = any, ArgsT extends unknown[] = any[]> {
     | { maxAge?: number; staleMaxAge?: number }
     | undefined
     | Promise<number | { maxAge?: number; staleMaxAge?: number } | undefined>;
+  /**
+   * Number of **seconds** a single shared resolution may take — the resolver plus the
+   * `getMaxAge`/`serialize` hooks folded into it. Defaults to `30`; `Infinity` (or `0`) waits
+   * forever. Seconds, like {@link maxAge} and {@link staleMaxAge}; fractions are allowed
+   * (`maxResolveTime: 0.5` is half a second).
+   *
+   * Concurrent calls for a key share one in-flight resolution, so a resolver that never
+   * settles would otherwise pin that key for the lifetime of the process: every later call
+   * joins a resolution that will never finish. On the deadline that resolution is abandoned
+   * and **every caller awaiting it rejects** with a `TimeoutError`, which frees the key —
+   * the next call resolves it afresh.
+   *
+   * The abandoned resolver is not cancelled (there is nothing here to cancel it with): it
+   * keeps running and may still settle, but into a promise nobody is awaiting, so its value
+   * is never served and can never be written over what a later call has cached. A timed-out
+   * resolution counts as a failed one in every respect, including evicting the entry it was
+   * refreshing. Under `swr` it also bounds the background refresh, whose failure is reported
+   * through `onError` rather than thrown.
+   */
+  maxResolveTime?: number;
   /** Base path prefix(es) for cache keys. When an array, reads try each prefix in order (multi-tier) and writes go to all prefixes. Defaults to `"/cache"`. */
   base?: string | string[];
   /**

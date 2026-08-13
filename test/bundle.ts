@@ -36,8 +36,16 @@ import { rolldown } from "rolldown";
 // rationale on the new `Cache-Control`/`Vary` predicates). The numbers that describe what is
 // actually downloaded are `min`/`minGzip`; keep those tight and let `raw` follow — 48_000
 // left it at 99% used, which is a tripwire on the next JSDoc paragraph, not a ceiling.
+//
+// 50_000 ran out on `maxResolveTime` (finding 03), and only just: the baseline was already
+// 49_867 raw / 20_162 min / 8_077 gzip — 100% of `raw` before this change existed — and the
+// deadline adds ~700 raw / ~330 min / ~135 gzip on top, for 50_563 / 20_495 / 8_212. All of
+// that is *code*: rolldown strips `//` comments and erases type-only JSDoc, so there is no
+// prose to trim it out of, and buying `raw` back out of the comments that document the
+// decisions is the wrong thing to spend first. `min`/`minGzip` still fit their unchanged
+// ceilings (98% / 97%), which is the pair that describes what a consumer downloads.
 const BUDGETS = {
-  raw: 50_000,
+  raw: 52_000,
   min: 21_000,
   minGzip: 8500,
 } as const;
