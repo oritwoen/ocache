@@ -52,10 +52,8 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
   const sizeOf = opts.sizeOf;
   const map = new Map<string, { value: unknown; expires?: number; bytes: number }>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Running total of every live entry's `bytes`. Kept incrementally because recomputing it
-  // would be O(cache) per write — which means *every* path that removes an entry has to go
-  // through `deleteEntry`, and the only path that adds one is the single `map.set` below.
-  // A leaked count is worse than no budget at all: it converges on evicting everything.
+  // Running total, not recomputed (O(cache)/write). Every removal path must funnel through
+  // `deleteEntry` — a leaked charge silently converges on evicting everything.
   let totalBytes = 0;
 
   function deleteEntry(key: string) {
@@ -77,9 +75,7 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
         deleteEntry(key);
         return null;
       }
-      // Mark as most-recently-used by reinserting (Map preserves insertion order). Raw map
-      // operations on purpose: the entry object — and with it its byte charge — is preserved,
-      // so this is a move, not a delete followed by an insert.
+      // Raw map ops, not delete+insert: moves the entry (and its byte charge) to MRU.
       if (maxSize || maxBytes) {
         map.delete(key);
         map.set(key, entry);
@@ -87,24 +83,16 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
       return entry.value as any;
     },
     set(key, value, opts) {
-      // Every branch below either replaces or removes the key, so drop the previous entry
-      // first: it releases its bytes and its TTL timer, and reinsertion then lands the key in
-      // the most-recent position.
+      // Drop the previous entry first — releases its bytes/timer; reinsertion below lands it MRU.
       deleteEntry(key);
       if (value === null || value === undefined) {
         return;
       }
-      // The estimate is only ever needed to police a budget, so an opted-out storage never
-      // pays for it (nor calls a user `sizeOf`).
+      // Only computed when `maxBytes` is armed — an opted-out storage never pays for it.
       const bytes = maxBytes ? entryBytes(key, value, sizeOf) : 0;
       if (maxBytes && bytes > maxBytes) {
-        // A single entry over the whole budget is refused rather than stored: storing it would
-        // leave the cache permanently over its ceiling, and evicting down to fit it would flush
-        // every other entry for something that still would not fit — one oversized response
-        // wiping the hot set is the cache-flush DoS with extra steps. The previous value under
-        // this key is gone (deleted above): `set` was asked to replace it, and serving the old
-        // one afterwards would be a lie about what is cached. Callers who cache a few very large
-        // values should raise `maxBytes`; the read simply misses and re-resolves.
+        // Evict-to-fit rejected: flushes every other entry for something that still won't
+        // fit — cache-flush DoS. Previous value already dropped above; raise `maxBytes` instead.
         return;
       }
       const ttlMs = opts?.ttl ? opts.ttl * 1000 : undefined;
@@ -124,9 +112,7 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
         }
         timers.set(key, timer);
       }
-      // Evict least-recently-used entries once over either ceiling. Both are checked in one
-      // loop so the map ends up under *both*; `map.keys()` is insertion-ordered, i.e. oldest
-      // first. The empty-map guard is what makes termination unconditional.
+      // LRU eviction, one loop, until under both ceilings (`map.keys()` is oldest-first).
       if (maxSize || maxBytes) {
         while ((maxSize && map.size > maxSize) || (maxBytes && totalBytes > maxBytes)) {
           const oldest = map.keys().next().value;
@@ -140,16 +126,13 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
   };
 }
 
-// Bookkeeping charged on top of the walked payload — per entry (Map node, entry object, timer
-// slot) and per property/slot — plus the depth at which the walk stops (`CacheEntry<ResponseCacheEntry>`
-// needs 3). Deliberately `//`, not JSDoc: internals stay out of the generated API docs.
+// Overhead per entry (Map node, entry object, timer) and per property/slot; depth cap
+// sized for `CacheEntry<ResponseCacheEntry>` (needs 3).
 const ENTRY_OVERHEAD = 64;
 const PROPERTY_OVERHEAD = 8;
 const MAX_ESTIMATE_DEPTH = 8;
 
-// Resolves an entry's byte charge: the user's `sizeOf` if it produced a usable number,
-// otherwise the built-in estimate. A hook that throws must not take the write down with it —
-// the budget degrades to the built-in estimate, never to "free".
+// Falls back to the built-in estimate on a throw or an unusable result — never degrades to "free".
 function entryBytes(key: string, value: unknown, sizeOf: MemoryStorageOptions["sizeOf"]): number {
   if (sizeOf) {
     try {
@@ -169,27 +152,15 @@ function entryBytes(key: string, value: unknown, sizeOf: MemoryStorageOptions["s
   }
 }
 
-// Strings are charged at 2 bytes per UTF-16 code unit. That is the *upper* bound — engines
-// store latin1-only strings at one byte per character, so an ASCII body is over-charged by up
-// to 2× — and over-charging is the only safe direction here: a budget that under-counts is not
-// a bound, which is the entire failing this exists to fix (finding 14.1). The key is measured
-// the same way; the finding's second measurement (10 000 × 8 KB attacker-chosen paths, 296 MB
-// RSS) is pure key weight.
+// Upper bound (2×): engines store latin1 at 1 byte/char. Over-counting is the only safe
+// direction (finding 14.1) — keys measured the same way; 10 000×8KB paths measured 296MB RSS.
 function estimateBytes(str: string): number {
   return str.length * 2;
 }
 
-// A depth-limited, cycle-safe structural walk. Deliberately not `JSON.stringify(value).length`:
-// that throws on cycles and BigInt, silently drops non-JSON values, and allocates a full second
-// copy of a body we are measuring precisely *because* it is large. This walk allocates nothing
-// beyond the `seen` set and touches each string once, so the dominant real shape —
-// `CacheEntry<ResponseCacheEntry>`, whose weight is `value.value.body` plus the header record —
-// costs a handful of property reads plus one `.length` per string.
-//
-// Two bounds keep it total on hostile input: `seen` charges any object once (so a cycle or a
-// shared subtree terminates and is not double-counted) and the depth cap keeps recursion off
-// the stack limit for pathologically deep values, at the price of under-counting below it —
-// that is what `sizeOf` is for.
+// JSON.stringify rejected: throws on cycles/BigInt, drops non-JSON, copies the body.
+// `seen` dedups cycles/shared subtrees; depth cap bounds recursion, under-counting deep
+// values beyond it — what `sizeOf` is for.
 function estimateValue(value: unknown, depth: number, seen: Set<object>): number {
   switch (typeof value) {
     case "string": {
@@ -214,15 +185,13 @@ function estimateValue(value: unknown, depth: number, seen: Set<object>): number
     return 0;
   }
   seen.add(value);
-  // Binary payloads: the byte length *is* the weight, and walking their indices would be both
-  // O(n) property reads and wildly wrong.
+  // Binary payloads: byteLength is the weight — walking indices is O(n) and wrong.
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
     return value.byteLength;
   }
   const next = depth + 1;
   let total = 0;
-  // Array/Set iterate as values, Map as pairs: their payload lives outside own properties,
-  // where `Object.keys` would price them at zero — the dangerous direction.
+  // Array/Set/Map payload lives outside own properties — `Object.keys` would price it zero.
   if (Array.isArray(value) || value instanceof Set) {
     for (const item of value as Iterable<unknown>) {
       total += PROPERTY_OVERHEAD + estimateValue(item, next, seen);
@@ -262,25 +231,9 @@ function clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: str
  */
 export type StorageOption = StorageInterface | (() => StorageInterface);
 
-// Resolves `opts.storage` into a concrete backend, memoizing it back into every options
-// object passed. `optsList[0]` is the source of truth and must be the one stable object per
-// cached function/handler instance; the rest are mirrors (internal clones of it).
-//
-// There is deliberately no ambient storage to fall back on. The removed `setStorage()`
-// singleton meant the *last* call won for every consumer in the process — including
-// unrelated `defineCachedFunction` callers who never asked for it — which is how two
-// independent apps, each constructing its own handler and its own storage, ended up sharing
-// one backend and serving each other's cached response bodies (h3#1524 audit, finding #2).
-// So an unset `storage` yields a *fresh* memory storage per cached function/handler:
-// colliding by accident is now impossible, and callers who want a shared cache pass the
-// same `storage` explicitly.
-//
-// The write-back is what lets the standalone `resolveCacheKeys` / `invalidateCache` /
-// `expireCache` helpers reach the same store as the cached function — hand them the same
-// options object and they see the memoized instance. Same mechanism (and same caveat) as
-// the resolved `name`. It also guarantees a factory runs at most once.
-//
-// Internal (deliberately not a JSDoc block: it must stay out of the generated API docs).
+// optsList[0] is the source of truth. Global storage rejected (h3#1524 #2) — unset
+// `storage` now gets a fresh instance per cached fn/handler; write-back lets standalone
+// helpers reach it too (same caveat as `name`). Factory runs once. `//`, not JSDoc: docs4ts.
 export function resolveStorage(
   ...optsList: Array<{ storage?: StorageOption } | undefined>
 ): StorageInterface {

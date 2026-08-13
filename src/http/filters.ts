@@ -7,8 +7,7 @@ import type { HandlerConfig } from "./config.ts";
 
 import type { HTTPEvent } from "../types.ts";
 
-// The allowlisted query string for this request, memoized on the handler config so the key
-// derivation and the URL rewrite don't recompute it.
+// Memoized per event so the key derivation and the URL rewrite don't recompute it.
 export function filteredSearch<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   event: HTTPEvent,

@@ -6,9 +6,8 @@ import { definedOptions, resolveName } from "../cache.ts";
 
 import type { HTTPEvent, EventHandler, CachedEventHandlerOptions } from "../types.ts";
 
-// The handler defaults. Deliberately not `cache.ts`'s `defaultCacheOptions()` — only the HTTP
-// layer has a `cacheStatusHeader` — and named apart so the two can't be imported for one
-// another as they diverge.
+// Handler defaults, not `cache.ts`'s `defaultCacheOptions()` (HTTP-only `cacheStatusHeader`) —
+// named apart so neither is importable for the other.
 export function defaultHandlerOptions() {
   return {
     name: "_",
@@ -19,10 +18,8 @@ export function defaultHandlerOptions() {
   } as const;
 }
 
-// Stripped from the handler-visible request by default, like a non-allowlisted cookie:
-// otherwise a token-authenticated route fails *open* — the first caller's private response is
-// stored under the anonymous key and replayed to everyone. `allowAuthorization` folds both
-// names into the header lists below, making them keyed, `Vary`-advertised and visible at once.
+// Stripped by default (like a non-allowlisted cookie): else a token-authenticated route fails
+// *open* — first caller's private response cached under the anonymous key, replayed to everyone.
 export const authHeaderNames = ["authorization", "proxy-authorization"];
 
 /** Per-handler configuration derived once from the caller's options. */
@@ -78,33 +75,28 @@ export interface HandlerConfig<E extends HTTPEvent> {
   bypassed: WeakMap<HTTPEvent, boolean>;
 }
 
-// Derives the per-handler configuration from the caller's options. `name` is resolved BEFORE
-// the defaults merge (they set a truthy `name: "_"`, which made every handler key as `_` and
-// collide across one shared storage) — via `cache.ts`'s `resolveName`, so the two paths can't
-// drift, and with its caveat: same-source handlers share a name, so pass an explicit one.
+// `name` resolved BEFORE defaults merge, via `cache.ts`'s `resolveName` (paths can't drift) —
+// else every handler collapsed to key `_` (shared-storage collision). Caveat: same-source names collide.
 export function resolveHandlerConfig<E extends HTTPEvent>(
   handler: EventHandler<E>,
   callerOpts: CachedEventHandlerOptions<E>,
 ): HandlerConfig<E> {
   const name = resolveName(callerOpts.name, handler);
-  // `definedOptions` (from `cache.ts`, the same helper `defineCachedFunction` merges through):
-  // an option explicitly set to `undefined` reads as unset, so `{ maxAge: routeConfig.maxAge }`
-  // with an unset rule gets the `maxAge: 1` default rather than clobbering it with nothing.
+  // `definedOptions` (cache.ts, shared with `defineCachedFunction`): explicit `undefined`
+  // reads as unset — `{ maxAge: routeConfig.maxAge }` falls back to the default, not clobbered.
   const opts: CachedEventHandlerOptions<E> = {
     ...defaultHandlerOptions(),
     ...definedOptions(callerOpts),
     name,
   };
 
-  // Names are trimmed/deduped; an empty (or whitespace-only) list normalizes to the
-  // "no cookies allowed" default.
+  // Names trimmed/deduped; an empty (or whitespace-only) list normalizes to "no cookies allowed".
   const _cookieNames = [
     ...new Set((opts.allowCookies ?? []).map((c) => c?.trim()).filter(Boolean)),
   ];
   const allowedCookieNames = _cookieNames.length > 0 ? _cookieNames : undefined;
 
-  // The header names the caller declared, before the two consumers below take their
-  // differing views of them.
+  // Declared header names, before the two consumers below take differing views of them.
   const _declaredHeaderNames = [
     ...new Set([
       ...(opts.varies || []).filter(Boolean).map((h) => h.toLowerCase()),
@@ -113,9 +105,8 @@ export function resolveHandlerConfig<E extends HTTPEvent>(
     ]),
   ].sort();
 
-  // Two lists, differing on exactly one name — `cookie` — because `allowCookies` changes
-  // *how* cookies are keyed, not *whether* the response varies by them. Conflating them made
-  // an `allowCookies` route advertise shared-cacheability with no `Vary` at all.
+  // Two lists differ on one name, `cookie` — `allowCookies` changes *how* it's keyed, not
+  // *whether* it varies. Conflated before: routes advertised cacheability with no `Vary`.
   const keyHeaderNames = allowedCookieNames
     ? _declaredHeaderNames.filter((h) => h !== "cookie")
     : _declaredHeaderNames;

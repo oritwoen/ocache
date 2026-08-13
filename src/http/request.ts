@@ -11,21 +11,14 @@ import { cacheableMethods } from "./key.ts";
 
 import type { HTTPEvent } from "../types.ts";
 
-// The built-in half of the bypass (a caller's `shouldBypassCache` composes on top in
-// `resolveBypass`, never replaces it). Derived from `cacheableMethods` rather than repeating
-// the method check, and never consulted alone outside it. `Range` bypasses too: it is
-// neither in the key nor a `Vary` dimension, so one `curl -r 0-0` stored a one-byte body that
-// every later `Range`-less GET was served — `validate` refusing 206 is the other half.
+// Built-in half; `resolveBypass` composes the caller's hook on top, never replaces it; never
+// consulted alone. `Range` unkeyed — `curl -r 0-0` poisoned later GETs; 206 is off the allowlist.
 function shouldBypassCache(event: HTTPEvent): boolean {
   return !cacheableMethods.includes(event.req.method) || event.req.headers.has("range");
 }
 
-// The composed verdict: the built-in bypass OR the caller's hook. Composed rather than
-// clobbered (assigning the built-in used to discard `opts.shouldBypassCache`, issue #50),
-// and evaluated EXACTLY ONCE per call — `cache.ts` awaits this to decide whether to
-// short-circuit to the raw resolver, so the answer is memoized on the event for
-// `narrowRequest` to read instead of the caller's hook being asked a second time (it may be
-// async, expensive or side-effecting). See `config.bypassed` for why the memo lives there.
+// Composed, not clobbered (issue #50), and evaluated EXACTLY ONCE per call — the caller's hook may
+// be async or side-effecting — so the verdict `cache.ts` awaits is memoized for `narrowRequest`.
 export async function resolveBypass<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   event: HTTPEvent,
@@ -36,17 +29,11 @@ export async function resolveBypass<E extends HTTPEvent>(
   return bypass;
 }
 
-// Narrows the request the handler sees — and NO-OPS on a bypassed call, which is never keyed
-// and so must reach the handler untouched, including its body (the rewritten `Request` drops
-// it) and its credentials (`shouldBypassCache` is the documented alternative to
-// `allowAuthorization`, and stripping there left it serving the anonymous page to every
-// authenticated user). The gate reads the *composed* verdict `resolveBypass` memoized, never
-// the built-in half alone; the fallback only covers a resolver reached without it, which
-// `cache.ts` cannot do.
+// NO-OP when bypassed: never keyed, so untouched — the rewrite drops the body; stripping
+// credentials served the anonymous page to authed users. Gate: *composed* verdict, not built-in.
 //
-// MUTATES the caller's event and never restores it: a handler's body producer can run *after*
-// the resolver returns, and handing it back the credentialed request would re-open what
-// narrowing closes. Narrowing a copy instead is tracked separately.
+// MUTATES the caller's event, never restored: a body producer can run *after* the resolver, so
+// handing back the credentialed request re-opens what narrowing closes. Copy instead: tracked.
 export function narrowRequest<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   event: HTTPEvent,
@@ -57,23 +44,18 @@ export function narrowRequest<E extends HTTPEvent>(
 
   const { keyHeaderNames, allowedCookieNames, allowedQueryNames } = config;
 
-  // Strip the credential headers and the cookies the handler didn't opt into. Everything
-  // else — the `varies` headers included — is forwarded as-is: those values are in the key,
-  // so reading them is safe and is the point of declaring them.
+  // Everything else — `varies` headers included — is forwarded: those values are in the key.
   const filteredHeaders = [...event.req.headers.entries()].flatMap(([key, value]) => {
     const name = key.toLowerCase();
-    // Absent from `keyHeaderNames` the credential can't vary the key, so the handler must
-    // not see it. The *key* list, never the `Vary` advertisement.
+    // Not in `keyHeaderNames` ⇒ can't vary the key ⇒ must not be seen. Key list, never `Vary`.
     if (authHeaderNames.includes(name) && !keyHeaderNames.includes(name)) {
       return [];
     }
     if (name !== "cookie") {
       return [[key, value] as [string, string]];
     }
-    // Same rule, three-way because cookies have a finer form: `allowCookies` → the
-    // allowlisted subset the key hashes; else `cookie` in `keyHeaderNames` (i.e.
-    // `varies: ["cookie"]`) → the raw header, which *is* the key component, at one entry per
-    // distinct value; else stripped (the secure default: not keyed, not visible).
+    // Same rule, three-way: `allowCookies` → the subset the key hashes; else `cookie` in
+    // `keyHeaderNames` → the raw header, itself the key component; else stripped (secure default).
     if (!allowedCookieNames) {
       return keyHeaderNames.includes("cookie") ? [[key, value] as [string, string]] : [];
     }
@@ -81,8 +63,7 @@ export function narrowRequest<E extends HTTPEvent>(
     return cookie ? [["cookie", cookie] as [string, string]] : [];
   });
 
-  // Narrow the query to the allowlist, so the handler can't depend on params outside the
-  // cache key (mirrors the header filtering above).
+  // Narrowed so the handler can't depend on params outside the cache key.
   let _reqUrl = event.req.url;
   if (allowedQueryNames) {
     const _url = event.url ?? new URL(event.req.url);
@@ -101,9 +82,8 @@ export function narrowRequest<E extends HTTPEvent>(
     if ((originalReq as any).runtime) {
       (event.req as any).runtime = (originalReq as any).runtime;
     }
-    // Inherit the runtime's background-task hook, *bound* to the original request (srvx and
-    // Cloudflare implement it against that receiver). `cache.ts` reads it after this swap, so
-    // dropping it makes every background write inert on the runtimes that provide it.
+    // *Bound* to the original request (srvx/Cloudflare implement it against that receiver).
+    // `cache.ts` reads it after this swap; dropping it makes every background write inert.
     if (typeof originalReq.waitUntil === "function") {
       event.req.waitUntil = originalReq.waitUntil.bind(originalReq);
     }

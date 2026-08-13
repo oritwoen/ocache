@@ -14,9 +14,8 @@ export function cacheControlForbidsReuse(cacheControl: unknown): boolean {
   if (typeof cacheControl !== "string" || !cacheControl) {
     return false;
   }
-  // Lifetimes are collected, not decided, inside the loop: the verdict depends on which
-  // directives are present *together*. The unconditional bans still short-circuit. A repeated
-  // directive keeps its first parseable value, so the result doesn't depend on loop position.
+  // Collected, not decided, in-loop — verdict depends on directives present *together*; bans
+  // still short-circuit. First parseable value wins, so the result is order-independent.
   let maxAge: number | undefined;
   let sMaxAge: number | undefined;
   for (const [name, value] of cacheControlDirectives(cacheControl)) {
@@ -25,9 +24,8 @@ export function cacheControlForbidsReuse(cacheControl: unknown): boolean {
       case "private": {
         return true;
       }
-      // TODO: RFC 9111 §5.2.2.4 permits storing a `no-cache` response if every reuse
-      // revalidates first — real new machinery (ocache has no foreground-revalidation path
-      // at all), and worth nothing until it exists. Rejecting is the honest interim.
+      // TODO: RFC 9111 §5.2.2.4 allows storing `no-cache` if every reuse revalidates — real
+      // new machinery ocache lacks. Rejecting is the honest interim.
       case "no-cache": {
         return true;
       }

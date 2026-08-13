@@ -41,34 +41,19 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
 ): CachedFunction<T, ArgsT> {
   // Resolve `name` from the caller's opts BEFORE merging defaults — see `resolveName`.
   const name = resolveName(opts.name, fn);
-  // Keep a handle on the caller's own options object *before* the defaults merge clones
-  // it: that object is the memo slot for the resolved storage, so a caller who hands the
-  // same object to `invalidateCache`/`expireCache` reaches this instance's store (see
-  // `resolveStorage`). The clone below is kept in sync as a mirror, since it is what the
-  // `.invalidate()`/`.expire()` methods delegate with.
+  // The caller's own object is the storage memo slot (`resolveStorage`), so the same object handed
+  // to `invalidateCache`/`expireCache` reaches this store. The clone below mirrors it.
   const _optsRef = opts;
-  // `definedOptions` first: an option explicitly set to `undefined` must read as unset, not
-  // as "override the default with nothing". Applied to a *copy*, so `_optsRef` above is still
-  // the caller's own object and the storage memo lands where the helpers can see it.
+  // `definedOptions` first: an explicit `undefined` must read as unset, not "override with
+  // nothing". Copies, so `_optsRef` stays the caller's own object.
   opts = { ...defaultCacheOptions(), ...definedOptions(opts), name };
 
-  // Storage is resolved on first actual read/write, never at definition time: the `storage`
-  // option may be a factory precisely because the real backend is often only configured
-  // after the module that defines this cached function has loaded. Unset means this
-  // instance gets its *own* memory storage (no ambient global to collide on).
+  // Resolved on first read/write, never at definition time — a `storage` factory exists for late
+  // binding. Unset -> this instance's *own* memory storage, no ambient global to collide on.
   const getStorage = (): StorageInterface => resolveStorage(_optsRef, opts);
 
-  // Deduplicates concurrent resolutions for the same key. The shared result carries
-  // the storable (post-`serialize`) value plus any dynamic TTL, so `getMaxAge` and
-  // `serialize` run exactly once and every caller observes the same value.
-  //
-  // A `Map`, never a plain object: keys are caller-controlled (a documented `getKey`
-  // may return an arbitrary string, e.g. `getKey: (id) => id`), and a plain object
-  // inherits from `Object.prototype`, so `pending["constructor"]` / `"toString"` /
-  // `"__proto__"` / … read truthy with nothing in flight. The call would then be
-  // treated as a deduplicated follower, `await` the inherited member (not a thenable,
-  // so it resolves to itself), and skip the resolver entirely — silently caching
-  // `undefined`.
+  // Shares the storable (post-`serialize`) value + TTL so `getMaxAge`/`serialize` run once. `Map`,
+  // never a plain object: `Object.prototype` keys faked in-flight followers, caching `undefined`.
   const pending = new Map<string, Promise<{ value: T; maxAge?: number; staleMaxAge?: number }>>();
 
   // Normalize cache params
@@ -132,11 +117,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       const error = new Error("Malformed data read from cache.");
       onError("[cache]", error);
     } else {
-      // Work on a per-call shallow clone: a storage backend may return the entry by
-      // reference (the built-in memory storage does), so all subsequent in-place
-      // mutations below — freshness resets, the `status` attach, the SWR value
-      // refresh — must not corrupt the object still held in storage or let
-      // concurrent same-key calls overwrite each other's per-call fields.
+      // Per-call clone: backends may return the entry by reference (memory storage does), so the
+      // mutations below must not corrupt stored state nor race concurrent same-key calls.
       entry = { ...entry };
     }
 
@@ -154,8 +136,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         ? readStaleMaxAge * 1000
         : undefined;
 
-    // A zero stale window means stale must never be served (e.g. upstream
-    // proxy-revalidate semantics): revalidate in the foreground instead.
+    // Zero stale window (upstream `must-revalidate`): never serve stale — revalidate in foreground.
     const swr = opts.swr && staleTtl !== 0;
 
     // When staleMaxAge is set, an entry is completely dead after maxAge + staleMaxAge
@@ -164,10 +145,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       readMaxAge != null &&
       Date.now() - (entry.mtime || 0) > ttl + staleTtl;
 
-    // Computed once and reused for both the `expired` check and the `status`
-    // decision below (same entry state, so re-validating would just repeat work).
-    // `validate` may be async (e.g. checking the cached value against an external source),
-    // so await it here. A sync return is fine too — `await` on a non-promise is a no-op.
+    // Computed once, reused by the `expired` check and the `status` decision below; may be async.
     const _isValid = (await validate(entry, validateCtx)) !== false;
 
     const expired =
@@ -186,12 +164,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       entry.expires = undefined;
     }
 
-    // Determine how this call will be served (mirrors the serve decision below):
-    // - no usable cached value -> resolved fresh (miss)
-    // - fresh cached value -> hit
-    // - expired but served stale under SWR -> stale
-    // - a prior value existed but was expired/invalid and re-resolved in the
-    //   foreground (no stale served) -> revalidated
+    // MUST mirror the serve decision below. "revalidated" = a prior value was expired/invalid and
+    // re-resolved in the foreground, no stale served.
     const status: CacheStatus =
       entry.value === undefined
         ? "miss"
@@ -211,10 +185,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           entry.mtime = undefined;
           entry.expires = undefined;
         }
-        // Resolve the value once and share it (plus any dynamic TTL and the
-        // storable form) with all concurrent callers. `getMaxAge` and `serialize`
-        // run exactly once here — critical for `serialize`, which may consume a
-        // one-shot source (e.g. a `ReadableStream`).
+        // Resolved once and shared with all callers — `serialize` may consume a one-shot stream.
         const resolution = (async () => {
           const value = await resolver();
           // Throwaway entry so the hooks can inspect resolution metadata.
@@ -227,8 +198,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
               const resolved = await opts.getMaxAge(resolvedEntry);
               // A bare number is shorthand for `{ maxAge }`.
               const dynamic = typeof resolved === "number" ? { maxAge: resolved } : resolved;
-              // Clamp to a non-negative TTL: a value <= 0 means "don't cache" (re-resolve every
-              // access), never "cache forever as fresh". Non-finite (NaN) falls back to static options.
+              // A value <= 0 means "don't cache" (re-resolve every access), never "cache forever".
               maxAge = clampTtl(dynamic?.maxAge);
               staleMaxAge = clampTtl(dynamic?.staleMaxAge);
               resolvedEntry.maxAge = maxAge;
@@ -237,37 +207,22 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
               onError("[cache] getMaxAge hook error.", error);
             }
           }
-          // Prepare the value for storage (write-side counterpart of `transform`).
-          // Runs after `getMaxAge` so that hook still sees the raw resolved value.
+          // Write-side counterpart of `transform`, run after `getMaxAge` so it sees the raw value.
           const stored = opts.serialize ? await opts.serialize(resolvedEntry, validateCtx) : value;
           return { value: stored, maxAge, staleMaxAge };
         })();
-        // Bound the shared resolution (finding 03). Every other way this promise can end
-        // already cleans the slot up — the auditor verified the resolve path, the reject path,
-        // a throwing `getMaxAge`, a throwing `serialize` and a throwing `validate` — so a
-        // promise that *never settles* was the one leak: the slot stayed occupied forever and
-        // every later request for that key became a follower of a resolution that would never
-        // finish. One hung upstream took the key down for the whole process.
+        // Bound the shared resolution: a promise that *never settles* was the one leak in an
+        // otherwise clean `pending` lifecycle — the slot stayed occupied forever, so one hung
+        // upstream took the key down for the whole process. Covers the hooks, not just
+        // `resolver()`: `serialize` is where a never-ending body is drained.
         //
-        // The deadline **rejects the waiters** rather than merely dropping the slot (the
-        // finding's weaker "at minimum" option), for three reasons. A caller left awaiting a
-        // resolution nobody will ever complete is not "served" — it holds its request open
-        // until something outside kills it, which on a serverless runtime is nothing; the
-        // whole write block below sits *after* this `await`, so a rejection also guarantees an
-        // abandoned resolver that settles late can never write its long-dead value over an
-        // entry a fresh leader has since resolved; and the fault becomes visible (thrown to
-        // the caller, or reported through `onError` by the SWR handler) instead of presenting
-        // as a hang. The cost is real and deliberate: an upstream that would have answered at
-        // 31s now fails at 30s, which is why the default is generous and `0`/`Infinity` opts
-        // out entirely.
-        //
-        // The slot is *not* additionally dropped from the timer callback: with the promise
-        // guaranteed to settle, the existing lifecycle already frees it, and an independent
-        // deletion would open a window in which a successor installs its own promise that
-        // this leader's `catch` then deletes — splitting the dedup group it just left.
-        //
-        // Covers the hooks too, not just `resolver()`: `serialize` is where a never-ending
-        // body is drained, so a deadline around the resolver alone would miss the measured case.
+        // Rejects the waiters rather than merely dropping the slot: a caller awaiting a
+        // resolution nobody will complete is not "served", and since the write block below sits
+        // *after* this `await`, rejecting also stops an abandoned resolver settling late from
+        // overwriting what a fresh leader has since resolved. Cost: an upstream that would have
+        // answered at 31s now fails at 30s — hence the generous default and the `0`/`Infinity`
+        // opt-out. The slot is *not* additionally dropped from the timer callback; the promise is
+        // guaranteed to settle, and doing so would let this leader's `catch` delete a successor's.
         pending.set(key, maxResolveTime ? withDeadline(resolution, maxResolveTime) : resolution);
       }
 
@@ -294,8 +249,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         throw error;
       }
 
-      // Every caller (leader + deduplicated followers) observes the same storable
-      // value, so `transform` deserializes consistently on every path.
+      // Leader and followers see the same storable value, so `transform` deserializes consistently.
       entry.value = resolved.value;
 
       if (!isPending) {
@@ -309,18 +263,14 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           entry.maxAge = resolved.maxAge;
           entry.staleMaxAge = resolved.staleMaxAge;
         }
-        // Storage options for this write — `false` when the entry must not be stored at all,
-        // `undefined` when it is stored with no TTL (see `storageTtl`). Per-entry lifetimes
-        // from `getMaxAge` take precedence over the static options, as on the read path above.
+        // See `storageTtl`. Per-entry lifetimes from `getMaxAge` beat static options, as on read.
         const setOpts = storageTtl(
           entry.maxAge ?? opts.maxAge,
           entry.staleMaxAge ?? opts.staleMaxAge,
           opts.swr,
         );
         if ((await validate(entry, validateCtx)) !== false && setOpts !== false) {
-          // Multi-tier write: only write to tiers up to the one that matched.
-          // If no tier had a hit (hitIndex === -1), write to all tiers.
-          // If tier N matched, write to tiers 0..N (promote upward + refresh hit tier).
+          // Multi-tier write: no hit -> all tiers; tier N matched -> tiers 0..N (promote upward).
           const writeBases = hitIndex < 0 ? bases : bases.slice(0, hitIndex + 1);
           // `status` is a per-call field — never persist it to storage.
           const { status: _status, ...toStore } = entry;
@@ -337,12 +287,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
           })();
           event?.req.waitUntil?.(promise);
         } else if (hitIndex >= 0) {
-          // A prior cached entry existed but this resolution isn't storable — `validate`
-          // refused it, or it has no lifetime at all (`storageTtl` → `false`). Evict it
-          // so SWR doesn't keep serving the stale value, which also clears out entries an
-          // older ocache wrote with no expiry and no TTL. When there was no cache hit
-          // (hitIndex === -1) nothing is stored, so skip the redundant delete (e.g. a handler
-          // returning `Cache-Control: no-store`/`private` on every request).
+          // Prior entry, unstorable resolution (`validate` refused, or `storageTtl` -> `false`):
+          // evict so SWR stops serving it; also clears entries an older ocache wrote with no TTL.
           const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
             (error) => {
               onError("[cache] Cache eviction error.", error);
@@ -361,17 +307,12 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       event?.req.waitUntil?.(_resolvePromise);
     }
 
-    // Attach the per-call `status` to `entry`. `entry` is a per-call clone (see the
-    // read path above), never the object a ref-sharing storage backend still holds,
-    // so this can't corrupt shared state or race with concurrent same-key calls. It's
-    // still marked NON-ENUMERABLE as defence-in-depth so it stays out of every
-    // persistence path (object spreads, JSON/structuredClone). It is attached to the live
-    // clone rather than to a fresh return-time copy, so an SWR revalidation that completes
-    // while this call is still in the serve path is reflected in the returned value — which
-    // no longer happens for a *sync* resolver, whose shared promise now carries the
-    // `maxResolveTime` deadline and settles a microtask later than the serve path reads it.
-    // That was always a tick-count accident: an async resolver never made it in time, so SWR
-    // now serves the stale value for both, which is what SWR means.
+    // `entry` is a per-call clone, so no shared-state race; NON-ENUMERABLE anyway so `status` never
+    // persists. Attached to the live clone, not a return-time copy, so an SWR refresh landing during
+    // the serve path is reflected — which no longer happens for a *sync* resolver, whose shared
+    // promise now carries the `maxResolveTime` deadline and settles a tick after the serve path
+    // reads it. That was always a tick-count accident (an async resolver never made it), so SWR now
+    // serves the stale value for both, which is what SWR means.
     Object.defineProperty(entry, "status", {
       value: status,
       enumerable: false,
@@ -411,10 +352,8 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   };
 
   cachedFn.resolveKeys = (...args: ArgsT) => resolveCacheKeys({ options: opts, args });
-  // Resolve storage before delegating: `opts` may still hold an unresolved factory (or
-  // nothing at all) when a purge is issued before the first cached call, and the helpers
-  // would then resolve a *different* store and silently no-op. `getStorage` memoizes
-  // into `opts`, so both paths end up on this instance's backend either way.
+  // Resolve before delegating: an unresolved factory here (purge before the first call) lets the
+  // helpers resolve a *different* store and silently no-op. `getStorage` memoizes into `opts`.
   cachedFn.invalidate = (...args: ArgsT) => {
     getStorage();
     return invalidateCache({ options: opts, args });
@@ -557,59 +496,16 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
 
 // --- Internal helpers ---
 
-// Cache-key `name` resolution, shared by `defineCachedFunction` and `defineCachedHandler`
-// (which passes the wrapped `EventHandler` as `fn`) so the two paths cannot drift.
-// Deliberately commented with `//`, not JSDoc, so docs4ts keeps it out of the API docs.
-//
-// MUST be called on the *caller's* options, BEFORE `defaultCacheOptions()` is merged in:
-// those defaults set a truthy `name: "_"`, so merging first makes `opts.name` always `"_"`
-// and the `fn.name` fallback dead code — a silent cache-key collision across every unnamed
-// cached function/handler (https://github.com/unjs/ocache/issues/53). `defineCachedHandler`
-// merged its defaults first and so shipped exactly that bug for handlers: every handler
-// keyed as `_`, and two handlers sharing one `storage` (the configuration the `storage`
-// docs recommend) either thrashed each other's entries or — when their sources match, so
-// the integrity hash matches too — served each other's cached responses.
-//
-// For anonymous functions (no `opts.name`, no `fn.name`) fall back to a hash of the
-// function source instead of a shared literal: two distinct inline arrows would
-// otherwise resolve to the same key and thrash each other (each read fails the
-// integrity check and re-resolves). A source hash is the right fallback precisely because
-// it is *stable* — keys must survive a process restart for persistent/shared backends, so
-// nothing per-instance (counter, WeakMap, randomness) is admissible here. The cost is that
-// it can't disambiguate same-source functions that only differ by closed-over variables
-// (the classic factory: `const make = (t) => defineCachedHandler(() => render(t))`) — pass
-// an explicit `name`/`getKey` for those. The integrity hash collides there too, so it is
-// unfixable from the source alone, and with a shared `storage` it is a cross-instance leak
-// rather than mere thrash.
+// Shared with `defineCachedHandler` so keys can't drift; `//` not JSDoc (docs4ts). MUST precede
+// the defaults merge or `name: "_"` wins (issue #53: every handler keyed `_`; shared `storage` ->
+// thrash/leak). Anon -> stable source hash; per-instance ids rejected; equal-source fns need one.
 export function resolveName(name: string | undefined, fn: (...args: any[]) => any): string {
   return name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
 }
 
-// Drops own properties whose value is `undefined`, so an option explicitly set to `undefined`
-// is indistinguishable from an absent one. Shared by both defaults merges (`defineCachedFunction`
-// here and `resolveHandlerConfig` in `http/config.ts`) so the two can't drift.
-//
-// Object spread copies own properties *including* undefined-valued ones, so
-// `{ ...defaults(), ...opts }` let `{ maxAge: undefined }` clobber the `maxAge: 1` default
-// while `{}` kept it. That spelling is what plumbing produces, never what anyone types —
-// `defineCachedHandler(h, { maxAge: routeConfig.maxAge })` with an unset rule — and the route
-// then silently stopped caching entirely (before finding 10.6 it silently cached *forever*:
-// same divergence, opposite harm). Applies to every option, not just the lifetimes:
-// `swr`/`staleMaxAge`/`storage`/`getKey`/`varies` all had the same shape.
-//
-// Idempotent, which is what makes the handler path safe: it merges twice (here, then again
-// when `defineCachedHandler` hands its `_opts` to `cachedFunction`), and the second pass only
-// ever sees an already-cleaned object plus the hooks `http/index.ts` sets itself — of which
-// `transform: undefined` ("no cache-status header") is the one undefined-valued key, dropped
-// to no effect since the defaults name no `transform` to restore.
-//
-// Only `undefined` is dropped; `null` is left as the caller wrote it. Returns a fresh object —
-// the caller's own options object is never mutated (it is the storage memo slot, see
-// `resolveStorage`), and the copy keeps symbol keys, exactly as a spread would.
-//
-// Costs one integrity hash: ohash walks an undefined-valued key, so an options object that
-// carries one hashes differently once the key is gone. That is exactly the set of configs this
-// fixes, and the effect is a single cold read per entry.
+// Shared by both defaults merges (here + `resolveHandlerConfig`) so they can't drift: spread copies
+// undefined keys, so `{ maxAge: undefined }` clobbered the default and the route silently stopped
+// caching (pre-10.6: forever). Idempotent; the handler merges twice. Copies — caller's = memo slot.
 export function definedOptions<T extends object>(opts: T): T {
   const cleaned = { ...opts } as Record<string, unknown>;
   for (const key of Object.keys(cleaned)) {
@@ -620,16 +516,8 @@ export function definedOptions<T extends object>(opts: T): T {
   return cleaned as T;
 }
 
-// Storage for the standalone purge helpers, which — unlike `resolveCacheKeys` (pure key
-// derivation, no storage) — are useless without the backend the entries were written to.
-// Since storage became per-instance there is no ambient store to fall back on, so an unset
-// `storage` used to resolve a *fresh empty* one: the purge found nothing, reported success,
-// and the stale entry kept being served. That silent no-op is the whole hazard, so it is an
-// error instead. Both valid paths leave `storage` set, so this only ever fires on a genuine
-// mistake: the cached function's own `.invalidate()`/`.expire()` (and `defineCachedHandler`'s
-// event-scoped variants) resolve it before delegating, and a caller reaching for these
-// helpers directly either passes an explicit shared backend or hands over the very options
-// object they cached with, onto which the resolved storage was memoized.
+// The purge helpers are useless without the write-side backend, and per-instance storage has no
+// ambient fallback: an unset `storage` resolved a *fresh empty* one — purge no-ops, stale serves.
 function requireStorage(
   options: { storage?: StorageOption } | undefined,
   caller: string,
@@ -708,26 +596,19 @@ function buildCacheKey(
   base: string,
 ): string {
   const group = opts.group || "functions";
-  // Escaped like every other segment: `name` is the one that used to reach the key raw, and it
-  // stopped being a controlled alphabet once it started coming from `fn.name` (see `resolveName`).
+  // Escaped — `name` is no controlled alphabet once it comes from `fn.name` (see `resolveName`).
   const name = escapeKeySegment(opts.name || "_");
   return [base, group, name, key + ".json"].filter(Boolean).join(":").replace(/:\/$/, ":index");
 }
 
-// A storage-safe segment of the `:`-joined key. Non-word characters are dropped, which is lossy,
-// so a segment the escape changed also carries a hash of the raw value: `.` occurs only in that
-// hashed form, so the two forms can never overlap and two raws that escape alike (`a:bc` /
-// `ab:c`) stay distinct. Ordinary identifier characters come back byte-identical, so escaping
-// this late costs no existing entry its key. Shared by the `name` segment here and a custom
-// `getKey` in `http/key.ts`, which needs the same treatment for the same reason. Commented with
-// `//`, not JSDoc, so docs4ts keeps it out of the API docs.
+// Non-word chars dropped (lossy), so a changed segment carries a hash of the raw — collisions like
+// `a:bc`/`ab:c` stay distinct; identifiers unchanged. Shared with `http/key.ts`; `//` for docs4ts.
 export function escapeKeySegment(raw: string): string {
   const escaped = escapeKey(raw);
   return escaped === raw ? escaped : `${escaped.slice(0, 64)}.${hash(raw)}`;
 }
 
-// Drops everything outside `[A-Za-z0-9_]` from a key segment. Lossy on purpose — see
-// `escapeKeySegment`, which is what callers composing a `:`-joined key should reach for.
+// Lossy on purpose — callers composing a `:`-joined key should reach for `escapeKeySegment`.
 export function escapeKey(key: string | string[]): string {
   return String(key).replace(/\W/g, "");
 }
@@ -747,36 +628,9 @@ async function evictFromStorage(
   await Promise.all(bases.map((b) => storage.set(buildCacheKey(key, { group, name }, b), null)));
 }
 
-// The storage options a write gets: `{ ttl }`, `undefined` for "store it, with no storage
-// TTL", or `false` for "do not store it at all". One helper, so the write path and
-// `remainingTtl` (which rewrites an entry on the `expireCache` path) cannot drift.
-//
-// The rule is **never persist an entry that has neither an expiry nor a storage TTL** — such
-// an entry is unservable-as-fresh *and* unreclaimable, a permanent HIT indistinguishable from
-// a leak (finding 10.6). The two shapes that look alike under it are genuinely different and
-// must stay distinguished:
-//
-// - `{ swr: true, maxAge: 60 }` -> the entry HAS an expiry (`entry.expires`, from `maxAge`)
-//   and deliberately no TTL. It is merely *retained* past the moment it goes stale, which is
-//   the whole of ISR: the last good value keeps being served while a background refresh
-//   replaces it, and a *failed* refresh keeps serving the last success. `revalidate` marks an
-//   entry eligible for regeneration; it never deletes it. **Allowed.** Do not "fix" this into
-//   a `maxAge` TTL (finding 14.3's proposed fix): the entry would be dropped at the exact
-//   moment it went stale, so SWR would degrade to foreground revalidation and nothing would
-//   ever be served stale. The bound on this shape is the storage backend's *capacity*
-//   (finding 14.1's byte budget) — never a timer.
-// - `{ maxAge: 0 }` (or a `getMaxAge` clamped to it) -> neither an expiry nor a TTL: the read
-//   path treats it as expired on arrival, so the entry could never be served, only purged by
-//   hand. **Refused**, and a prior entry on that key is evicted instead (which also clears out
-//   what an older ocache left behind). A nullish `maxAge` is refused with it — unreachable
-//   from the two defaults merges (they always supply `maxAge: 1`, and `definedOptions` means
-//   an explicit `undefined` no longer defeats that), but reachable through the standalone
-//   `expireCache`, which merges nothing. It is also why `swr` with no `maxAge` needs no special
-//   case of its own: there is no such configuration to normalize.
-//
-// `!swr` rather than `swr === false` so an unset `swr` aligns with the SWR-off default on the
-// standalone `expireCache` path, which doesn't merge `defaultCacheOptions`. A negative
-// `staleMaxAge` states no window and is treated as unset.
+// Never persist an entry with neither expiry nor storage TTL (finding 10.6). One helper, so this
+// and `remainingTtl` can't drift. `{ swr, maxAge }` = expiry, no TTL: ISR, bounded by backend
+// capacity (14.1); 14.3 (TTL=maxAge) rejected, kills SWR. `!swr` not `=== false`: `expireCache`.
 function storageTtl(
   maxAge: number | undefined,
   staleMaxAge: number | undefined,
@@ -788,8 +642,8 @@ function storageTtl(
   if (!swr) {
     return { ttl: maxAge };
   }
-  // Under SWR a TTL has to cover the whole window the entry may still be served in; with no
-  // stale window named there is no such moment, so no TTL is armed (the ISR shape above).
+  // A TTL must cover the whole window the entry may still be served in; no stale window named (or a
+  // negative one, which states none) -> no TTL armed, the ISR shape above.
   return staleMaxAge != null && staleMaxAge >= 0 ? { ttl: maxAge + staleMaxAge } : undefined;
 }
 
@@ -798,10 +652,8 @@ function remainingTtl(
   entry: CacheEntry,
   opts: Pick<CacheOptions, "maxAge" | "swr" | "staleMaxAge">,
 ): { ttl: number } | undefined {
-  // The same decision the write path makes (`storageTtl`), so expiring an entry can neither
-  // extend its lifetime nor strip a TTL off it — nor arm one the write deliberately withheld,
-  // which would delete the ISR entry the moment it goes stale. Prefers the per-entry values
-  // `getMaxAge` persisted, falling back to static options.
+  // Same decision as the write path, so expiring can't extend a lifetime, strip a TTL, or arm one
+  // the write withheld (deleting the ISR entry when it goes stale). Per-entry beats static.
   const ttlOpts = storageTtl(
     entry.maxAge ?? opts.maxAge,
     entry.staleMaxAge ?? opts.staleMaxAge,

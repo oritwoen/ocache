@@ -9,28 +9,17 @@ import { hasUnkeyedVary, hasVaryWildcard } from "./vary.ts";
 import type { HandlerConfig } from "./config.ts";
 import type { HTTPEvent, ResponseCacheEntry } from "../types.ts";
 
-// The statuses ocache stores, and identically the only ones it advertises a lifetime for. An
-// allowlist because "not obviously bad" isn't "a complete, reusable representation of what was
-// requested": 200/203 are that representation, 301/308 the resource's stable identity. The
-// rest are per-request answers (302/303/307 bounced an authenticated user to someone else's
-// login redirect; 206 is a partial body), operation outcomes (201/202/300), empty (204/205/304
-// — a stored 304 was replayed to *unconditional* requests) or errors.
+// Allowlist: complete, reusable representations only. 302/303/307 bounced an authed user to
+// someone else's login redirect; 206 is partial; a stored 304 was replayed to *unconditional* GETs.
 const cacheableStatuses = new Set([200, 203, 301, 308]);
 
-// The single source of truth on the status axis, read by `validateEntry` (storage) and by
-// `serializeResponse` (advertisement) so the two cannot disagree. One of three shared axes,
-// alongside `hasVaryWildcard` and `hasUnkeyedVary` — every rejection a *fresh* response can
-// trip while carrying no `Cache-Control` of its own has to be gated there too, or the entry
-// is advertised as reusable and then not stored. The explicit `Cache-Control` opt-outs need
-// no gate (they *are* the handler's header, and we never clobber one) and `shouldCache` is
-// deliberately ungated — "ocache doesn't store this, but a CDN may" is a real configuration,
-// with `sendCacheControl: false` as the inverse knob.
+// Read by `validateEntry` (storage) and `serializeResponse` (advertisement) so the two cannot
+// disagree; likewise `hasVaryWildcard`/`hasUnkeyedVary`. `shouldCache` ungated: a CDN may store.
 export function isCacheableStatus(status: number): boolean {
   return cacheableStatuses.has(status);
 }
 
-// Whether a `ResponseCacheEntry` may be stored (on write, right after `serialize`) and
-// served (on read, as persisted).
+// Whether an entry may be stored (on write, right after `serialize`) and served (on read).
 export async function validateEntry<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   value: ResponseCacheEntry | undefined,
@@ -39,25 +28,21 @@ export async function validateEntry<E extends HTTPEvent>(
   if (!value) {
     return false;
   }
-  // Explicit response-side opt-outs: `no-store`/`private`/`no-cache`, a zero shared
-  // lifetime, or `Vary: *`.
+  // Explicit opt-outs: `no-store`/`private`/`no-cache`, a zero shared lifetime, or `Vary: *`.
   if (forbidsSharedCaching(value.headers)) {
     return false;
   }
-  // Not an opt-out — the handler asked to be cached *per variant* of a header we don't key
-  // on, which one entry cannot honor, so refuse it rather than serve one variant to all of
-  // them (see `hasUnkeyedVary`). On read too: an entry written by an older ocache heals.
+  // Not an opt-out: cacheable, just not keyable per the header it varies on — refuse rather than
+  // serve one variant to all. On read too, so an older ocache's entry heals.
   if (hasUnkeyedVary(value.headers?.vary, varyHeaderNames)) {
     return false;
   }
-  // Defense in depth for entries this version didn't write (an older ocache kept allowlisted
-  // cookies — h3#1524 finding #15c — or another writer shares the storage): reject *any*
+  // Defense in depth for entries we didn't write (h3#1524 #15c, or a shared storage): reject *any*
   // stored Set-Cookie rather than replay it to strangers. `serialize`'s strip is the real guard.
   if (value.headers?.["set-cookie"]) {
     return false;
   }
-  // The one status gate, shared with the advertisement — see `cacheableStatuses`. Applying it
-  // on read too means an entry written by an older, more permissive ocache heals on access.
+  // The one status gate, shared with the advertisement. On read too, so older entries heal.
   if (!isCacheableStatus(value.status)) {
     return false;
   }
@@ -70,8 +55,7 @@ export async function validateEntry<E extends HTTPEvent>(
   if (value.headers.etag === "undefined" || value.headers["last-modified"] === "undefined") {
     return false;
   }
-  // Additive user hook: ANDed with the checks above, so it can reject but never force-cache
-  // what they reject. A throwing hook fails closed — served, but not stored.
+  // ANDed with the above: can reject, never force-cache. A throwing hook fails closed.
   if (opts.shouldCache) {
     try {
       if ((await opts.shouldCache(value)) === false) {

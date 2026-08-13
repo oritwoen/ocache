@@ -42,9 +42,8 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   handler: EventHandler<E>,
   opts: CachedEventHandlerOptions<E> = {},
 ): CachedEventHandler<E> {
-  // Merged options (`name` resolved before the defaults merge — see `config.ts`) plus the
-  // shared cookie/query/header lists. `opts` is rebound so every module reads the same
-  // object; the caller's own object is never written to (storage-memo note in AGENTS.md).
+  // `name` resolved before defaults merge (config.ts). `opts` rebound to a shared object —
+  // caller's own object never written to (AGENTS.md).
   const config = resolveHandlerConfig(handler, opts);
   opts = config.opts;
   const { statusHeader } = config;
@@ -61,13 +60,10 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
 
   const handleCacheHeaders = opts.handleCacheHeaders || defaultHandleCacheHeaders;
 
-  // The resolver returns a live `Response` (hence `T`), `serialize` turns it into the stored
-  // `ResponseCacheEntry`, and `transform` reads that entry back on serve — so `entry.value`
-  // holds the serialized shape once stored (the looseness `transform` already relies on).
+  // `entry.value` holds the serialized `ResponseCacheEntry` once stored, not the live `Response`.
   const _opts: CacheOptions<Response> = {
     ...opts,
-    // Inject the cache-status header into a cloned entry value (never mutating the
-    // stored entry) so it flows through to the final Response headers.
+    // Injects the cache-status header into a cloned value — never mutates the stored entry.
     transform: statusHeader
       ? (entry) => {
           const value = entry.value as unknown as ResponseCacheEntry | undefined;
@@ -83,12 +79,8 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
           };
         }
       : undefined,
-    // Per-entry lifetime, wrapping the caller's `getMaxAge` to honor `must-revalidate` —
-    // which constrains *stale* serving, not storage (RFC 9111 §5.2.2.2), hence
-    // `staleMaxAge: 0`: `cache.ts` reads that as `swr = false` for this entry alone, so a
-    // fresh read still HITs and an expired one revalidates in the foreground. Our override is
-    // computed first and the caller's hook isolated in its own `try`, since `cache.ts` drops
-    // *both* values on a throw — which used to take our `staleMaxAge: 0` down with it.
+    // `must-revalidate` constrains stale, not storage (RFC 9111 §5.2.2.2) — persist
+    // `staleMaxAge: 0`, computed first; caller's hook isolated in its own `try` (throw can't drop it).
     getMaxAge: async (entry) => {
       const res = entry.value;
       // Headers only — the body is read exactly once, by `serialize`, which runs after this.
@@ -110,32 +102,24 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       }
       return override ? { ...dynamic, ...override } : dynamic;
     },
-    // Write-side seam (see `entry.ts`): consume the body, synthesize the cache headers, build
-    // the entry. Runs once per resolution, and outside the resolver so bypassed requests —
-    // which never reach it — get their live `Response` back untouched. Handed the whole entry,
-    // not just its `Response`: the lifetimes it advertises are the ones the hook above just
-    // resolved onto it.
+    // Write-side seam (entry.ts). Handed the whole entry, not just `Response` — advertises
+    // the lifetimes `getMaxAge` above resolved onto it (finding 10.2).
     serialize: (entry) => serializeResponse(config, entry),
-    // The built-in bypass composed with the caller's check (see `request.ts`). The single
-    // evaluation of that composition per call: `cache.ts` short-circuits to the raw resolver
-    // on `true`, and the resolver's narrowing reads the same memoized verdict.
+    // Built-in bypass ∨ caller's check (request.ts), evaluated once per call — resolver's
+    // narrowing reads the same memoized verdict (`cache.ts` short-circuits on `true`).
     shouldBypassCache: (event: HTTPEvent) => resolveBypass(config, event),
     // Key = resource identity + method component; see `key.ts` for both halves.
     getKey: async (event: HTTPEvent) =>
       methodKey(await resolveKey(config, event), event.req.method),
-    // Always inspects the serialized shape: on write right after `serialize`, on read the
-    // entry as persisted.
+    // Always inspects the serialized shape: write, right after `serialize`; read, as persisted.
     validate: (entry) => validateEntry(config, entry.value as unknown as ResponseCacheEntry),
     group: opts.group || "handlers",
     integrity: opts.integrity || hash([handler, integrityOpts(opts)]),
   };
 
-  // Resolver: narrow the request (cacheable calls only), run the handler, return the *live*
-  // `Response`. Serialization happens in the `serialize` hook above, which a bypassed
-  // request skips entirely — so it flows back out untouched.
+  // Bypassed calls skip `serialize` entirely — returns the live `Response` untouched.
   const cachedFn = cachedFunction<Response>(async (event: HTTPEvent) => {
-    // Cacheable calls only — `narrowRequest` gates itself on the composed bypass verdict, so
-    // a request the caller excluded reaches the handler with its credentials and query intact.
+    // Self-gates on the composed bypass verdict — excluded requests keep credentials/query intact.
     narrowRequest(config, event);
 
     // Call handler
@@ -155,9 +139,8 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
     // Call with cache
     const cached = (await cachedFn(event))! as Response | ResponseCacheEntry;
 
-    // A bypassed request resolves to the handler's live `Response` (no `serialize`/
-    // `transform`). Pass it straight through: no body buffering (streams and binary bodies
-    // survive), no synthesized cache headers, no bogus 304 for a non-cacheable method.
+    // Bypassed: live `Response`, no `serialize`/`transform` — passed through untouched (no
+    // body buffering, no synthesized headers, no bogus 304).
     if (cached instanceof Response) {
       return cached;
     }
@@ -177,20 +160,16 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
       });
     }
 
-    // Send Response — the read half of the codec (null-body statuses, binary decode) lives
-    // in `entry.ts`, next to the write half it mirrors.
+    // Read half of the codec (null-body statuses, binary decode) lives in `entry.ts`.
     const { body, init } = deserializeEntry(response);
     return createResponse(body, init);
   };
 
-  // On-demand revalidation from the event itself, without reconstructing the escaped key
-  // (issue #71). Targets the *resource*: every method variant is covered whichever method the
-  // event carries, so a purge can't leave a sibling HEAD entry advertising the dead etag —
-  // the event's own variant first, so `resolveKeys()[0]` is the key it reads and writes.
+  // issue #71: revalidation from the event, no key reconstruction. Covers every method
+  // variant (own variant first → `resolveKeys()[0]`), so a purge can't strand a sibling entry.
   const variantOptions = async (event: E) => {
-    // Each variant spreads `_opts` into a *fresh* object, so resolve the storage first:
-    // otherwise a purge issued before the first request leaves every copy to build its own
-    // default memory storage and silently no-op.
+    // Variants spread `_opts` fresh — resolve storage first, or a purge before the first
+    // request leaves each copy building its own default storage (silent no-op).
     resolveStorage(_opts);
     const key = await resolveKey(config, event);
     const methods = cacheableMethods.includes(event.req.method)
