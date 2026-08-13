@@ -43,7 +43,7 @@ export function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   opts: CachedEventHandlerOptions<E> = {},
 ): CachedEventHandler<E> {
   // `name` resolved before defaults merge (config.ts). `opts` rebound to a shared object —
-  // caller's own object never written to (AGENTS.md).
+  // caller's own object never written to (.agents/http/key.md).
   const config = resolveHandlerConfig(handler, opts);
   opts = config.opts;
   const { statusHeader } = config;
