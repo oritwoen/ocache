@@ -5,11 +5,18 @@
   "license": "MIT",
   "repository": "unjs/ocache",
   "files": [
-    "dist"
+    "dist",
+    "lib"
   ],
   "type": "module",
   "sideEffects": false,
   "types": "./dist/index.d.mts",
+  "imports": {
+    "#crypto": {
+      "node": "./lib/digest.node.mjs",
+      "default": "./lib/digest.mjs"
+    }
+  },
   "exports": {
     ".": "./dist/index.mjs"
   },
@@ -23,9 +30,6 @@
     "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",
     "test": "pnpm lint && pnpm typecheck && vitest run --coverage",
     "typecheck": "tsc --noEmit --skipLibCheck"
-  },
-  "dependencies": {
-    "ohash": "^2.0.11"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

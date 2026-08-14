@@ -20,7 +20,12 @@ src/
 │   ├── cache-control.ts # RFC 9111 directive parser (no policy, just syntax)
 │   ├── vary.ts          # Vary merging and the two response-`Vary` predicates
 │   └── conditional.ts   # 304 decisions and the headers a 304 must echo
+├── hash.ts         # `hash`/`serialize`: cache keys + integrity, digest via `#crypto`
 └── storage.ts      # Storage interface + built-in memory storage
+
+lib/                # Shipped as-is (not built): the two arms of the `#crypto` import
+├── digest.node.mjs # `node` condition -> node:crypto
+└── digest.mjs      # default condition -> portable sha256
 ```
 
 Each mechanism lives in the module its name suggests; `http/index.ts` holds only the wiring (the
@@ -41,6 +46,7 @@ shape — the code comments only reference them.
 | `.agents/http/request.md`  | `http/request.ts` (+ `config.ts`, `filters.ts`): bypass, narrowing, cookies/credentials                |
 | `.agents/http/response.md` | `http/entry.ts`, `validate.ts`, `vary.ts`, `cache-control.ts`, `conditional.ts`                        |
 | `.agents/storage.md`       | `storage.ts`: memory-backend ceilings, byte accounting, `resolveStorage`                               |
+| `.agents/hash.md`          | `hash.ts`: the digest backend lookup, what `serialize` renders and why it must stay stable             |
 
 ## Cross-module invariants
 
@@ -78,8 +84,12 @@ Breaking one of these is how nearly every finding in the deep dives happened.
 
 ## Design Decisions
 
-- No h3/srvx/unstorage dependency — fully standalone. Only runtime dep is `ohash` (cache keys +
-  integrity).
+- No h3/srvx/unstorage dependency — fully standalone, and **zero runtime dependencies**. Cache
+  keys and integrity hash through `src/hash.ts` (sha256/base64url over a deterministic
+  `serialize`), which replaced `ohash`. Its digest comes from the `#crypto` conditional import:
+  `node:crypto` under the `node` condition, a portable sha256 (`lib/digest.mjs`) otherwise, so
+  each consumer bundles only the arm it needs. Both arms must give byte-identical keys; `hash` is
+  sync, which is why neither is WebCrypto (`.agents/hash.md`).
 - `base` supports `string | string[]` — multi-tier: reads try each prefix in order (first hit
   wins), writes go to all prefixes (a tier-N hit promotes to tiers 0..N).
 - Default cache key group: `"functions"` (cache.ts) / `"handlers"` (http/index.ts) — no `ocache/`

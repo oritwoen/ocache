@@ -274,7 +274,7 @@ Resolves all cache storage keys (one per base prefix) for given arguments and ca
 Uses the same key derivation as `defineCachedFunction` internally:
 
 - When `opts.getKey` is provided, it is called with `args` to produce the key segment.
-- Otherwise, `args` are hashed with `ohash` (same default as `defineCachedFunction`).
+- Otherwise, `args` are hashed (same default as `defineCachedFunction`).
 
 Pass the same `getKey`, `name`, `group`, and `base` options you use in
 `defineCachedFunction` / `defineCachedHandler` to get the exact storage keys.

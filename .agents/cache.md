@@ -25,7 +25,7 @@ layer builds on all of this (`.agents/http/key.md`, `.agents/http/response.md`).
   but not once it comes from `fn.name`, which is no controlled alphabet: `named.bind(null)` is
   `bound named` (embedded space), and a handler named `page:HEAD` built **exactly** the key a
   `page` handler's HEAD variant writes. Breaking only for names carrying an escapable character
-  (≈ one `anon_<hash>` in five — ohash's alphabet includes `-`); `name` is outside the integrity
+  (≈ one `anon_<hash>` in five — the base64url alphabet includes `-`); `name` is outside the integrity
   hash, so a moved entry is simply not found: one cold read, never found-and-rejected.
 
 ## Option merging

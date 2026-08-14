@@ -933,7 +933,7 @@ describe("cache key name resolution (#53)", () => {
   it("anonymous function falls back to a stable hash of its source", async () => {
     const fn = defineCachedFunction(async () => 1);
     const key = (await fn.resolveKeys())[0]!;
-    // ohash's alphabet includes `-`, which the key escape drops — so a slice carrying one
+    // The base64url alphabet includes `-`, which the key escape drops — so a slice carrying one
     // takes the escaped-plus-hash form (see "cache key name escaping"). Both are accepted.
     expect(key).toMatch(/^\/cache:functions:anon_\w{1,16}(\.[\w-]+)?:\.json$/);
     // Stable across separate definitions of the identical function source.
@@ -2537,7 +2537,7 @@ describe("storage", () => {
       const key = "/cache:functions:integrity:k.json";
 
       // Identical in every way except where entries live, and in which *form* the storage
-      // was passed — ohash hashes a factory and a ready instance differently, so this
+      // was passed — `serialize` hashes a factory and a ready instance differently, so this
       // would diverge if `storage` reached the integrity hash.
       const a = _defineCachedFunction(fn, {
         maxAge: 10,

@@ -2,7 +2,7 @@
 // Holds only the wiring — the `CacheOptions` hooks, the resolver, the serve path and the
 // revalidation helpers.
 
-import { hash } from "ohash";
+import { hash } from "../hash.ts";
 import { cachedFunction, expireCache, invalidateCache, resolveCacheKeys } from "../cache.ts";
 import { resolveStorage } from "../storage.ts";
 

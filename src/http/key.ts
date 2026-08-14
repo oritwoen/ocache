@@ -3,7 +3,7 @@
 // caller's `getKey`), `methodKey` prefixes the method — so the revalidation helpers can
 // enumerate every method variant of one resource from a single event.
 
-import { hash } from "ohash";
+import { hash } from "../hash.ts";
 
 import { escapeKey, escapeKeySegment } from "../cache.ts";
 

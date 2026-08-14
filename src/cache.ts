@@ -1,4 +1,4 @@
-import { hash } from "ohash";
+import { hash } from "./hash.ts";
 import { resolveStorage } from "./storage.ts";
 
 import type { StorageInterface, StorageOption } from "./storage.ts";
@@ -376,7 +376,7 @@ export const cachedFunction = defineCachedFunction;
  *
  * Uses the same key derivation as `defineCachedFunction` internally:
  * - When `opts.getKey` is provided, it is called with `args` to produce the key segment.
- * - Otherwise, `args` are hashed with `ohash` (same default as `defineCachedFunction`).
+ * - Otherwise, `args` are hashed (same default as `defineCachedFunction`).
  *
  * Pass the same `getKey`, `name`, `group`, and `base` options you use in
  * `defineCachedFunction` / `defineCachedHandler` to get the exact storage keys.
@@ -671,7 +671,7 @@ function remainingTtl(
  * `storage` belongs in that set for the same reason as `base`/`group`/`name`: it says
  * *where* entries live, not what they contain, so pointing an instance at a different
  * backend must not invalidate the entries already there. Hashing it would also be
- * meaningless and expensive — ohash walks a storage object's methods as source text, so
+ * meaningless and expensive — `serialize` walks a storage object's methods as source text, so
  * two `createMemoryStorage()` instances hash identically (including different `maxSize`,
  * a closure variable) while a factory vs. a ready instance hash differently: an integrity
  * change on a purely cosmetic config edit.

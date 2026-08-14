@@ -2,7 +2,7 @@
 // (`serializeResponse`) and back on a hit (`deserializeEntry`). One file because the two
 // halves must agree on the body encoding, the null-body statuses and which headers survive.
 
-import { hash } from "ohash";
+import { hash } from "../hash.ts";
 
 import type { HandlerConfig } from "./config.ts";
 import { isCacheableStatus } from "./validate.ts";
