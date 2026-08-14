@@ -1,21 +1,14 @@
-// `Cache-Control`: the RFC 9111 directive syntax and the two questions ocache asks of it.
-// Syntax only, no policy — storage is `validate.ts`'s decision and the stale window is the
-// `getMaxAge` hook's, and a header parser is testable without an event or a cache.
-
 /**
- * Whether a `Cache-Control` value forbids reusing the response from a shared cache:
- * `no-store`, `private` (the qualified `private="field"` form too — we replay headers
- * verbatim), `no-cache` (see the TODO below), or a zero shared lifetime. The last is
- * `s-maxage` whenever it parses, else `max-age` (RFC 9111 §5.2.2.10), never the first zero of
- * either — that refused the canonical `public, max-age=0, s-maxage=600` "store me" idiom.
- * `must-revalidate` is absent on purpose: it constrains stale serving, not storage.
+ * Returns whether `Cache-Control` forbids reuse by a shared cache.
+ *
+ * `s-maxage` overrides `max-age` per RFC 9111 section 5.2.2.10.
+ * `must-revalidate` limits stale reuse but does not forbid storage.
  */
 export function cacheControlForbidsReuse(cacheControl: unknown): boolean {
   if (typeof cacheControl !== "string" || !cacheControl) {
     return false;
   }
-  // Collected, not decided, in-loop — verdict depends on directives present *together*; bans
-  // still short-circuit. First parseable value wins, so the result is order-independent.
+  // Collect both lifetimes before applying shared-cache precedence.
   let maxAge: number | undefined;
   let sMaxAge: number | undefined;
   for (const [name, value] of cacheControlDirectives(cacheControl)) {
@@ -24,8 +17,7 @@ export function cacheControlForbidsReuse(cacheControl: unknown): boolean {
       case "private": {
         return true;
       }
-      // TODO: RFC 9111 §5.2.2.4 allows storing `no-cache` if every reuse revalidates — real
-      // new machinery ocache lacks. Rejecting is the honest interim.
+      // ocache cannot validate every reuse as RFC 9111 section 5.2.2.4 requires.
       case "no-cache": {
         return true;
       }
@@ -39,15 +31,11 @@ export function cacheControlForbidsReuse(cacheControl: unknown): boolean {
       }
     }
   }
-  // The shared-cache lifetime: `s-maxage` when it says anything at all, `max-age` otherwise.
   const shared = sMaxAge ?? maxAge;
   return shared !== undefined && shared <= 0;
 }
 
-/**
- * Whether a `Cache-Control` value requires revalidation before a *stale* response is reused
- * (`must-revalidate`). Not a storage opt-out — see the `getMaxAge` hook.
- */
+/** Returns whether stale reuse requires revalidation. */
 export function requiresRevalidation(cacheControl: unknown): boolean {
   if (typeof cacheControl !== "string" || !cacheControl) {
     return false;
@@ -55,12 +43,7 @@ export function requiresRevalidation(cacheControl: unknown): boolean {
   return cacheControlDirectives(cacheControl).some(([name]) => name === "must-revalidate");
 }
 
-/**
- * Splits a `Cache-Control` value into `[name, value]` pairs, lowercasing names and unquoting
- * values. A parser rather than `includes()`/`split(",")`: a value may be a quoted string
- * holding a comma, and substring matching confuses `max-age=0` with `max-age=0600`,
- * `stale-while-revalidate=0` or `x-no-cache`.
- */
+/** Parses directives, including quoted values that contain commas. */
 function cacheControlDirectives(value: string): Array<[string, string | undefined]> {
   const directives: Array<[string, string | undefined]> = [];
   let token = "";
@@ -85,7 +68,7 @@ function cacheControlDirectives(value: string): Array<[string, string | undefine
   for (let i = 0; i < value.length; i++) {
     const char = value[i]!;
     if (quoted) {
-      // A quoted-pair escapes the next character, including a closing quote.
+      // A quoted pair escapes the next character.
       if (char === "\\") {
         token += char + (value[++i] ?? "");
         continue;
@@ -112,10 +95,8 @@ function cacheControlDirectives(value: string): Array<[string, string | undefine
 }
 
 /**
- * Parses a `delta-seconds` value (RFC 9111 §1.2.2: `1*DIGIT`), returning `undefined` for
- * anything else — a malformed directive states nothing we may act on (§5.2). A leading `-` is
- * accepted so the common `max-age=-1` reads as "already expired", and leading zeros are
- * digits, so `max-age=0600` is 600 seconds rather than a zero lifetime.
+ * Parses RFC 9111 delta-seconds.
+ * Accepts negative values as expired and ignores malformed values.
  */
 function deltaSeconds(value: string | undefined): number | undefined {
   if (value === undefined || !/^-?\d+$/.test(value)) {

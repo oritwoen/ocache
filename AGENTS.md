@@ -1,6 +1,6 @@
 # ocache
 
-Composable caching primitives. Works with any runtime that has standard `Request`/`Response`.
+ocache provides composable cache primitives. It works in any runtime that provides standard `Request` and `Response` objects.
 
 ## Project Structure
 
@@ -28,16 +28,11 @@ lib/                # Shipped as-is (not built): the two arms of the `#crypto` i
 └── digest.mjs      # default condition -> portable sha256
 ```
 
-Each mechanism lives in the module its name suggests; `http/index.ts` holds only the wiring (the
-`CacheOptions` hooks handed to `cachedFunction`, the resolver, the serve path, the revalidation
-helpers). The `http/` dependency graph is a DAG — `cache-control.ts`, `vary.ts`, `conditional.ts`
-and `config.ts` import nothing from the directory.
+Each mechanism belongs in the module whose name describes it. `http/index.ts` contains only the connection to `cachedFunction`, the `CacheOptions` hooks, the resolver, the serve path, and the revalidation helpers. The `http/` dependency graph is a DAG. `cache-control.ts`, `vary.ts`, `conditional.ts`, and `config.ts` do not import from the directory.
 
 ## Deep dives (`.agents/`)
 
-Laid out to mirror `src/`. Read the one that owns the area you are changing **before** editing
-it: they carry the measured symptom, the rejected alternatives and the findings behind each
-shape — the code comments only reference them.
+The `.agents/` layout matches `src/`. Before you edit an area, read the file that covers it. These files record measured symptoms, rejected alternatives, and reasons for the current design. Code comments only refer to these details.
 
 | File                       | Covers                                                                                                 |
 | -------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -50,30 +45,19 @@ shape — the code comments only reference them.
 
 ## Cross-module invariants
 
-Breaking one of these is how nearly every finding in the deep dives happened.
+Most findings in the deep dives came from violations of these rules.
 
-- **A handler may read exactly what the key covers.** `keyHeaderNames` drives both narrowing
-  (`request.ts`) and key composition (`key.ts`); the allowlist subsets are computed once in
-  `filters.ts` so neither side derives its own. Narrowing is an allowlist — undeclared headers
-  are stripped; the only exemptions are `filters.ts`'s `safeHeaderNames`, and adding one is a
-  claim that no key could ever cover it.
-- **The storage decision and the advertisement share predicates.** `isCacheableStatus`,
-  `hasVaryWildcard`, `hasUnkeyedVary` are read by `validate.ts` (may we store it?) and `entry.ts`
-  (may we advertise a lifetime?). Never re-implement one at a call site.
-- **Never write an entry with neither an expiry nor a storage TTL** — `storageTtl` is the single
-  decision point, and `remainingTtl` (`expireCache`) derives from it.
-- **Storage is per instance, never global**, and key derivation must be deterministic across
-  process restarts (persistent backends).
-- `resolveName`, `definedOptions`, `resolveStorage` are shared internals exported from `cache.ts`
-  and `storage.ts` so the function and handler paths cannot drift. `name` must be resolved
-  **before** the defaults merge on both paths.
-- Key segments reaching a `:`-joined key go through `escapeKeySegment`.
+- **A handler may read exactly what the key covers.** `keyHeaderNames` controls both request narrowing in `request.ts` and key composition in `key.ts`. `filters.ts` computes the allowlist subsets once. Neither side may compute separate subsets. Narrowing uses an allowlist and removes undeclared headers. Only `safeHeaderNames` in `filters.ts` are exempt. Add a safe header only if no key could ever need to cover it.
+- **The storage decision and the advertisement must use the same predicates.** `validate.ts` uses `isCacheableStatus`, `hasVaryWildcard`, and `hasUnkeyedVary` to decide whether it may store a response. `entry.ts` uses the same predicates to decide whether it may advertise a lifetime. Never copy these checks into a call site.
+- **Never write an entry that has neither an expiry nor a storage TTL.** `storageTtl` is the only decision point. `remainingTtl` in `expireCache` derives from it.
+- **Storage must be per instance, never global.** Persistent backends also require deterministic keys across process restarts.
+- `cache.ts` and `storage.ts` export the shared internal functions `resolveName`, `definedOptions`, and `resolveStorage`. The function and handler paths must use these functions so they cannot differ. Both paths must resolve `name` **before** they merge defaults.
+- Pass every segment of a `:`-joined key through `escapeKeySegment`.
 
 ## Docs
 
-- Never touch contents inside `<!-- automd -->` in README.md — auto-generated (`pnpm fmt`).
-- User-facing guides live in `docs/1.guide/`. Behavior changes that alter a documented string or
-  default belong there too (`8.cache-control.md`, `9.isr.md` are the closest to the internals).
+- Never edit content inside `<!-- automd -->` in README.md. `pnpm fmt` generates this content.
+- User guides are in `docs/1.guide/`. If a behavior change changes a documented string or default, update the relevant guide. `8.cache-control.md` and `9.isr.md` are closest to these internals.
 
 ## Dev Commands
 
@@ -84,19 +68,8 @@ Breaking one of these is how nearly every finding in the deep dives happened.
 
 ## Design Decisions
 
-- No h3/srvx/unstorage dependency — fully standalone, and **zero runtime dependencies**. Cache
-  keys and integrity hash through `src/hash.ts` (sha256/base64url over a deterministic
-  `serialize`), which replaced `ohash`. Its digest comes from the `#crypto` conditional import:
-  `node:crypto` under the `node` condition, a portable sha256 (`lib/digest.mjs`) otherwise, so
-  each consumer bundles only the arm it needs. Both arms must give byte-identical keys; `hash` is
-  sync, which is why neither is WebCrypto (`.agents/hash.md`).
-- `base` supports `string | string[]` — multi-tier: reads try each prefix in order (first hit
-  wins), writes go to all prefixes (a tier-N hit promotes to tiers 0..N).
-- Default cache key group: `"functions"` (cache.ts) / `"handlers"` (http/index.ts) — no `ocache/`
-  prefix.
-- Integrity excludes the storage-location fields `base`/`group`/`name`/`storage`, in **both**
-  `integrityOpts` (cache.ts, http/config.ts), so entries survive a backend or prefix change. See
-  the JSDoc in `cache.ts` for why hashing `storage` is both meaningless and expensive.
-- Framework integration hooks on `CachedEventHandlerOptions`: `toResponse(value, event)`,
-  `createResponse(body, init)`, `handleCacheHeaders(event, conditions)` — each replacing the
-  built-in `Response`/304 behavior.
+- Do not add h3, srvx, or unstorage as a dependency. ocache is standalone and has **zero runtime dependencies**. Cache keys and integrity values use `src/hash.ts`. This module computes sha256/base64url over deterministic `serialize` output and replaces `ohash`. The `#crypto` conditional import provides the digest. The `node` condition selects `node:crypto`. The default condition selects portable sha256 from `lib/digest.mjs`. This lets each consumer bundle only the required implementation. Both implementations must produce byte-identical keys. `hash` is synchronous, so neither implementation uses WebCrypto. See `.agents/hash.md`.
+- `base` supports `string | string[]`. For multiple tiers, reads stop at the first hit. Misses write every prefix. Revalidation writes the hit tier and every earlier tier.
+- The default cache key group is `"functions"` in cache.ts and `"handlers"` in http/index.ts. Do not add an `ocache/` prefix.
+- Both `integrityOpts` implementations in cache.ts and http/config.ts exclude the storage-location fields `base`, `group`, `name`, and `storage`. This keeps entries valid after a backend or prefix change. The JSDoc in `cache.ts` explains why hashing `storage` has no meaning and costs too much.
+- `CachedEventHandlerOptions` provides these framework hooks: `toResponse(value, event)`, `createResponse(body, init)`, and `handleCacheHeaders(event, conditions)`. Each hook replaces the related built-in `Response` or 304 behavior.

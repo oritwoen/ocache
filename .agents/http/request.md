@@ -1,159 +1,60 @@
 # `http/request.ts` — bypass and request narrowing
 
-The directory's one rule: **a handler may read exactly what the key covers**. `keyHeaderNames`
-drives narrowing (`config.ts`), `filters.ts` computes the allowlisted subsets both this module
-and `key.ts` use, so neither side can derive its own.
+The directory has one rule: **a handler may read exactly what the key covers**. `keyHeaderNames` controls narrowing in `config.ts`. `filters.ts` computes the allowlisted subsets used by this module and `key.ts`. The two modules must not derive separate subsets.
 
 ## Bypass
 
-Non-GET/HEAD requests **and any request carrying a `Range` header** bypass the cache — the
-built-in half of `resolveBypass`, composed with (never replaced by) any caller
-`shouldBypassCache` (issue #50) — and reach the handler untouched, body included, which the
-rewritten `Request` would otherwise drop.
+Non-GET/HEAD requests and every request with a `Range` header **bypass the cache**. This is the built-in part of `resolveBypass`. Compose it with, and never replace it with, the caller's `shouldBypassCache` (issue #50). Bypassed requests reach the handler without changes, including their bodies. A rewritten `Request` would otherwise omit the body.
 
-Narrowing gates on the **composed** verdict, never the built-in half alone (finding 09): the
-built-in check said "cacheable" for a GET the caller had excluded, so `shouldBypassCache`
-stripped credentials off the very requests it exempted — and it is the escape hatch the
-credential defaults document, so following that advice served the anonymous/401 rendering to
-every authenticated user, on every request. `narrowRequest` gates itself rather than trusting
-its call site.
+Base narrowing on the **combined** decision, not only the built-in decision (finding 09). Earlier code considered a GET cacheable before the caller's `shouldBypassCache` excluded it. It removed credentials from the requests that the caller had explicitly exempted. Bypass is the escape path documented by the credential defaults. The defect caused anonymous or 401 output on every authenticated request. `narrowRequest` checks the decision itself instead of relying on its caller.
 
-The verdict is produced **exactly once per call** (the caller's hook may be async, expensive or
-side-effecting) by `resolveBypass`, which `cache.ts` awaits for its short-circuit to the raw
-resolver and which memoizes the answer on the event in a per-handler-instance `WeakMap`
-(`config.bypassed`, the `searchCache` pattern). Per-call state keyed by the event, deliberately
-not a module-level slot (a cross-request bug); threaded through `config` rather than the
-resolver's arguments because `cache.ts` calls `fn(...args)` with the caller's args and nothing
-else.
+Compute the decision **exactly once per call**. The caller's hook can be asynchronous, expensive, or have side effects. `resolveBypass` stores the result on the event in `config.bypassed`, a per-handler `WeakMap` that follows the `searchCache` pattern. `cache.ts` awaits this result before it skips to the raw resolver. Keep per-call state keyed by event, not in a module-level slot, which would mix requests. Pass it through `config` because `cache.ts` invokes `fn(...args)` with only the caller's arguments.
 
-**`Range` specifically** (finding 07) — the request-side half of the 206 fix, paired with 206's
-absence from the status allowlist. `Range` is forwarded but is neither in the key nor a `Vary`
-dimension, so a range-honoring handler (static files, media, `serveStatic`) resolved a _partial_
-representation under the range-free key: one `curl -r 0-0` stored a one-byte body plus its
-`Content-Range`, and every later `Range`-less GET got that truncation for the whole TTL,
-propagated to shared CDNs by the synthesized `s-maxage` (RFC 9110 §15.3.7 / RFC 9111 §3.3 — a 206
-answers only the request that named the range; combining partials is out of scope). Bypassing on
-the request side is the cheaper half: nothing partial is stored and `serialize` never buffers a
-large partial body. Breaking: a ranged request now also skips narrowing (the standard bypass
-contract) and gets no `x-cache`/`etag`/`cache-control`.
+**`Range` specifically** (finding 07) is the request-side part of the 206 fix. The status allowlist also excludes 206. `Range` was forwarded but was absent from the key and `Vary`. A range-aware handler such as a static-file, media, or `serveStatic` handler could store a partial representation under the range-free key. One `curl -r 0-0` request stored a one-byte body with `Content-Range`. Every later GET without `Range` received that truncated body for the full TTL. Synthesized `s-maxage` also sent it to shared CDNs. RFC 9110 §15.3.7 and RFC 9111 §3.3 state that a 206 answers only the request that specified the range. Combining partial responses is out of scope. Request bypass is the cheaper protection because no partial response is stored and `serialize` does not buffer a large partial body. This is a breaking change. A ranged request now also skips narrowing, as all bypassed requests do. It receives no `x-cache`, `etag`, or `cache-control` synthesis.
 
-Bypassed responses pass through untouched: because `serialize` lives outside the resolver, a
-bypassed call yields the handler's live `Response`, which the outer wrapper detects
-(`value instanceof Response`) and returns as-is — no body buffering (streaming/binary bodies
-survive), no synthesized cache headers, no bogus `304` for a non-cacheable method. Breaking vs.
-the old always-serialize path.
+Return bypassed responses without changes. `serialize` runs outside the resolver, so a bypassed call returns the handler's live `Response`. The outer wrapper detects `value instanceof Response` and returns it directly. Do not buffer its body. Streaming and binary bodies must survive. Do not synthesize cache headers or a false `304` for a non-cacheable method. This differs from the old path, which always serialized.
 
 ## What the handler sees
 
-The header filter is an **allowlist**, the rule stated literally: a header reaches the handler
-only if it is in `keyHeaderNames`, is `cookie` (its own three-way branch below), or is in
-`safeHeaderNames`. Everything else is stripped on cacheable calls.
+The header filter is an **allowlist**. A header reaches the handler only when it appears in `keyHeaderNames`, is `cookie` under the three-way rule below, or appears in `safeHeaderNames`. Remove every other header on cacheable calls.
 
-`varies` headers are **forwarded** — their values are part of the key, so reading them is safe
-and is the point of declaring them. They used to be the only headers filtered _out_, which meant
-`varies: ["accept-language"]` produced correct per-language keys and `Vary` while every entry
-held the _default_ rendering (breaking behavior change).
+Forward `varies` headers. Their values are part of the key, so the handler can safely read them. Reading them is the reason to declare them. Earlier code removed declared `varies` headers instead of forwarding them. For example, `varies: ["accept-language"]` produced separate keys and correct `Vary`, but every entry contained the default rendering. Correct forwarding was therefore a breaking behavior change.
 
-Everything undeclared used to be forwarded too, and the strip was a by-name patch for
-`authorization`/`proxy-authorization`/`cookie` — three instances of a general gap the rule had
-asserted since the initial commit but nothing implemented. Any other header a handler read was
-rendered into an entry no key distinguished: a MISS carrying `x-api-key: alice` stored alice's
-tenant page under the shared key, advertised it with a synthesized `max-age=N` and **no `Vary`**,
-and replayed it to every later caller — the credential failure mode exactly, minus the name.
-`x-forwarded-host` is the same h3#1524 cross-tenant collision by another route (behind a proxy
-the authority in the key is the internal one, identical for both tenants). `origin` echoed into a
-cached CORS header, `accept`/`accept-language` driving negotiation, `x-forwarded-proto` building
-absolute links — all the same shape.
+Earlier code also forwarded every undeclared header. It removed only `authorization`, `proxy-authorization`, and `cookie`, which treated three examples as the full problem. Any other header read by the handler could affect output without affecting the key. For example, a MISS with `x-api-key: alice` stored Alice's tenant page under a shared key. It advertised synthesized `max-age=N` without `Vary` and replayed the page to later callers. This is the same credential defect under a different header name. `x-forwarded-host` causes the h3#1524 cross-tenant collision through another path when the key contains the same internal proxy authority for every tenant. Other examples are `origin` copied into CORS output, `accept` or `accept-language` used for negotiation, and `x-forwarded-proto` used for absolute links.
 
-Breaking, and broadly: a handler reading a header it has not declared now gets `null` and renders
-the default variant for everyone. The fix is to declare it in `varies` (keyed, visible,
-advertised) or to keep those requests out of the cache with `shouldBypassCache`. It fails closed —
-one shared rendering rather than one caller's rendering shared — which is the direction the
-credential default already chose.
+This change is broad and breaking. A handler that reads an undeclared header now receives `null` and produces the default variant. Declare the header in `varies` to key, expose, and advertise it. Alternatively, exclude those requests with `shouldBypassCache`. The default now fails closed by sharing one default rendering instead of sharing one caller's rendering. This matches the existing credential policy.
 
-This is the request-side twin of `hasUnkeyedVary` (`.agents/http/response.md`): the response side
-refuses to _store_ a response that varies on an unkeyed header, the request side refuses to
-_show_ the handler that header at all. A route misconfigured in both directions now hits both.
+This rule is the request-side counterpart to `hasUnkeyedVary` in `.agents/http/response.md`. The response side refuses to store output that varies on an unkeyed header. The request side refuses to expose that header to the handler. A route that is wrong in both directions triggers both protections.
 
 ### `safeHeaderNames`
 
-The exemptions (`filters.ts`, beside the cookie/query filters so no module derives its own list).
-Each is there because it cannot vary a rendering _and_ because `varies` is no escape hatch for it:
+`filters.ts` defines these exemptions beside the cookie and query filters. No module may create its own list. Each exempt header cannot vary a rendering and cannot usefully be placed in `varies`:
 
-- **`host`** — already covered, by the URL authority `resolveKey` hashes.
-- **`if-none-match` / `if-modified-since`** — `defaultHandleCacheHeaders` reads them off
-  `event.req` in `http/index.ts` **after** narrowing has swapped it, so stripping them left 304s
-  working on a HIT and silently never firing on a MISS. Safe to forward: the only responses a
-  handler can derive from them (304, 412) are off `cacheableStatuses`, so nothing built from them
-  is ever stored.
-- **`traceparent`, `tracestate`, `x-request-id`, `x-correlation-id`** — carried for logging and
-  trace propagation, and per-request-unique by construction: putting one in `varies` would mean
-  one entry per request, so there is no configuration that makes them keyed. A handler rendering
-  from one is producing something no key could cover in the first place.
+- **`host`** is already covered by the URL authority that `resolveKey` hashes.
+- **`if-none-match` / `if-modified-since`** remain visible because `defaultHandleCacheHeaders` reads them from `event.req` in `http/index.ts` after narrowing replaces that request. If narrowing removed them, 304 responses worked on a HIT but never on a MISS. They are safe to forward. The only conditional responses that a handler can derive from them are 304 and 412, and those statuses are not in `cacheableStatuses`. The cache never stores such output.
+- **`traceparent`, `tracestate`, `x-request-id`, `x-correlation-id`** support logging and trace propagation. They are unique per request by design. Adding one to `varies` would create one entry per request, so no useful keyed configuration exists. A handler that renders one into output creates data that no cache key can cover.
 
-Deliberately **not** exempt: `user-agent` (device/bot branching is the most common real rendering
-input there is) and `baggage` (OTel's is designed for application code to read — tenant id,
-feature flags — unlike the opaque `traceparent`/`tracestate` pair). Both are declared in `varies`
-like any other varying header.
+Do **not** exempt `user-agent` or `baggage`. Device and bot branching commonly use `user-agent`. OTel `baggage` is designed for application values such as tenant IDs and feature flags. This differs from the opaque `traceparent` and `tracestate` pair. Declare both headers in `varies` when they affect output.
 
 ### Cookies (request side)
 
-By default no cookies participate in caching: the `Cookie` header is stripped before the handler
-runs and never varies the key. Two opt-ins, both governing **this direction only** (the response
-side is not negotiable — see `.agents/http/response.md`):
+By default, cookies do not affect caching. Remove the `Cookie` header before the handler runs and do not vary the key by it. Two options affect only this request-side rule. The response-side rule cannot be changed. See `.agents/http/response.md`.
 
-- `varies: ["cookie"]` — the **coarse** opt-in, symmetric with how `varies: ["authorization"]`
-  equals `allowAuthorization: true`: `cookie` stays in `keyHeaderNames`, so the **raw** header
-  composes the key _and_ is forwarded untouched. Correct by construction, and the caller owns the
-  fragmentation cost — one entry per distinct raw `Cookie` value, i.e. effectively per visitor.
-  Previously the raw header was hashed into the key while narrowing still stripped it, so the
-  handler rendered the cookie-less default variant into every per-cookie entry (N identical
-  entries, zero variation), a key re-derived from an already-served event drifted from the one
-  just written (so `.invalidate(event)` after `handler(event)` — the documented issue-#71 pattern
-  — silently purged nothing), and the documented "`varies` headers are forwarded" rule was
-  contradicted.
-- `allowCookies: string[]` — the **fine** opt-in and the one to prefer: only listed names survive
-  in the handler-visible `Cookie` header and vary the key (sorted, order-independent —
-  `filterCookie`). **Supersedes** `varies: ["cookie"]` in both directions — `cookie` is dropped
-  from `keyHeaderNames` (the allowlist hash is strictly finer) and the handler never sees the raw
-  header — but is added to `varyHeaderNames`, so `allowCookies` always emits `Vary: Cookie`.
+- `varies: ["cookie"]` is the **coarse** option. It is symmetric with `varies: ["authorization"]`, which is equivalent to `allowAuthorization: true`. `cookie` remains in `keyHeaderNames`, so the raw header affects the key and reaches the handler without changes. This is correct by construction. The caller accepts one entry for each distinct raw `Cookie` value, which is effectively one entry per visitor. Earlier code hashed the raw header but removed it before the handler. The handler then wrote the cookie-free default into every cookie-specific entry. This created N equal entries with no output variation. It also caused a key rebuilt from a served event to differ from the written key. Therefore, documented code such as `.invalidate(event)` after `handler(event)` purged nothing. That behavior also contradicted the rule that `varies` headers are visible.
+- `allowCookies: string[]` is the preferred **fine** option. Only listed cookie names remain in the visible `Cookie` header and affect the key. `filterCookie` sorts them, so order does not matter. This option **overrides** `varies: ["cookie"]` in both directions. Remove `cookie` from `keyHeaderNames` because the allowlist hash is more precise. Never expose the raw header. Add `cookie` to `varyHeaderNames`, so `allowCookies` always emits `Vary: Cookie`.
 
-The three-way branch lives in the narrowing block: allowlist → filtered subset; no allowlist but
-`cookie` in `keyHeaderNames` → forward raw; neither → strip.
+Implement this as three branches in narrowing. Use the filtered subset when an allowlist exists. Otherwise, forward the raw header when `keyHeaderNames` contains `cookie`. Remove it in all other cases.
 
 ### Authorization
 
-By default `authorization`/`proxy-authorization` do not participate in caching (same rigor as
-cookies) — both stripped from the handler-visible request on cacheable calls, so a handler cannot
-render per-user content from a credential that isn't in the key. No special case any more: they
-are undeclared headers, and the allowlist above covers them. Previously they were forwarded
-but never keyed, so a token-authenticated route failed **open**: the first caller's private
-response was stored under the anonymous key, replayed to everyone, and advertised
-`max-age=N, s-maxage=N` for shared CDNs. Cookie-authenticated routes already failed safe — that
-asymmetry was the defect.
+By default, `authorization` and `proxy-authorization` do not affect caching. Remove both from the handler-visible request on cacheable calls. A handler must not render per-user content from a credential absent from the key. No special code is needed because they are undeclared headers under the allowlist rule. Earlier code forwarded these headers without keying them. A token-authenticated route then failed open. The first caller's private response was stored under the anonymous key, replayed to everyone, and advertised with `max-age=N, s-maxage=N` to shared CDNs. Cookie-authenticated routes already failed closed. That difference was the defect.
 
-`allowAuthorization: true` folds both names into both header lists (deduped against `opts.varies`,
-sorted), which in one step makes them vary the key, appear in `Vary`, and stay visible. Listing
-either name in `varies` counts as the same opt-in. Callers own the consequence: one entry per
-distinct credential value, shared by everyone presenting it. Breaking: handlers needing the
-credential must set `allowAuthorization`, or bypass those requests.
+`allowAuthorization: true` adds both names to both header lists. Deduplicate them against `opts.varies` and sort the result. One operation then keys the values, emits them in `Vary`, and keeps them visible. Listing either name in `varies` is the same opt-in. The caller accepts one entry for each credential value, shared by callers that present the same value. This is a breaking change. Handlers that need credentials must set `allowAuthorization` or bypass those requests.
 
 ## Mutation of the caller's event
 
-Narrowing **mutates** `event.req` (plus `event.url` under `allowQuery`) and never restores it, so
-after a MISS the caller observes the narrowed request while after a HIT or bypass it does not.
+Narrowing **mutates** `event.req`. It also mutates `event.url` when `allowQuery` applies. It does not restore either value. After a MISS, the caller sees the narrowed request. After a HIT or bypass, the caller does not.
 
-Not restored in a `finally` on purpose: a handler's body producer can run _after_ the resolver
-returns (an async `ReadableStream.pull` is drained by `serialize`'s `res.arrayBuffer()`), so a
-restore would hand the original credentialed request back to a lazy read whose output is then
-cached and replayed — re-opening exactly what narrowing closes. It would also still leave the SWR
-window, where the background refresh swaps the stale reader's event after its response was
-returned. The real fix is to stop mutating the caller's event at all, which needs a design
-decision because `E` is an arbitrary framework event — **tracked, open**.
+Do not restore values in a `finally` block. A response body can read them after the resolver returns. For example, an asynchronous `ReadableStream.pull` runs while `serialize` calls `res.arrayBuffer()`. Early restoration would expose the original credentials to a lazy body that is then cached and replayed. It would also leave an SWR race in which a background refresh replaces the stale reader's event after the response returns. The correct fix is to avoid mutating the caller's event. That requires a design decision because `E` can be any framework event. This work is **tracked, open**.
 
-The replacement `Request` carries `runtime` and `waitUntil` over, the latter **bound to the
-original request** (a bare copy would run with the narrowed `Request` as its receiver;
-srvx/Cloudflare implement it against the real one). All four `cache.ts` call sites read
-`waitUntil` _after_ this swap, so dropping it made every background write inert on exactly the
-runtimes that provide it: the isolate can be torn down before the write lands — every request a
-MISS forever, with SWR refreshes and post-failure evictions cancelled the same way.
+Copy `runtime` and `waitUntil` to the replacement `Request`. Bind `waitUntil` to the original request. A direct method copy would use the narrowed `Request` as `this`, but srvx and Cloudflare implement it against the original request. All four `cache.ts` call sites read `waitUntil` after the replacement. If the property is lost, background writes can stop when the isolate exits. Every request then remains a MISS. SWR refresh and eviction after failure can fail in the same way.

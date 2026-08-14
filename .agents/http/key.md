@@ -1,90 +1,35 @@
 # `http/key.ts` — cache key + revalidation helpers
 
-**Key = resource identity + method component.** `resolveKey` derives the method-free resource
-part (auto: URL origin + path + `varies` header values + allowlisted cookies; or the caller's
-`getKey`), `methodKey` prefixes the method.
+**Key = resource identity + method component.** `resolveKey` produces the method-independent resource part. By default, it uses the URL origin, path, `varies` header values, and allowlisted cookies. A caller can replace this with `getKey`. `methodKey` prefixes the method.
 
 ## Handler `name`
 
-`resolveName(opts.name, handler)` **before** the `defaultHandlerOptions()` merge — same rule and
-same shared internal as `defineCachedFunction` (`.agents/cache.md`). `config.ts` keeps its own
-defaults, deliberately not `cache.ts`'s (only the HTTP layer has `cacheStatusHeader`), named
-apart so neither is importable for the other.
+Call `resolveName(opts.name, handler)` **before** the `defaultHandlerOptions()` merge. This is the same rule and shared internal that `defineCachedFunction` uses. See `.agents/cache.md`. `config.ts` keeps separate defaults because only the HTTP layer has `cacheStatusHeader`. The defaults have different names so neither module can import the other's defaults.
 
-Merging first left `opts.name` permanently `"_"`, so **every** handler keyed identically. Two
-handlers sharing one `storage` (the configuration `types.ts` recommends) that can see the same
-path then collided: identical source ⇒ identical integrity ⇒ one served the other's cached
-response (cross-handler leak); differing source ⇒ every read failed the other's integrity check
-⇒ permanent thrash at 0% hit rate. Breaking key change; every handler entry went cold once.
-`hash(handler)` sees only source, so handlers from one factory share a name _and_ an integrity —
-pass an explicit `name` per instance.
+Merging first made `opts.name` always equal `"_"`. Therefore, **every** handler used the same name. Two handlers could then collide when they shared a `storage`, as `types.ts` recommends, and could see the same path. If their source was identical, their integrity was also identical and one handler served the other handler's response. This was a cross-handler data leak. If their source differed, each read failed the other entry's integrity check and the cache had a 0% hit rate. The fix changes keys, so every handler entry became cold once. `hash(handler)` sees source only. Handlers created by one factory can share a name and integrity value. Pass an explicit `name` for each instance.
 
 ## Method component
 
-GET is the implicit default and carries no component; every other cacheable method contributes
-`<METHOD>:` — today exactly `HEAD:` (`cacheableMethods`, the enumerable counterpart of
-`shouldBypassCache`'s method half; another cacheable method is a one-line addition, not a key
-redesign).
+GET is the implicit default and has no component. Every other cacheable method adds `<METHOD>:`. Currently, the only such method is `HEAD:`. `cacheableMethods` is the enumerable counterpart to the method check in `shouldBypassCache`. Adding another cacheable method requires one list change, not a key redesign.
 
-Closes h3#1524 audit finding #3: GET and HEAD shared one entry, and a spec-compliant host
-`toResponse` nulls the body of a HEAD response — exactly the `Response` `serialize` stores — so
-one anonymous `HEAD /page` seeded the shared entry with a zero-byte body, a synthesized
-`max-age=N` and a weak etag over that empty body, and every GET for the rest of the TTL got a
-blank 200 that CDNs/browsers cached and successfully revalidated.
+This fixes h3#1524 audit finding #3. GET and HEAD shared an entry. A specification-compliant host `toResponse` removes the body from a HEAD response. `serialize` then stored that body-less `Response`. One anonymous `HEAD /page` could store a zero-byte body, synthesized `max-age=N`, and a weak etag for the empty body. Every GET during the TTL then received a blank 200 that browsers and CDNs cached and revalidated.
 
-Applied around **both** key branches (a custom `getKey` expresses content identity; preventing
-the method collision is ocache's job either way), and both are escaped, as is the `name` before
-them — no segment can forge a `<METHOD>:` component. GET keys are byte-identical to pre-fix ones
-so existing entries stay warm; the cost is one origin dispatch per method per resource per TTL.
-Non-cacheable methods never reach `getKey`.
+Apply the method component to **both** key branches. A custom `getKey` defines content identity, but ocache must still prevent method collisions. Escape both branches and the `name` before them. No segment may create a false `<METHOD>:` component. GET keys are byte-identical to their earlier values, so existing GET entries remain warm. Each method and resource now requires one origin request per TTL. Non-cacheable methods never call `getKey`.
 
 ## Request authority in the hashed component
 
 `_hashedPath = ${_pathname}.${hash([authority(_url), _path])}`.
 
-Without the authority, one handler instance serving several hostnames — the normal nitro/h3
-vhost deployment — stored **one entry per path across all hosts**: tenant A's rendering served to
-tenant B (h3#1524 finding #2's cross-app body leak, reopened between hosts on one instance after
-per-instance storage closed it between processes), and an attacker-supplied `Host` that reached a
-rendered absolute URL (canonical link, `Location`, a password-reset link) was stored under the
-shared key and published with the synthesized `s-maxage` for shared CDNs to propagate. The
-pre-existing mitigation, `varies: ["host"]`, was off by default and _silently_ a no-op on adapters
-that don't put `Host` in `req.headers`.
+Without authority, one handler instance that serves several hostnames stores one entry per path for all hosts. This is a normal nitro/h3 virtual-host deployment. Tenant A's rendering could be served to tenant B. h3#1524 finding #2 found this cross-application body leak. Per-instance storage closed it between processes but not between hosts in one instance. An attacker-controlled `Host` could also enter an absolute URL in a rendered canonical link, `Location`, or password-reset link. The shared key then stored that URL and advertised synthesized `s-maxage` to shared CDNs. The old mitigation, `varies: ["host"]`, was disabled by default. It also did nothing on adapters that omit `Host` from `req.headers`.
 
-Derived from `event.url` — what the adapter resolved — **never** from the `Host` header; on
-adapters that build `url` from that header the two coincide, so a reverse proxy must still
-normalize it. Goes in the hashed component, never the human-readable `_pathname` prefix
-(debuggability only), and is hashed as a **tuple** with `_path` so the origin/path boundary can't
-be read two ways (an opaque-scheme pathname need not start with `/`). Breaking: GET keys moved
-once.
+Derive authority from `event.url`, which the adapter resolved. **Never** read it from the `Host` header. If an adapter builds `url` from that header, a reverse proxy must still normalize it. Put authority in the hashed component, not in the human-readable `_pathname` prefix. `_pathname` exists only for debugging. Hash authority and `_path` as a **tuple** so no code can interpret the boundary in two ways. An opaque-scheme pathname does not need to start with `/`. This was a breaking key change, so GET keys moved once.
 
-`authority(url)` prefers `url.origin` because it canonicalizes (lowercased host, default port
-dropped), but `origin` is the literal string `"null"` for every **opaque** origin, including any
-non-special scheme where a real authority is present and simply not exposed
-(`new URL("x-proxy://a.example/p").origin === "null"`, as does `b.example`) — so those fall back
-to `${protocol}//${host}`, or the collision this exists to prevent comes right back.
-Authority-less schemes (`file:`/`data:`/`about:`) land on a per-scheme constant, which is right:
-their identity is entirely in the path, already hashed alongside.
+`authority(url)` prefers `url.origin` because it canonicalizes values by lowercasing the host and removing a default port. For every **opaque** origin, `url.origin` is the literal string `"null"`. This includes non-special schemes that contain a real authority but do not expose it. For example, `new URL("x-proxy://a.example/p").origin === "null"`, as it does for `b.example`. In this case, use `${protocol}//${host}`. Otherwise, the cross-host collision returns. Authority-less schemes such as `file:`, `data:`, and `about:` use one constant per scheme. This is correct because their identity is entirely in the path, which the tuple also hashes.
 
 ## `.resolveKeys(event)` / `.invalidate(event)` / `.expire(event)`
 
-Issue #71. They target the **resource, not one method variant**: every cacheable method's variant
-of the event's resource key, regardless of which method the event carries, so purging
-`/article/hello` can't leave a sibling HEAD entry advertising the dead etag/last-modified for
-downstream caches to revalidate against. `resolveKeys` enumerates the same set (one key per base
-prefix per method variant), the event's own variant first, so `keys[0]` is still exactly the key
-that event reads/writes.
+Issue #71. These methods target a **resource, not one method variant**. They include every cacheable method variant of the event's resource, regardless of the event method. Purging `/article/hello` must not leave a HEAD entry with an obsolete etag or last-modified value for downstream revalidation. `resolveKeys` returns the same set: one key for each base prefix and method variant. It puts the event's own variant first, so `keys[0]` remains the key that the event reads and writes.
 
-Implemented by feeding each variant key to the standalone helpers as a fixed `getKey` —
-`resolveKey` is method-free, so no event is cloned or mutated. `variantOptions` calls
-`resolveStorage(_opts)` first: it spreads `_opts` into one fresh options object per variant, so
-without pre-resolving, a purge issued before the first request would leave each copy to resolve
-its own storage (re-running a factory once per variant).
+Pass each variant key to the standalone helpers through a fixed `getKey`. `resolveKey` has no method component, so this does not clone or mutate the event. `variantOptions` must call `resolveStorage(_opts)` first. It then spreads `_opts` into one new options object per variant. Without pre-resolution, a purge before the first request would make each copy resolve storage independently and call a factory once per variant.
 
-**Storage memo asymmetry vs `cache.ts`**: `defineCachedHandler` reassigns `opts` to a merged
-clone on entry and clones again into `_opts`, so the caller's own options object never receives
-the resolved storage. `invalidateCache({ options: myHandlerOpts })` therefore will _not_ reach a
-handler's default storage. Deliberate: never-works is clearer than sometimes-works (the memo
-would otherwise land only when a purge happened to run before the first request), and
-reconstructing a handler key by hand is the error-prone path issue #71 exists to avoid — use the
-handler's own methods, or pass an explicit `storage`.
+**Storage memo asymmetry vs `cache.ts`**: `defineCachedHandler` first replaces `opts` with a merged clone and then clones it into `_opts`. Therefore, the caller's original options object never receives resolved storage. `invalidateCache({ options: myHandlerOpts })` does not reach a handler's default storage. This is deliberate. Behavior that never works is clearer than behavior that works only when purge happens before the first request. Manually rebuilding a handler key is error-prone and is the problem issue #71 addresses. Use the handler's own methods or pass an explicit `storage`.

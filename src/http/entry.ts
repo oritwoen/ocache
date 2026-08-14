@@ -1,7 +1,3 @@
-// The storage codec, both directions: live `Response` → stored `ResponseCacheEntry`
-// (`serializeResponse`) and back on a hit (`deserializeEntry`). One file because the two
-// halves must agree on the body encoding, the null-body statuses and which headers survive.
-
 import { hash } from "../hash.ts";
 
 import type { HandlerConfig } from "./config.ts";
@@ -10,8 +6,7 @@ import { appendVary, hasUnkeyedVary, hasVaryWildcard } from "./vary.ts";
 
 import type { CacheEntry, HTTPEvent, ResponseCacheEntry } from "../types.ts";
 
-// Stripped: body is stored fully decoded/re-buffered, none still describe it. `content-range`
-// included though 206 never reaches storage — a proxying handler can copy it onto a 200.
+// Buffered response bodies no longer match these transport headers.
 const transportHeaders = [
   "content-encoding",
   "content-length",
@@ -19,12 +14,10 @@ const transportHeaders = [
   "transfer-encoding",
 ];
 
-// `Response` throws on non-null body for these — read path only (storage already rejects
-// via `validate.ts`). Stored as `""`; MISS caller is served regardless of `validate`.
+// Response constructors reject non-null bodies for these statuses.
 const nullBodyStatuses = new Set([204, 205, 304]);
 
-// Runs once per resolution (dedup callers share it), so the body is read exactly once. Takes
-// the whole entry: lifetimes below are what `cache.ts` already resolved onto it (finding 10.2).
+// Deduplicated callers share this single body read.
 export async function serializeResponse<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   entry: CacheEntry<Response>,
@@ -32,18 +25,13 @@ export async function serializeResponse<E extends HTTPEvent>(
   const { opts, varyHeaderNames } = config;
   const res = entry.value as Response;
 
-  // Valid UTF-8 → stored as string (stable etags); else base64 + flagged, so binary survives
-  // a JSON storage backend. Discriminated by byte validity, not the spoofable content-type.
+  // Use byte validity, not Content-Type, to preserve binary data in JSON storage.
   const bytes = new Uint8Array(await res.arrayBuffer());
   const text = decodeUtf8(bytes);
   const base64 = text === undefined;
   const body = base64 ? bytesToBase64(bytes) : text;
 
-  // Copied, never mutated in place: a `Response` from `fetch()`, `Response.redirect()` or
-  // `Response.error()` carries the spec's *immutable* header guard, so the first `set` below
-  // threw — taking the whole resolution down and evicting the entry, on every request. A
-  // reverse proxy over `fetch()` and cacheable `Response.redirect(…, 301)` are both exactly
-  // that shape. Nothing reads `res.headers` after this point, so the copy is otherwise a no-op.
+  // Copy headers because fetch and redirect responses can have immutable headers.
   const headers = new Headers(res.headers);
 
   if (!headers.has("etag")) {
@@ -54,9 +42,7 @@ export async function serializeResponse<E extends HTTPEvent>(
     headers.set("last-modified", new Date().toUTCString());
   }
 
-  // Mirrors `validate`'s predicates (can't drift — an unstored 500 once shipped `s-maxage=60`),
-  // closing findings 08/13's gap for `Vary`-only responses. Opt-out: `sendCacheControl` (issue #49).
-  // Raw `Vary` here vs. merged in `validate`: same verdict, since `appendVary` only adds keyed names.
+  // Advertisement must use the same status and Vary predicates as storage validation.
   const declaredVary = headers.get("vary");
   if (
     opts.sendCacheControl !== false &&
@@ -65,26 +51,19 @@ export async function serializeResponse<E extends HTTPEvent>(
     !hasUnkeyedVary(declaredVary, varyHeaderNames) &&
     !headers.has("cache-control")
   ) {
-    // Same precedence `cache.ts` uses for freshness/TTL (finding 10.2): `opts` alone advertised
-    // the static lifetime while a dynamic one was enforced; `http/index.ts` always wraps `getMaxAge`.
+    // Advertise dynamic entry lifetimes before static options.
     const maxAge = entry.maxAge ?? opts.maxAge;
     const staleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
 
     const cacheControl = [];
-    // Treated identically with/without `swr` — present (`0` included) is advertised, so
-    // `validate` reads a zero the same from a synthesized header as a hand-written one.
     if (maxAge != null) {
-      // `max-age` accompanies `s-maxage`, never replaced by it (finding 10.3, RFC 9111 §5.2.2.10):
-      // alone, private caches fall back to heuristic freshness ≈ 0 and revalidate every navigation.
-      // Not folded away: `s-maxage` alone authorizes storing an `Authorization`-carrying response (§3.5).
+      // Send `max-age` for private caches and `s-maxage` for shared-cache authorization.
       cacheControl.push(`max-age=${maxAge}`);
       if (opts.swr) {
         cacheControl.push(`s-maxage=${maxAge}`);
       }
     }
-    // No delta-seconds ⇒ invalid per RFC 5861 §3; a bare token here was previously ignored
-    // wholesale (RFC 9111 §5.2.3, finding 10.4). Nothing replaces it — the window is unbounded,
-    // and inventing a number would overclaim it.
+    // Omit stale-while-revalidate when the stale window is unbounded.
     if (opts.swr && staleMaxAge != null) {
       cacheControl.push(`stale-while-revalidate=${staleMaxAge}`);
     }
@@ -93,18 +72,15 @@ export async function serializeResponse<E extends HTTPEvent>(
     }
   }
 
-  // `varyHeaderNames`, not the key list: `allowCookies` keys a hashed cookie subset, but
-  // `Vary` can only state header names.
+  // Vary can name only the complete Cookie header, not an allowlisted subset.
   if (varyHeaderNames.length > 0) {
     appendVary(headers, varyHeaderNames);
   }
 
-  // Always stripped, allowlisted or not (issue #61: minted cookies leak to coalesced/later
-  // callers). Exempting `allowCookies` reopened this as session fixation (h3#1524 finding #15c).
+  // Never share a response cookie with deduplicated or later callers.
   headers.delete("set-cookie");
 
-  // Deleted here, not just excluded above — a stale value would desync headers from the
-  // re-buffered body (nitro#2109); runtime recomputes `content-length` on read.
+  // Remove headers that describe the original transport body.
   for (const header of transportHeaders) {
     headers.delete(header);
   }
@@ -114,8 +90,7 @@ export async function serializeResponse<E extends HTTPEvent>(
     statusText: res.statusText,
     headers: Object.fromEntries(headers.entries()),
     body,
-    // Only set for binary bodies — text entries stay flag-free, byte-identical to
-    // pre-binary-support ones.
+    // Keep text entries compatible with the original unflagged format.
     ...(base64 && { base64: true }),
   };
 
@@ -123,10 +98,9 @@ export async function serializeResponse<E extends HTTPEvent>(
 }
 
 /**
- * The read half: a stored entry → the pieces its `Response` is rebuilt from (pieces, because
- * the construction itself is the caller's `createResponse` hook). Mirrors
- * {@link serializeResponse}: a null-body status is forced back to `null` (`""` is not nullish
- * and `new Response("", { status: 204 })` throws), and a `base64` entry decodes to raw bytes.
+ * Returns the body and init data needed to rebuild a stored response.
+ *
+ * Null-body statuses use `null` because Response rejects an empty string body for them.
  */
 export function deserializeEntry(entry: ResponseCacheEntry): {
   body: string | Uint8Array | null;
@@ -147,11 +121,10 @@ export function deserializeEntry(entry: ResponseCacheEntry): {
   };
 }
 
-// Fatal: throws on invalid UTF-8 (→ base64) instead of substituting replacement chars.
-// `ignoreBOM` preserves a leading BOM so decode→encode round-trips byte-for-byte.
+// Fatal decoding detects binary data; `ignoreBOM` preserves leading BOM bytes.
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-/** Decodes bytes as UTF-8, returning `undefined` when they aren't valid UTF-8 (i.e. binary). */
+/** Returns decoded UTF-8 or `undefined` for invalid UTF-8. */
 function decodeUtf8(bytes: Uint8Array): string | undefined {
   try {
     return utf8Decoder.decode(bytes);
@@ -160,7 +133,7 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
   }
 }
 
-/** Encodes raw bytes to a base64 string (chunked to stay within `String.fromCharCode` arg limits). */
+/** Encodes bytes in chunks that fit `String.fromCharCode`. */
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   const CHUNK = 0x80_00;
@@ -170,7 +143,7 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** Decodes a base64 string produced by {@link bytesToBase64} back to raw bytes. */
+/** Decodes base64 to bytes. */
 function base64ToBytes(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);

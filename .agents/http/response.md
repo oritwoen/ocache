@@ -1,306 +1,111 @@
 # The response side — `entry.ts`, `validate.ts`, `vary.ts`, `cache-control.ts`, `conditional.ts`
 
-`defineCachedHandler` is split along the `serialize` seam, built on `cachedFunction<Response>`:
-the **resolver** narrows the request and returns the handler's live `Response`; the internal
-**`serialize`** consumes the body, synthesizes `etag`/`last-modified`/`cache-control`/`Vary`,
-strips every `Set-Cookie`, and builds the stored `ResponseCacheEntry`; **`transform`**
-reconstructs the servable shape and injects the cache-status header on read. All three are
-`Omit`ted from `CachedEventHandlerOptions` so internal use doesn't collide with a caller's.
+`defineCachedHandler` uses `cachedFunction<Response>` and divides work at the `serialize` boundary. The **resolver** narrows the request and returns the handler's live `Response`. Internal **`serialize`** consumes the body, creates `etag`, `last-modified`, `cache-control`, and `Vary`, removes every `Set-Cookie`, and creates the stored `ResponseCacheEntry`. **`transform`** rebuilds a servable response and adds the cache-status header on read. `CachedEventHandlerOptions` uses `Omit` for all three hooks so caller options cannot conflict with this internal use.
 
 ## What may be stored
 
-**One status gate**, `isCacheableStatus` over `{200, 203, 301, 308}` — the statuses whose
-response is a complete, reusable representation of what was requested. It replaced three
-overlapping conditions (`status >= 400`, `nullBodyStatuses`, and the implicit "anything under
-400 is fine"), so "what may be stored" is expressed in one place, which `serialize` also
-consults. Each exclusion is load-bearing:
+Use one status check: `isCacheableStatus` over `{200, 203, 301, 308}`. These statuses provide a complete, reusable representation of the request. This check replaced three overlapping rules: `status >= 400`, `nullBodyStatuses`, and the implicit rule that anything below 400 was valid. `serialize` also uses the shared check. Every exclusion is required:
 
-- `302`/`303`/`307` are per-request answers — an auth middleware's `302 → /login?next=/dashboard`
-  was stored under the **anonymous** `/dashboard` key (request-side defaults strip
-  `Cookie`/`Authorization`, so anonymous and authenticated callers share a key) and published
-  shared-cacheable, bouncing an authenticated user to someone else's login redirect.
-- `206` is a partial body valid only for the range asked for (finding 07).
-- `201`/`202`/`300` are operation outcomes or an unresolved choice.
-- `204`/`205`/`304` have nothing to replay — a 304 answers _one_ client's conditional request, so
-  a crafted `If-Modified-Since: <far future>` stored one that every later **unconditional**
-  request got for the whole TTL, self-healing never.
+- `302`, `303`, and `307` are request-specific responses. An authentication middleware could return `302 → /login?next=/dashboard`. Request defaults remove `Cookie` and `Authorization`, so anonymous and authenticated requests share a key. The cache stored this redirect under the anonymous `/dashboard` key and made it shared-cacheable. An authenticated user could then receive another user's login redirect.
+- `206` contains a partial body that is valid only for the requested range (finding 07).
+- `201`, `202`, and `300` describe operation results or an unresolved choice.
+- `204`, `205`, and `304` have no representation to replay. A 304 answers one client's conditional request. A crafted `If-Modified-Since: <far future>` could store a 304 and return it to every later **unconditional** request for the full TTL. The cache could not recover.
 
-Strictly narrowing: nothing previously rejected became acceptable, no existing entry invalidated.
-Caching `404`/`410` (RFC 9111 permits it heuristically) was considered and **declined**: it
-expands behavior and makes a 404 flood a cache-flush vector — finding 14.1's byte budget bounds
-what such a flood can _retain_, not the eviction pressure it applies to the hot set (14.2).
+This is only a restriction. It accepts no status that earlier code rejected and invalidates no existing entry. RFC 9111 allows heuristic caching of `404` and `410`, but this was considered and **declined**. It would add behavior and let a flood of 404 responses push useful entries out. Finding 14.1's byte budget limits retained data, not the pressure that finding 14.2 applies to the hot set.
 
-`nullBodyStatuses` (`204`/`205`/`304`) survives for the **read path only**, independently of
-`validate`: `serialize` stores a body-less response as `""` (not nullish, so `?? null` misses it),
-`new Response("", { status: 204 })` **throws**, and the MISS caller is served through the freshly
-serialized entry regardless of `validate`'s verdict — so without forcing `body → null` before
-`createResponse` every 204/205/304 would crash on the way out.
+Keep `nullBodyStatuses` for the **read path only**, separate from `validate`. `serialize` stores a body-less response as `""`. This value is not nullish, so `?? null` does not replace it. `new Response("", { status: 204 })` **throws**. The MISS caller receives the newly serialized entry even when `validate` rejects it. Therefore, apply `body → null` before `createResponse` for 204, 205, and 304. Without this rule, all such direct responses would fail.
 
-`validate` rejects a **missing** body (`value.body === undefined`) but accepts `""`: a zero-byte
-200 is legal and rejecting it would only cost hit rate. The dangerous empty body (a body-less
-HEAD response replayed to GET clients) is prevented by the method component in the key.
+`validate` rejects a **missing** body when `value.body === undefined`, but accepts `""`. A zero-byte 200 is valid. Rejecting it only reduces the hit rate. The method component in the key prevents the unsafe case in which a body-less HEAD response is replayed to GET clients.
 
 ## Response-side opt-outs
 
-Never cached (rejected in `validate`), though still returned to the caller: `Cache-Control:
-no-store` / `private` / `no-cache` / a zero **shared** lifetime, and `Vary: *`.
+Do not cache these responses, but still return them to the caller: responses with `Cache-Control: no-store`, `private`, `no-cache`, or a zero **shared** lifetime; and responses with `Vary: *`.
 
-Which directive states the lifetime follows RFC 9111 §5.2.2.10: **`s-maxage` overrides `max-age`
-for a shared cache** and ocache is one, so directives are collected first and only then judged —
-`s-maxage` governs whenever it parses, `max-age` otherwise, and only that effective value being
-`<= 0` rejects. Rejecting on the first zero of either (the shape this landed as) refused
-`public, max-age=0, s-maxage=600` — the canonical "browsers revalidate, CDN caches" idiom, a
-request _to_ be stored — in both directive orders, while `s-maxage=0, max-age=600` must still
-reject.
+Follow RFC 9111 §5.2.2.10 when selecting the lifetime. **`s-maxage` overrides `max-age` for a shared cache**, and ocache is shared. First collect directives. If `s-maxage` parses, use it. Otherwise, use `max-age`. Reject only when the effective value is `<= 0`. Do not reject on the first zero value in either directive. That incorrect implementation rejected `public, max-age=0, s-maxage=600`, in both directive orders. This common value means browsers revalidate while a CDN caches. In contrast, `s-maxage=0, max-age=600` must be rejected.
 
-Only `no-store`/`private` used to be recognized, so `no-cache` and a zero `max-age` — the two
-commonest ways to write "don't reuse this", and what `"/**": { swr: 60 }` puts every hand-marked
-page behind — were stored and replayed while the directive was faithfully echoed to the client
-(same shape as h3#1524 finding #15, one directive over). `no-cache` is **rejected outright**, not
-stored-with-revalidation: RFC 9111 §5.2.2.4 permits storing it if every reuse revalidates first,
-which is real new machinery (ocache has no foreground-revalidation path) and buys nothing until
-that exists; a `TODO` at the branch records it.
+Earlier code recognized only `no-store` and `private`. It stored responses with `no-cache` or zero `max-age`, which are the most common forms of "do not reuse." The configuration `"/**": { swr: 60 }` could place every manually excluded page behind that behavior. The cache replayed such responses while sending the opt-out directive to clients. This matches h3#1524 finding #15 with a different directive. Reject `no-cache` instead of storing with revalidation. RFC 9111 §5.2.2.4 allows storage only when every reuse validates first. ocache has no foreground revalidation path. That support needs new behavior and provides no value before the path exists. A `TODO` at the branch records this fact.
 
-Directives are **parsed**, never substring-matched (`cacheControlDirectives`, quoted-string aware
-so `no-cache="set-cookie, x"` is one directive; `deltaSeconds` is RFC 9111 `1*DIGIT`, so
-`max-age=0600` is 600s and `stale-while-revalidate=0` is not a zero lifetime; a malformed value
-states nothing and is ignored, except a leading `-` which reads as already-expired). The
-qualified `no-cache="field"`/`private="field"` forms are rejected like the bare ones: they scope
-the ban to named fields, but ocache replays a stored header set verbatim, so honoring them would
-mean stripping fields on every reuse.
+Parse directives with `cacheControlDirectives`; never use substring matching. The parser understands quoted strings, so `no-cache="set-cookie, x"` is one directive. `deltaSeconds` follows RFC 9111 `1*DIGIT`. Therefore, `max-age=0600` is 600 seconds, and `stale-while-revalidate=0` is not a zero lifetime. Ignore a malformed value because it states nothing. Treat a leading `-` as already expired. Reject qualified forms such as `no-cache="field"` and `private="field"` as well as bare forms. They restrict only named fields, but ocache replays the stored header set unchanged. Supporting them would require removing fields on every reuse.
 
-`Vary: *` lives in the same predicate (finding 13) but reads a different header — so
-`forbidsSharedCaching` takes the whole serialized header set and delegates to
-`cacheControlForbidsReuse`, rather than pretending it inspects one header. `hasUnkeyedVary` is a
-**separate** check in `validateEntry`, deliberately not another arm: such a response forbids
-nothing — it is cacheable, ocache just can't key it.
+`Vary: *` uses the same final predicate (finding 13), but it comes from a different header. `forbidsSharedCaching` must accept the complete serialized header set and call `cacheControlForbidsReuse`. Do not imply that it reads only one header. Keep `hasUnkeyedVary` as a **separate** check in `validateEntry`. Such a response is cacheable in general, but ocache cannot create its key.
 
-All of this governs storage only: concurrent requests are still coalesced by cache key, so
-per-user responses must be keyed correctly.
+These rules control storage only. Concurrent requests still coalesce by cache key. Always key user-specific responses correctly.
 
 ### `must-revalidate` is not an opt-out
 
-It constrains stale serving, not storage (RFC 9111 §5.2.2.2), so it must not reject. Instead the
-internal `getMaxAge` wrapper persists **`staleMaxAge: 0` on that entry**: `cache.ts`'s read path
-computes `staleTtl === 0` → `swr = false` for that entry alone, so a fresh read is still a HIT and
-an expired one revalidates in the **foreground** instead of serving stale.
+`must-revalidate` limits stale reuse, not storage (RFC 9111 §5.2.2.2). Do not reject it. The internal `getMaxAge` wrapper instead stores **`staleMaxAge: 0` on that entry**. The `cache.ts` read path computes `staleTtl === 0` → `swr = false` for that entry. A fresh read remains a HIT. An expired read revalidates in the **foreground** instead of serving stale data.
 
-Chosen over a new `CacheEntry.mustRevalidate` flag because "no stale window" is already exactly
-what `staleMaxAge: 0` means: no new field, no `cache.ts` change, and it flows through the
-storage-TTL and `expireCache` math for free — all of which a flag would have to be taught
-separately.
+Do not add a `CacheEntry.mustRevalidate` field. "No stale window" already means `staleMaxAge: 0`. The existing value requires no new field or `cache.ts` change. It also reaches storage TTL and `expireCache` calculations automatically. A separate flag would require changes to every one of those paths.
 
-The wrapper computes its own override **first and independently** and isolates the caller's hook
-in its own `try` (reported through the same `onError` / `console.error("[cache] getMaxAge hook
-error.")` shape `cache.ts` uses, so it is neither silent nor double-reported): `cache.ts` handles
-a throwing hook by leaving _both_ values `undefined`, so awaiting the caller's hook first and
-uncaught let one throwing caller hook take ocache's own `staleMaxAge: 0` down with it and the
-entry was served STALE — exactly what `must-revalidate` forbids. A throw degrades to "no _caller_
-override", never "no override at all". `proxy-revalidate` is the shared-cache counterpart and
-belongs in the same place, deliberately left to a separate change.
+The wrapper must compute its internal override **first and independently**. Run the caller's hook in a separate `try`. Report its error through the same `onError` or `console.error("[cache] getMaxAge hook error.")` path that `cache.ts` uses. Do not hide or report the error twice. When a hook throws, `cache.ts` leaves both values `undefined`. If the wrapper awaited the caller first without catching, a caller error would also remove ocache's `staleMaxAge: 0`. The cache would then serve STALE data in violation of `must-revalidate`. A throw means "no caller override," not "no override." `proxy-revalidate` is the shared-cache equivalent. It belongs in this code but is intentionally left for a separate change.
 
 ## `cache-control` synthesis
 
-Sets `cache-control`, `etag`, `last-modified` — but never clobbers an explicit `cache-control`
-set by the handler.
+Create `cache-control`, `etag`, and `last-modified`. Never replace an explicit `cache-control` from the handler.
 
-**Gated on `isCacheableStatus`, `hasVaryWildcard` and `hasUnkeyedVary`** — the same three
-predicates `validate` rejects on, deliberately shared functions so the advertisement and the
-storage decision cannot drift. They had: `serialize` runs before `validate` and shipped the header
-regardless of the verdict, so a 500 was _not_ stored — origin takes every request, zero
-protection — while being advertised `s-maxage=60, stale-while-revalidate=600`, pinned at every CDN
-for 11 minutes and revalidating successfully. Inverted on both sides.
+Gate synthesis on **`isCacheableStatus`, `hasVaryWildcard`, and `hasUnkeyedVary`**. `validate` rejects responses with the same three shared predicates. Advertisement and storage must not use different logic. They differed before because `serialize` runs before `validate` and always added the header. A 500 was not stored, so the origin received every request and had no protection. However, CDNs received `s-maxage=60, stale-while-revalidate=600` and kept the error for 11 minutes while revalidation succeeded. The two layers had opposite behavior.
 
-Not "synthesize if `validate` passes": the gate covers exactly the rejections a **fresh** response
-can trip while carrying no `Cache-Control` of its own. `validate`'s remaining rejections split
-three ways — structurally impossible here (an explicit opt-out already suppresses synthesis via
-the `has("cache-control")` check; a `set-cookie` is deleted before this point; a missing body
-can't occur on a value `serialize` just built) — and **deliberately ungated**: `shouldCache`, a
-caller's own storage policy, where "ocache doesn't store this, but a CDN may" is a real
-configuration and `sendCacheControl: false` is the inverse knob.
+Do not simply synthesize when `validate` passes. This gate covers exactly the failures that a **fresh** response without its own `Cache-Control` can trigger. Other `validate` failures fall into two groups. Some are impossible here: an explicit opt-out already blocks synthesis through `has("cache-control")`; `set-cookie` is removed before this point; and a value built by `serialize` cannot have a missing body. One is intentionally outside the gate: caller `shouldCache` controls only ocache storage. A caller may want a CDN to cache data that ocache does not store. `sendCacheControl: false` provides the inverse control.
 
-**Both `Vary` verdicts were the gap**, for one reason: unlike every other opt-out they are spelled
-in a header that leaves `cache-control` empty, so synthesis fired for a response never stored (the
-finding-10.1 shape, one header over) — `Vary: *` first (finding 08), then `hasUnkeyedVary`
-(finding 13). The gate reads the handler's raw `Vary` (it runs before `appendVary`), `validate`
-the merged one; same verdict, since the merge only adds keyed names.
+Both `Vary` checks were missing for the same reason. These opt-outs use a header while leaving `cache-control` empty. Therefore, synthesis ran for responses that ocache did not store. This was the finding 10.1 pattern with another header. `Vary: *` was finding 08. `hasUnkeyedVary` was finding 13. Synthesis reads the handler's original `Vary` before `appendVary`. `validate` reads the merged value. Both produce the same decision because merging adds only keyed names.
 
 ### The advertised lifetime is the entry's, not the option's
 
-Finding 10.2: `serialize` receives the whole `CacheEntry` and reads `entry.maxAge ?? opts.maxAge`
-/ `entry.staleMaxAge ?? opts.staleMaxAge` — the same per-field precedence `cache.ts` applies to
-the freshness check, the storage TTL and `expireCache`. Reading the static options alone meant
-`{ maxAge: 3600, getMaxAge: () => 2 }` expired ocache's entry after 2 s while every shared cache
-kept that 2-second-old copy for an hour: the dynamic TTL honored at the layer holding the value
-and discarded at the layer holding the audience. Sound because `http/index.ts` **always** installs
-its `getMaxAge` wrapper, so both fields are always written. The wrapper's own `staleMaxAge: 0` can
-never be advertised: it exists only when the handler set `must-revalidate`, i.e. exactly when
-`has("cache-control")` has already suppressed synthesis.
+Finding 10.2. `serialize` receives the full `CacheEntry`. Read `entry.maxAge ?? opts.maxAge` and `entry.staleMaxAge ?? opts.staleMaxAge`. This is the same field-by-field precedence that `cache.ts` uses for freshness, storage TTL, and `expireCache`. Reading only static options made `{ maxAge: 3600, getMaxAge: () => 2 }` expire inside ocache after 2 seconds while shared caches kept the value for an hour. The layer that stored the value enforced the dynamic TTL, but the layer serving the audience did not. This is safe because `http/index.ts` **always** installs its `getMaxAge` wrapper and always writes both fields. The wrapper's own `staleMaxAge: 0` cannot be advertised. It exists only when the handler sent `must-revalidate`, which also means `has("cache-control")` already prevented synthesis.
 
 ### What is emitted
 
-`max-age=<lifetime>` whenever a lifetime is present (`0` included), `s-maxage=<the same number>`
-additionally under `swr`, and `stale-while-revalidate=<staleMaxAge>` only when a stale window is
-actually named.
+Emit `max-age=<lifetime>` whenever a lifetime exists, including zero. When `swr` is enabled, also emit `s-maxage=<the same number>`. Emit `stale-while-revalidate=<staleMaxAge>` only when a stale window has a defined value.
 
-- **`max-age` accompanies `s-maxage` rather than being replaced by it** (finding 10.3) —
-  `s-maxage` is shared-cache-only and overrides `max-age` there (RFC 9111 §5.2.2.10), so CDNs see
-  no change, but a private cache got no freshness lifetime at all and fell back to heuristic
-  freshness over `Date − Last-Modified` (§4.2.2), which is ≈ 0 because `last-modified` is stamped
-  at fill time: browsers revalidated on **every** navigation while ocache held the entry for the
-  full `maxAge`. The same number on both, because that is the number ocache enforces — a smaller
-  one is unenforced fiction, a larger one an overclaim. `s-maxage` is kept rather than folded away
-  because it is separately what authorizes a shared cache to store the response to an
-  `Authorization`-carrying request (§3.5, reachable under `allowAuthorization`).
-- **Never a bare `stale-while-revalidate`** (finding 10.4): RFC 5861 §3 requires the delta-seconds,
-  so the argument-less token the ISR shape used to emit was unparseable and had to be ignored
-  wholesale (RFC 9111 §5.2.3) — the stale window evaporated downstream while the header read as
-  though it hadn't. **Nothing replaces it**, deliberately: that shape's stale window is genuinely
-  _unbounded_, so no number states it, and an invented one (`maxAge`, a year) would advertise a
-  window ocache never promised. Silence costs nothing real: a downstream cache revalidates when
-  `max-age` runs out, ocache answers _that_ request from its retained stale copy while refreshing
-  in the background, so ISR still happens one layer in, where it is enforced.
-  `{ swr: true, maxAge: 60 }` advertises `max-age=60, s-maxage=60`, and `docs/1.guide/9.isr.md`
-  documents that string.
-- `maxAge` is treated **identically** with and without `swr` — present (`0` included) advertised,
-  absent not. The two branches disagreed (`!= null` under `swr`, truthy without it), so
-  `{ swr: true, maxAge: 0 }` shipped `s-maxage=0` while `{ maxAge: 0 }` shipped nothing. Agreeing
-  on `!= null` also means `validate` reads the same zero-lifetime opt-out out of a synthesized
-  header as out of a hand-written one, so **`maxAge: 0` keeps the response out of storage either
-  way** — narrowing, since `cache.ts` clamps a `<= 0` TTL to "re-resolve on every access" and the
-  handler already ran on every request; what changes is a dead entry no longer stored plus an
-  honest `max-age=0` downstream where silence previously invited heuristic caching. The opposite
-  reconciliation would have _started_ storing `{ swr: true, maxAge: 0 }` and serving it stale.
-  The `!= null` guard on `maxAge` is defensive only; the one on `staleMaxAge` is load-bearing — it
-  _is_ the ISR shape.
-- `sendCacheControl: false` opts out of synthesis entirely (**server-only caching**, issue #49 /
-  nitro#3997): the entry is still stored and served (SWR/`etag`/`last-modified` unaffected), but
-  nothing is advertised — without the `no-store`/`private` tricks that would also disqualify the
-  entry via `validate`. It governs only ocache's synthesis; a handler's explicit `cache-control`
-  is left untouched and still sent.
+- **Emit `max-age` with `s-maxage`; do not replace it** (finding 10.3). `s-maxage` applies only to shared caches and overrides `max-age` there under RFC 9111 §5.2.2.10. CDNs therefore behave the same. A private cache previously received no freshness lifetime and used heuristic freshness based on `Date − Last-Modified` under §4.2.2. This result was about zero because `last-modified` is set when the entry is created. Browsers revalidated on **every** navigation while ocache retained the value for full `maxAge`. Use the same value in both directives because ocache enforces that value. A smaller value would describe an unenforced limit. A larger value would claim too much. Keep `s-maxage` because it also allows shared caches to store responses to requests with `Authorization` under §3.5. This can occur with `allowAuthorization`.
+- **Never emit `stale-while-revalidate` without a value** (finding 10.4). RFC 5861 §3 requires delta-seconds. The old ISR form emitted a token without an argument. Parsers had to ignore it under RFC 9111 §5.2.3, so downstream stale reuse disappeared even though the header appeared to request it. Add **nothing** in its place. This stale window is unbounded, so no number describes it. Do not invent `maxAge` or one year, because ocache does not enforce such a value. This omission has no practical cost. When downstream `max-age` expires, that cache revalidates. ocache can serve the retained stale value to that request while refreshing in the background. ISR still runs at the layer that enforces it. `{ swr: true, maxAge: 60 }` emits `max-age=60, s-maxage=60`. `docs/1.guide/9.isr.md` documents this exact string.
+- Treat `maxAge` **the same with and without `swr`**. Emit it when present, including zero. Do not emit it when absent. Earlier branches differed: SWR used `!= null`, while non-SWR used a truthy check. `{ swr: true, maxAge: 0 }` emitted `s-maxage=0`, while `{ maxAge: 0 }` emitted nothing. Using `!= null` also makes `validate` read the same zero-lifetime opt-out from synthesized and manual headers. Therefore, **`maxAge: 0` prevents storage in both cases**. This is a restriction. `cache.ts` already makes a `<= 0` TTL resolve on every access, so the handler already ran each time. The change avoids storing an unused entry and sends an accurate `max-age=0` instead of allowing heuristic caching. The opposite choice would begin storing `{ swr: true, maxAge: 0 }` and serving it stale. The `!= null` check for `maxAge` is defensive. The same check for `staleMaxAge` is required for ISR.
+- `sendCacheControl: false` disables all synthesis. This provides **server-only caching** for issue #49 and nitro#3997. The cache still stores and serves the entry. SWR, `etag`, and `last-modified` still work. Nothing advertises cacheability downstream. Do not use `no-store` or `private` to achieve this result because `validate` would also reject the entry. This option controls only ocache synthesis. Keep an explicit handler `cache-control` unchanged and send it.
 
 ## `Vary`
 
-Emitted by merging into whatever the handler set (case-insensitive dedup; a wildcard `*` is left
-untouched — such a response is refused by `validate` anyway, so what `appendVary` preserves there
-is only what the direct caller is served).
+Merge generated values with any handler value. Deduplicate case-insensitively. Leave wildcard `*` unchanged. `validate` rejects such a response, so only the direct caller receives it.
 
-**Two separate lists, deliberately not the same one**: `keyHeaderNames` composes the cache key
-(and gates handler visibility of the credential headers), `varyHeaderNames` is the advertisement.
-They differ on exactly one name — `cookie` — which `allowCookies` removes from the key list (the
-key carries a finer `cookie.<hash(subset)>` component) but which must stay in the `Vary` list,
-since the response genuinely varies by the `Cookie` request header and `Vary` has no granularity
-below a header name. Conflating them meant an `allowCookies` route advertised `s-maxage`/`max-age`
-with **no** `Vary` at all, so a CDN stored one visitor's variant and served it to everyone; and
-`varies: ["cookie"] + allowCookies` silently dropped a `Vary` the caller explicitly asked for.
-`allowQuery` contributes nothing (query lives in the URL, which downstream caches already key on).
+Keep **two distinct lists**. `keyHeaderNames` creates the cache key and controls credential visibility. `varyHeaderNames` advertises dimensions. They differ only for `cookie`. `allowCookies` removes `cookie` from the key list because the key has the more precise `cookie.<hash(subset)>` component. It must remain in the `Vary` list because the response varies by the `Cookie` request header, and `Vary` cannot name part of a header. Earlier code combined the lists. An `allowCookies` route then advertised `s-maxage` and `max-age` with no `Vary`, so a CDN could serve one visitor's variant to everyone. `varies: ["cookie"] + allowCookies` also removed a `Vary` that the caller explicitly requested. `allowQuery` adds nothing because downstream caches already key on the URL query.
 
-**Documented trade**: `Vary: Cookie` is destructive to CDN hit rates (any unrelated analytics
-cookie makes a request its own variant) — the honest version of a shared-cacheability claim
-ocache previously hadn't earned. Callers needing downstream hit rate should key by URL instead, or
-keep the cookie-keyed cache server-only with `sendCacheControl: false`. **Rejected alternative**:
-keep `Vary` off and mark cookie-keyed responses `private` — preserves CDN behavior by opting out
-of it rather than by telling the truth, and `private` also disqualifies the entry via `validate`.
+This is a **documented tradeoff**. `Vary: Cookie` can greatly reduce CDN hit rates because an unrelated analytics cookie creates another variant. This is the correct cost of an honest shared-cache claim. Callers that need downstream hit rate should put the key in the URL. They can also keep a cookie-keyed cache on the server with `sendCacheControl: false`. A rejected alternative was to omit `Vary` and mark cookie-keyed output `private`. That approach would preserve CDN behavior by disabling it rather than by describing variants. `private` would also make `validate` reject the ocache entry.
 
 ### Reading a handler's own `Vary`
 
-Finding 13, the fail-closed half: `hasUnkeyedVary(vary, varyHeaderNames)` rejects in `validate`
-and suppresses synthesis in `serialize` — one shared predicate at both sites. ocache _wrote_
-`Vary` but never _read_ one, so a handler declaring `Vary: Accept-Language` (the spec-correct way
-to say "not interchangeable", RFC 9111 §4.1) had its English rendering stored under the
-language-free key and served to every other language — with that same `Vary` attached for
-downstream caches to propagate, the layer closest to the origin violating what it told everyone
-else.
+Finding 13 provides fail-closed behavior. `hasUnkeyedVary(vary, varyHeaderNames)` rejects storage in `validate` and prevents synthesis in `serialize`. Both sites must use one predicate. Earlier ocache wrote `Vary` but did not read a handler value. A handler could correctly send `Vary: Accept-Language` under RFC 9111 §4.1, but ocache stored its English output under a language-independent key. It served that output for every language and kept the same `Vary` header for downstream caches. The cache nearest the origin violated its own advertisement.
 
-Compared against **`varyHeaderNames`, not `keyHeaderNames`**: the two differ only on `cookie`,
-which `allowCookies` keys as a finer component, so every advertised name _is_ in the key in some
-form and a handler declaring `Vary: Cookie` under `allowCookies` must still cache.
-Case-insensitive and whitespace-tolerant; only empty list elements are skipped (RFC 9110 §5.6.1 —
-a trailing comma isn't degenerate), so a malformed token matches nothing and rejects — **fail
-closed**. `*` is deliberately _not_ handled here: it is a different verdict on the same header,
-`hasVaryWildcard`'s (finding 08), applied alongside at both sites — folding it in would let a
-degenerate `varies: ["*"]` make the wildcard "keyed". Applied on read too, so an older entry heals
-on access.
+Compare with **`varyHeaderNames`, not `keyHeaderNames`**. The lists differ only for `cookie`. `allowCookies` keys a more precise cookie component, so every advertised name still appears in the key in some form. A handler that sends `Vary: Cookie` with `allowCookies` must remain cacheable. Matching is case-insensitive and allows whitespace. Skip only empty list items under RFC 9110 §5.6.1. A trailing comma is not enough to make the value invalid. A malformed token matches no key and causes rejection, which fails closed. Do not process `*` here. `hasVaryWildcard` owns that separate decision from the same header (finding 08). Apply both functions at both sites. Combining them would let `varies: ["*"]` falsely mark a wildcard as keyed. Apply the check on read so access repairs an older unsafe entry.
 
-**Breaking**: costs hit rate on a route whose `varies` doesn't match what its handler declares —
-which is exactly the route that was serving the wrong body. That includes a custom `getKey` that
-already partitions by the header: list the name in `varies` too.
+This is **breaking** for a route whose `varies` list does not match its handler's declaration. It reduces the hit rate on exactly the route that previously served incorrect output. A custom `getKey` may already partition by the header, but the caller must still list the header in `varies`.
 
-**Full `Vary` support** (folding declared names into the key) is deliberately not attempted:
-`Vary` is only known _after_ the handler has run, so it needs a re-key or a second store pass —
-the classic two-phase problem, **tracked, open**.
+Do not implement **full `Vary` support** by automatically adding response names to the key. The response reveals these names only after the handler runs. Support requires a second storage pass or re-keying. This is the standard two-phase problem and remains **tracked, open**.
 
 ## Cookies, response side
 
-**No `Set-Cookie` ever survives a cacheable route** — unconditional
-`res.headers.delete("set-cookie")` in `serialize`, before storage and before the value any caller
-(including the direct MISS caller) receives.
+**No `Set-Cookie` may survive a cacheable route.** `serialize` must call `headers.delete("set-cookie")` on the copied headers without conditions before storage and before any caller, including a direct MISS caller, receives the value.
 
-Closes issue #61: concurrent same-key requests coalesce onto one resolution, so the leader's
-per-request `Set-Cookie` (e.g. a session id) was replayed to every deduplicated peer — a
-cross-user session leak. `allowCookies` used to except its own names, which reintroduced that leak
-one opt-in later: a handler minting `sid` on first visit stored the response under the _no-sid_
-key with `Set-Cookie: sid=s1` attached, so every subsequent first-time visitor (also no `sid`,
-same key) got a HIT carrying `sid=s1` — session-fixation grade, and broad rule sets like
-`"/**": { swr: 60 }` put every cookie-setting route there (h3#1524 finding #15c).
+This fixes issue #61. Concurrent requests with one key share one resolution. Earlier code replayed the leader's request-specific `Set-Cookie`, such as a session ID, to every follower. This caused a cross-user session leak. `allowCookies` once exempted its listed names and recreated the problem. A handler could mint `sid` on a first visit and store the response under the no-sid key with `Set-Cookie: sid=s1`. Every later first-time visitor also had no sid and used the same key, so a HIT assigned `sid=s1`. This allowed session fixation. Broad rules such as `"/**": { swr: 60 }` included all cookie-setting routes, as in h3#1524 finding #15c.
 
-The more permissive alternative (refuse to _store_ a response that mints a cookie) can't close the
-concurrent-peer case at all — coalesced callers share one resolution and are indistinguishable —
-so the rule is uniform and one sentence long. The rest of the response is cached normally (mirrors
-how CDNs / Varnish drop `Set-Cookie` on cacheable responses). A bare `delete` covers every runtime,
-so the old `getSetCookie()` capability branch is gone. `validate` rejects **any** stored
-`set-cookie` — defense-in-depth for pre-existing/foreign entries. **Breaking**: handlers minting
-per-request cookies must serve them from a non-GET/HEAD (bypassed) route.
+A more permissive alternative would reject storage when a response sets a cookie. This cannot protect concurrent followers because coalesced callers share one indistinguishable resolution. Keep the uniform removal rule. Cache the rest of the response normally, as CDNs and Varnish do when they remove `Set-Cookie` from cacheable output. A direct `delete` works in every runtime, so remove the old `getSetCookie()` capability branch. `validate` must reject **any** stored `set-cookie` as defense for old or foreign entries. This is a breaking rule. A handler that creates per-request cookies must use a non-GET/HEAD route, which bypasses caching.
 
 ## Transport headers
 
-`content-encoding`, `content-length`, `content-range`, `transfer-encoding` are deleted in
-`serialize` before storage: the body is stored fully decoded and re-buffered, so replaying an
-upstream `content-encoding: gzip` against a decompressed body (or a stale `content-length`/wire
-`transfer-encoding`) would desync headers from the served body and yield malformed responses
-(nitro#2109). The runtime recomputes `content-length` on read. `content-range` is there for the
-same reason and **not** because a 206 could reach storage (it can't — `Range` bypasses and
-`validate` rejects the status): it describes a _partial_ body, so on an entry we do store it is
-meaningless at best and a lie about the served bytes at worst. Realistic source: a proxying
-handler copying upstream headers onto a 200.
+Remove `content-encoding`, `content-length`, `content-range`, and `transfer-encoding` in `serialize` before storage. The stored body is fully decoded and buffered. Replaying `content-encoding: gzip` with a decompressed body, or stale `content-length` or `transfer-encoding`, makes headers disagree with bytes and can produce malformed responses (nitro#2109). The runtime recreates `content-length` on read. Remove `content-range` for the same reason, not because a 206 can reach storage. `Range` bypass and status validation already block 206. `content-range` describes a partial body. It is meaningless or false on a stored complete entry. A proxy handler that copies upstream headers to a 200 can realistically produce this case.
 
 ## The header set is copied, never mutated in place
 
-`serialize` builds the entry from `new Headers(res.headers)` — one copy taken before the first
-synthesis — and the handler's own `Response` is left exactly as it was handed over.
+`serialize` must create the entry from `new Headers(res.headers)`. Make this copy before the first synthesized change. Do not change the handler's original `Response`.
 
-It used to write straight onto `res.headers`: `set` for `etag`/`last-modified`/`cache-control`,
-`appendVary`, `delete` for `set-cookie` and the transport headers. Every `Response` produced by
-`fetch()`, `Response.redirect()` or `Response.error()` carries the spec's **immutable** header
-guard, so the first of those threw a `TypeError` inside `serialize` → the shared resolution
-rejected → the entry was evicted → the next request repeated it, forever. That is not a corner:
-a reverse proxy over `fetch()` is the canonical use of an HTTP response cache, and `301`/`308`
-are on the cacheable-status allowlist specifically so `Response.redirect` can be cached. **No
-configuration avoided it** — `sendCacheControl: false` plus an upstream `etag`/`last-modified`
-still hit the unconditional `set-cookie` / `appendVary` / transport deletes.
+Earlier code changed `res.headers` directly. It used `set` for `etag`, `last-modified`, and `cache-control`; called `appendVary`; and deleted `set-cookie` and transport headers. Responses from `fetch()`, `Response.redirect()`, and `Response.error()` have an **immutable** header guard. The first mutation threw a `TypeError` inside `serialize`. The shared resolution then rejected and evicted the entry. Every next request repeated the failure. This is a common case because a reverse proxy over `fetch()` is a primary HTTP-cache use. Statuses 301 and 308 are allowed specifically so `Response.redirect` can be cached. **No configuration avoided the failure.** Even `sendCacheControl: false` with upstream `etag` and `last-modified` still reached unconditional `set-cookie`, `appendVary`, and transport deletion calls.
 
-Sound because nothing reads `res.headers` after `serialize`: `getMaxAge` (which does read them,
-for `must-revalidate`) runs strictly before it, `validate` and `transform` see the serialized
-entry, the serve path rebuilds from storage via `createResponse`, and a bypassed call skips
-`serialize` entirely. So for a mutable response the copy is behavior-identical — it only stops
-ocache scribbling on an object the caller still owns.
+The copy is safe because no code reads `res.headers` after `serialize`. `getMaxAge` reads them for `must-revalidate` before serialization. `validate` and `transform` read the serialized entry. The serve path rebuilds responses through `createResponse`. Bypass skips serialization. For a mutable response, the copy preserves behavior and only avoids changing an object that the caller owns.
 
-Coverage gap that hid it: every 301 test constructed a mutable `new Response(...)`. The
-regression tests now assert the premise (`Response.redirect` really is immutable) alongside the
-behavior, since they prove nothing on a runtime that stops enforcing the guard.
+Old tests missed this defect because every 301 test used mutable `new Response(...)`. Regression tests now assert that `Response.redirect` is immutable and then assert cache behavior. Without the first assertion, the behavior test proves nothing on a runtime that does not enforce the guard.
 
 ## Body encoding
 
-`serialize` decides by **byte validity, not content-type** — a valid-UTF-8 body (fatal
-`TextDecoder` with `ignoreBOM`, lossless roundtrip) is stored verbatim as a string (unchanged text
-behavior, stable text etags); anything else is base64-encoded and flagged `base64: true`. Base64
-rather than a raw `Uint8Array` so binary bodies survive JSON-serializing backends. On read a
-`base64` entry decodes back to a `Uint8Array` so the exact bytes replay untouched; `createResponse`
-therefore receives `string | Uint8Array | null`.
+Choose storage format by **byte validity, not content-type**. Decode with a fatal `TextDecoder` and `ignoreBOM`, then require a lossless round trip. Store valid UTF-8 directly as a string. This keeps existing text behavior and stable text etags. Store all other bytes as base64 and set `base64: true`. Base64 lets binary content survive backends that serialize values as JSON. On read, decode a `base64` entry to `Uint8Array` so the exact bytes remain unchanged. `createResponse` therefore accepts `string | Uint8Array | null`.
 
 ## `304 Not Modified`
 
-Decided from `if-none-match`/`if-modified-since` (`handleCacheHeaders` overrides it); the headers
-a 304 echoes are not overridable. `Vary` above all: a 304 must state the same variant dimensions
-or a shared cache updates its stored entry having lost them (RFC 7232 §4.1). The cache-status
-header rides along, because a HIT served as a 304 is still a HIT.
+Use `if-none-match` and `if-modified-since` to select a 304. `handleCacheHeaders` may replace this decision. The set of headers that a 304 repeats is not configurable. Always include `Vary`. A 304 must state the same variant dimensions. Otherwise, a shared cache can update its stored entry after losing those dimensions (RFC 7232 §4.1). Also include the cache-status header because a HIT returned as 304 is still a HIT.

@@ -1,77 +1,31 @@
 # `storage.ts` — the built-in memory backend
 
-`StorageInterface` is a minimal `get`/`set` (with optional TTL in seconds). Setting a nullish
-value deletes the entry instead of storing dead weight.
+`StorageInterface` provides minimal `get` and `set` operations. `set` accepts an optional TTL in seconds. A nullish value deletes the entry instead of storing unused data.
 
 ## Two ceilings, LRU-evicted in one loop
 
-`maxSize` (10 000 entries) and `maxBytes` (100 MB, finding 14.1). They bound different things and
-both apply: `maxSize` bounds entry _count_, which is not a memory bound at all — retained bytes
-are `maxSize × whatever an entry weighs`, i.e. attacker-influenced for an HTTP handler. Measured:
-10 000 × 1 MB documents held 10 GB of RSS, and because the cache is external/large-object memory
-the process is **OOM-killed rather than throwing a catchable `RangeError`** — there is no graceful
-degradation path to write.
+The backend defaults to `maxSize` of 10 000 entries and `maxBytes` of 100 MB (finding 14.1). Both limits apply because they control different resources. `maxSize` limits entry count, not memory. Retained bytes equal `maxSize × whatever an entry weighs`, and HTTP clients can influence entry size. Measurements with 10 000 documents of 1 MB each produced 10 GB of RSS. The cache uses external and large-object memory, so the operating system **kills the process for OOM instead of throwing a catchable `RangeError`**. A write cannot degrade gracefully after that point.
 
-Promoted to a release blocker when finding 14.3 was rejected: `{ swr: true, maxAge: N }` carries
-an expiry but no storage TTL (`.agents/cache.md`), so backend capacity became the _only_ bound on
-it — the backend therefore has to be one. `Infinity`/`0`/negative disables either ceiling; `get`'s
-recency touch is armed when _either_ is.
+This became a release blocker after finding 14.3 was rejected. `{ swr: true, maxAge: N }` has an expiry but no storage TTL. See `.agents/cache.md`. Backend capacity is the **only** bound for these entries, so the built-in backend must enforce one. `Infinity`, `0`, and negative values disable either limit. A `get` updates recency when either limit is active.
 
 ## The running total is a correctness obligation
 
-The budget is policed by a running total, not by recomputing (which would be O(cache) per write).
-That makes every removal path load-bearing: `set` (overwrite included), the nullish-value delete,
-the TTL `setTimeout` callback and `get`'s lazy expiry all funnel through `deleteEntry`, the only
-place bytes are released, and the single `map.set` in `set` is the only place they are charged.
+Use a running byte total. Recomputing the total would take O(cache) work for every write. Every removal path must update the total. `set`, including overwrite, nullish-value deletion, the TTL `setTimeout` callback, and lazy expiration in `get` must call `deleteEntry`. This is the only function that releases bytes. The one `map.set` in `set` is the only operation that charges bytes.
 
-A leaked count doesn't lose the budget, it converges on **evicting everything** — silently — so
-the drift is tested per path. `get`'s LRU touch deliberately uses raw `map.delete`/`map.set`: it
-moves the same entry object (and its charge); it is not a delete plus an insert.
+A leaked charge does not remove the budget. It makes the backend silently approach **evicting everything**. Tests must cover accounting for each removal path. The LRU update in `get` intentionally uses raw `map.delete` and `map.set`. It moves the same entry and its existing charge. It is not a charged deletion followed by insertion.
 
 ## An entry larger than the whole budget is refused
 
-Any previous value under its key is dropped with it. The alternative — store it and sit
-permanently over the ceiling — isn't available, and evicting down to fit it flushes every other
-entry for something that _still_ doesn't fit, which is finding 14.2's cache-flush DoS reachable
-from a single request. Dropping the prior value is what `set` was asked to do; serving the old one
-afterwards would be a lie about what is cached, and the read simply misses and re-resolves. The
-eviction loop's empty-map guard makes termination unconditional regardless.
+Reject an entry larger than the complete budget. Also remove any previous value for its key. Storing the entry while permanently over budget is not valid. Evicting all other entries cannot make an oversized entry fit. It would instead create the single-request cache-flush denial of service from finding 14.2. Removing the previous value follows the requested `set`. Serving that old value afterward would falsely report what is cached. The next read misses and resolves again. The eviction loop checks for an empty map, so it always terminates.
 
 ## Measuring an entry
 
-- `sizeOf(value, key)` replaces the built-in estimate and owns the **whole** per-entry charge, key
-  included — nothing is added on top. Only called when `maxBytes` is armed. A throwing hook, or a
-  result that isn't a finite non-negative number, falls back to the built-in estimate: the budget
-  degrades to an approximation, never to "free".
-- The built-in estimate is a **depth-limited, cycle-safe structural walk**, deliberately not
-  `JSON.stringify(value).length` — that throws on cycles and BigInt, drops non-JSON values, and
-  allocates a second copy of the very body being measured because it is large. The walk allocates
-  nothing but its `seen` set and reads each string's `length` once, so the dominant real shape
-  (`CacheEntry<ResponseCacheEntry>`, depth 3) costs a handful of property reads. `seen` charges any
-  object once, so a cycle terminates and a shared subtree isn't double-counted; the depth cap (8)
-  keeps recursion off the stack limit, at the price of under-counting below it — that is what
-  `sizeOf` is for. Typed arrays/`ArrayBuffer` are charged `byteLength` (walking indices would be
-  O(n) reads and wildly wrong) and `Map`/`Set` are iterated, since `Object.keys` would price them
-  at zero — the dangerous direction. Host objects with no own enumerable properties (a `Response`)
-  are likewise under-counted, which is why the HTTP layer stores the serialized entry, not the live
-  response.
-- Strings are charged at **2 bytes per UTF-16 code unit** — the upper bound; engines store
-  latin1-only strings at one byte per character, so an ASCII body is over-charged by up to 2×.
-  Over-charging is the only safe direction: a budget that under-counts is not a bound. The key is
-  measured the same way and counts toward the entry — the finding's second measurement (10 000 ×
-  8 KB attacker-chosen _paths_, 93 MB heap / 296 MB RSS in 6 s, with trivial values) is entirely
-  key weight.
+- `sizeOf(value, key)` replaces the built-in estimate. It owns the **entire** per-entry charge, including the key. Do not add another charge. Call it only when `maxBytes` is active. If it throws or returns a value that is not a finite, non-negative number, use the built-in estimate. The budget may become approximate but must never treat the value as free.
+- The built-in estimate uses a **depth-limited, cycle-safe structural traversal**. Do not use `JSON.stringify(value).length`. That operation throws for cycles and BigInt, omits non-JSON values, and allocates a second copy of a potentially large body. The traversal allocates only its `seen` set and reads each string's `length` once. The common `CacheEntry<ResponseCacheEntry>` shape has depth 3 and costs only a few property reads. `seen` charges an object once, so cycles stop and shared subtrees are not counted twice. The depth limit of 8 prevents stack overflow. It can undercount deeper values; use `sizeOf` when that matters. Charge typed arrays and `ArrayBuffer` by `byteLength`. Walking their indices would require O(n) reads and give the wrong size. Iterate `Map` and `Set`; `Object.keys` would assign them a dangerous zero cost. Host objects with no own enumerable properties, such as `Response`, are also undercounted. For this reason, the HTTP layer stores a serialized entry, not a live response.
+- Charge strings at **2 bytes per UTF-16 code unit**, which is the upper bound. Engines may store latin1-only strings with one byte per character, so this can charge an ASCII body up to 2× its actual string storage. Overcounting is safe. Undercounting would make the budget ineffective. Measure keys the same way and include them in the entry. The finding's second measurement used `10 000 × 8 KB` attacker-selected paths with trivial values. It reached 93 MB heap and 296 MB RSS in 6 s. Almost all of that size was in keys.
 
 ## `resolveStorage` and the absence of a global
 
-`StorageOption` is `StorageInterface | (() => StorageInterface)`; the factory form exists for late
-binding (handler defined at module load, backend configured at server start). `resolveStorage(
-...optsList)` resolves `optsList[0].storage` (factory → call it; unset → a fresh
-`createMemoryStorage()`) and writes the result into every listed options object.
+`StorageOption` is `StorageInterface | (() => StorageInterface)`. The factory supports late binding when a handler is defined during module load but its backend is configured during server startup. `resolveStorage(...optsList)` reads `optsList[0].storage`. It calls a factory, or creates a fresh `createMemoryStorage()` when unset. It writes the resolved instance to every options object in the list.
 
-**No global storage.** `useStorage()`/`setStorage()` are _removed_, not deprecated: the
-module-level slot made the last `setStorage()` call win for every consumer in the process, so two
-independent apps each building their own handler + storage shared one backend and served each
-other's cached response bodies (h3#1524 finding #2). Per-instance defaults close it by
-construction — two defaults can never collide on a key. Sharing is explicit: pass the same
-`storage`.
+**Do not use global storage.** `useStorage()` and `setStorage()` are removed, not deprecated. The module-level slot made the last `setStorage()` call affect every consumer in the process. Two independent applications could each create a handler and storage but still share one backend. They then served each other's cached response bodies, as in h3#1524 finding #2. Per-instance defaults prevent key collisions between default stores. To share storage, pass the same `storage` explicitly.

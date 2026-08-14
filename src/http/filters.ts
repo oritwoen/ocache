@@ -1,26 +1,15 @@
-// The allowlist filters. `key.ts` hashes what these return and `request.ts` hands it to the
-// handler — the directory's one rule, a handler may read exactly what the key covers — so
-// neither side may compute "the allowlisted subset" on its own. Here, so neither imports the
-// other.
+// Key composition and request narrowing must use these same filtered values.
 
 import type { HandlerConfig } from "./config.ts";
 
 import type { HTTPEvent } from "../types.ts";
 
 /**
- * The only headers a handler may read *without* the key covering them — every other
- * undeclared name is stripped by `narrowRequest`. Each earns its place by being unusable
- * as a rendering input, because `varies` is no escape hatch for any of them:
+ * Headers that remain visible without separate key components.
  *
- * - `host` — already keyed, via the URL authority `resolveKey` hashes.
- * - `if-none-match` / `if-modified-since` — read by `defaultHandleCacheHeaders` *after*
- *   narrowing has mutated the event, so stripping them would kill the 304 on every MISS.
- *   Safe to forward: the only responses they can produce (304, 412) are off the status
- *   allowlist (`validate.ts`), so nothing derived from them is ever stored.
- * - the propagation headers — carried for logging/tracing, and per-request-unique by
- *   construction: a handler rendering from one produces something no key could cover.
- *   Deliberately NOT here: `user-agent` (device/bot branching is a real rendering input)
- *   and `baggage` (OTel's is app-readable tenant/flag context). Declare those in `varies`.
+ * URL authority already covers `host`.
+ * Conditional headers can produce only non-storable responses.
+ * Trace headers support propagation but must not affect rendered output.
  */
 export const safeHeaderNames = new Set([
   "host",
@@ -32,7 +21,7 @@ export const safeHeaderNames = new Set([
   "x-request-id",
 ]);
 
-// Memoized per event so the key derivation and the URL rewrite don't recompute it.
+// Share one filtered query between key composition and URL rewriting.
 export function filteredSearch<E extends HTTPEvent>(
   config: HandlerConfig<E>,
   event: HTTPEvent,
@@ -46,7 +35,7 @@ export function filteredSearch<E extends HTTPEvent>(
   return search;
 }
 
-/** Rebuilds the query string from only the allowlisted param names, order-independent. */
+/** Returns an order-independent query with only allowed names. */
 function filterSearch(url: URL, names: string[]): string {
   const filtered = new URLSearchParams();
   for (const name of names) {
@@ -58,7 +47,7 @@ function filterSearch(url: URL, names: string[]): string {
   return query ? `?${query}` : "";
 }
 
-/** Rebuilds the `Cookie` header from only the allowlisted cookie names, sorted (order-independent). */
+/** Returns an order-independent Cookie header with only allowed names. */
 export function filterCookie(header: string | null | undefined, names: string[]): string {
   if (!header) {
     return "";
