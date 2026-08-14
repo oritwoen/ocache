@@ -86,11 +86,9 @@ const handler = defineCachedHandler(
 type CachedEventHandler<E extends HTTPEvent = HTTPEvent> = EventHandler<E> &
 ```
 
-Cached event handler returned by `defineCachedHandler`.
+Cached handler with resource-level cache management methods.
 
-An [`EventHandler`](#eventhandler) augmented with on-demand revalidation methods forwarded from
-the underlying cached function. Each accepts the [`HTTPEvent`](#httpevent) directly and derives
-the exact storage key the handler caches under, so no manual key reconstruction is needed.
+Each method covers GET and HEAD variants in every base prefix.
 
 ---
 
@@ -110,13 +108,12 @@ Alias for [`defineCachedFunction`](#definecachedfunction).
 type CacheStatus = "hit" | "stale" | "revalidated" | "miss";
 ```
 
-How a cached value was served on a given call.
+Result of one cache call.
 
-- `"hit"` — a fresh cached value was returned without re-resolving.
-- `"stale"` — a stale value was served while a background SWR refresh runs.
-- `"revalidated"` — a prior value existed but was expired/invalid, so it was
-  re-resolved in the foreground (no stale value served) before returning.
-- `"miss"` — the value was resolved fresh on this call (nothing was cached).
+- `"hit"`: returned a fresh stored value.
+- `"stale"`: returned stale data and started background revalidation.
+- `"revalidated"`: replaced an old value before returning.
+- `"miss"`: resolved a value when none existed.
 
 ---
 
@@ -126,7 +123,7 @@ How a cached value was served on a given call.
 function createMemoryStorage(opts: MemoryStorageOptions =
 ```
 
-Creates an in-memory storage backed by a `Map` with optional TTL support (in seconds) and LRU eviction.
+Creates Map-based memory storage with TTLs in seconds and LRU eviction.
 
 ---
 
@@ -138,14 +135,14 @@ function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   opts: CacheOptions<T, ArgsT> =
 ```
 
-Wraps a function with caching support including TTL, SWR, integrity checks, and request deduplication.
+Wraps a function with caching, SWR, integrity checks, and request deduplication.
 
 **Parameters:**
 
-- **`fn`** — The function to cache.
-- **`opts`** — Cache configuration options.
+- **`fn`** — Function to cache.
+- **`opts`** — Cache options.
 
-**Returns:** — A cached function with a `.resolveKey(...args)` method for cache key resolution.
+**Returns:** — The cached function and its cache management methods.
 
 ---
 
@@ -157,20 +154,18 @@ function defineCachedHandler<E extends HTTPEvent = HTTPEvent>(
   opts: CachedEventHandlerOptions<E> =
 ```
 
-Wraps an HTTP event handler with response caching.
+Wraps an HTTP handler with response caching and conditional response support.
 
-Automatically generates cache keys from the URL path and variable headers,
-sets `cache-control`, `etag`, and `last-modified` headers, and handles
-`304 Not Modified` responses via conditional request headers.
+Only GET and HEAD requests without Range are cacheable.
+Only 200, 203, 301, and 308 responses are stored.
+Response Cache-Control and Vary headers can prevent storage.
 
 **Parameters:**
 
-- **`handler`** — The event handler to cache.
-- **`opts`** — Cache and HTTP-specific configuration options.
+- **`handler`** — Handler to cache.
+- **`opts`** — Cache and HTTP options.
 
-**Returns:** — A new event handler that serves cached responses when available. The handler
-also exposes `.resolveKeys(event)`, `.invalidate(event)`, and `.expire(event)` for
-on-demand revalidation, keyed exactly as the handler caches (no key reconstruction).
+**Returns:** — A cached handler with resource-level cache management methods.
 
 ---
 
@@ -180,7 +175,7 @@ on-demand revalidation, keyed exactly as the handler caches (no key reconstructi
 type EventHandler<E extends HTTPEvent = HTTPEvent> = (
 ```
 
-Handler function that receives an [`HTTPEvent`](#httpevent) and returns a response value.
+Handler that receives an HTTP event.
 
 ---
 
@@ -191,28 +186,22 @@ async function expireCache<ArgsT extends unknown[] = any[]>(
   input:
 ```
 
-Expires cached entries for given arguments and cache options across all base prefixes,
-without removing them.
+Marks matching entries as stale without removing them.
 
-Unlike [`invalidateCache`](#invalidatecache) (which removes entries entirely), expired entries keep
-serving the stale value with SWR — still bounded by the originally configured
-`staleMaxAge` window — while the next access triggers a background refresh.
-Without SWR, the next call re-resolves before returning.
-
-Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
-Pass the same `maxAge` / `swr` / `staleMaxAge` options you cache with so the
-remaining storage TTL is preserved.
+SWR may serve the stale value within its original stale window.
+Without SWR, the next call revalidates before returning.
+Pass the original lifetime options to preserve the remaining storage TTL.
+This function throws when `options.storage` is unset.
 
 **Parameters:**
 
-- **`input`** — Object with `options` (cache options) and optional `args` (function arguments).
+- **`input`** — Cache options and function arguments.
 
 **Example:**
 
 ```ts
-// Mark a cached entry for background refresh on next access
 await expireCache({
-  options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300 },
+  options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, swr: true, storage },
   args: ["user-123"],
 });
 ```
@@ -226,20 +215,21 @@ async function invalidateCache<ArgsT extends unknown[] = any[]>(
   input:
 ```
 
-Invalidates (removes) cached entries for given arguments and cache options across all base prefixes.
+Removes matching entries from all base prefixes.
 
-Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
+Pass the original options object or the same explicit storage backend.
+This function throws when `options.storage` is unset because no global store exists.
+Prefer the cached function's `.invalidate()` method when available.
 
 **Parameters:**
 
-- **`input`** — Object with `options` (cache options) and optional `args` (function arguments).
+- **`input`** — Cache options and function arguments.
 
 **Example:**
 
 ```ts
-// Invalidate a specific cached entry
 await invalidateCache({
-  options: { name: "fetchUser", getKey: (id: string) => id },
+  options: { name: "fetchUser", getKey: (id: string) => id, storage },
   args: ["user-123"],
 });
 ```
@@ -253,21 +243,16 @@ async function resolveCacheKeys<ArgsT extends unknown[] = any[]>(
   input:
 ```
 
-Resolves all cache storage keys (one per base prefix) for given arguments and cache options.
+Returns one storage key per base prefix.
 
-Uses the same key derivation as `defineCachedFunction` internally:
-
-- When `opts.getKey` is provided, it is called with `args` to produce the key segment.
-- Otherwise, `args` are hashed with `ohash` (same default as `defineCachedFunction`).
-
-Pass the same `getKey`, `name`, `group`, and `base` options you use in
-`defineCachedFunction` / `defineCachedHandler` to get the exact storage keys.
+Pass the same `getKey`, `name`, `group`, and `base` options as the cached function.
+This helper computes keys without accessing storage.
 
 **Parameters:**
 
-- **`input`** — Object with `options` (cache options) and optional `args` (function arguments).
+- **`input`** — Cache options and function arguments.
 
-**Returns:** — An array of storage key strings (one per base prefix).
+**Returns:** — Storage keys in base-prefix order.
 
 **Example:**
 
@@ -276,30 +261,19 @@ const keys = await resolveCacheKeys({
   options: { name: "fetchUser", getKey: (id: string) => id },
   args: ["user-123"],
 });
-for (const key of keys) {
-  await useStorage().set(key, null); // invalidate all tiers
-}
 ```
 
 ---
 
-### `setStorage`
+### `StorageOption`
 
 ```ts
-function setStorage(storage: StorageInterface): void;
+type StorageOption = StorageInterface | (() => StorageInterface);
 ```
 
-Sets a custom storage implementation to be used by all cached functions.
+A storage instance or a late-bound storage factory.
 
----
-
-### `useStorage`
-
-```ts
-function useStorage(): StorageInterface;
-```
-
-Returns the current storage instance. If none has been set via `setStorage`, lazily initializes an in-memory storage.
+The cache calls a factory once, on the first cache operation.
 
 <!-- /automd-->
 

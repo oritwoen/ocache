@@ -1,19 +1,47 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-  cachedFunction,
-  defineCachedFunction,
-  defineCachedHandler,
+  cachedFunction as _cachedFunction,
+  defineCachedFunction as _defineCachedFunction,
+  defineCachedHandler as _defineCachedHandler,
   resolveCacheKeys,
   invalidateCache,
   expireCache,
   createMemoryStorage,
-  setStorage,
-  useStorage,
+  type StorageInterface,
   type HTTPEvent,
 } from "../src/index.ts";
+
+// There is no global storage any more: every cached function/handler owns its own memory
+// storage unless it is handed one, which is what makes two independent consumers unable to
+// collide (covered explicitly in `describe("storage")`). Most tests here predate that and
+// want ONE shared, inspectable backend, so the wrappers below inject `testStorage` as the
+// `storage` option. It goes in as a *factory* — resolved on first use — so a test can still
+// swap the backend after defining its cached function, exactly as the old `useTestStorage()`
+// calls did. Use the `_`-prefixed imports directly to exercise the real defaults.
+let testStorage: StorageInterface;
+
 beforeEach(() => {
-  setStorage(createMemoryStorage());
+  testStorage = createMemoryStorage();
 });
+
+/** Replaces the storage the wrappers below hand out (the old global `setStorage`). */
+function useTestStorage(storage: StorageInterface): void {
+  testStorage = storage;
+}
+
+// Mutates rather than clones: the standalone `invalidateCache`/`expireCache` helpers reach
+// a cached function's store by being handed the very same options object, so the wrapper
+// must not break that identity.
+function _withTestStorage<O extends { storage?: any }>(opts: O): O {
+  opts.storage ??= () => testStorage;
+  return opts;
+}
+
+const cachedFunction: typeof _cachedFunction = (fn: any, opts: any = {}) =>
+  _cachedFunction(fn, _withTestStorage(opts));
+const defineCachedFunction: typeof _defineCachedFunction = cachedFunction;
+const defineCachedHandler: typeof _defineCachedHandler = (handler: any, opts: any = {}) =>
+  _defineCachedHandler(handler, _withTestStorage(opts));
 
 describe("cachedFunction", () => {
   it("caches function results", async () => {
@@ -137,7 +165,7 @@ describe("cachedFunction", () => {
     await fn(); // miss (writes entry)
     await fn(); // hit — must not mutate the stored entry with `status`
     const [key] = await fn.resolveKeys();
-    const stored = (await useStorage().get(key!)) as Record<string, unknown>;
+    const stored = (await testStorage.get(key!)) as Record<string, unknown>;
     expect(Object.keys(stored)).not.toContain("status");
   });
 
@@ -152,7 +180,7 @@ describe("cachedFunction", () => {
     await fn(); // hit (sets per-call status on the returned entry)
     await fn.expire();
     const [key] = await fn.resolveKeys();
-    const stored = (await useStorage().get(key!)) as Record<string, unknown>;
+    const stored = (await testStorage.get(key!)) as Record<string, unknown>;
     expect(stored.stale).toBe(true);
     expect(Object.keys(stored)).not.toContain("status");
   });
@@ -339,7 +367,7 @@ describe("cachedFunction", () => {
 
   it("handles cache read errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => Promise.reject(new Error("read error")),
       set: () => {},
     });
@@ -352,7 +380,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache read errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => {
         throw new Error("sync read error");
       },
@@ -367,7 +395,7 @@ describe("cachedFunction", () => {
 
   it("handles cache write errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => Promise.reject(new Error("write error")),
     });
@@ -381,7 +409,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache write errors gracefully", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => {
         throw new Error("sync write error");
@@ -397,7 +425,7 @@ describe("cachedFunction", () => {
 
   it("handles cache eviction errors gracefully", async () => {
     const errors: unknown[] = [];
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => Promise.reject(new Error("evict error")),
     });
@@ -418,7 +446,7 @@ describe("cachedFunction", () => {
 
   it("handles sync cache eviction errors gracefully", async () => {
     const errors: unknown[] = [];
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: () => {
         throw new Error("sync evict error");
@@ -441,7 +469,7 @@ describe("cachedFunction", () => {
 
   it("handles malformed cache data", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setStorage({
+    useTestStorage({
       get: () => "not-an-object" as any,
       set: () => {},
     });
@@ -481,7 +509,10 @@ describe("cachedFunction", () => {
     expect(callCount).toBe(2);
   });
 
-  it("no maxAge caches indefinitely", async () => {
+  // Named "caches indefinitely" for years, but `{}` merges the `maxAge: 1` default, so this
+  // is the 1-second cache, not a no-expiry one — the only test that ever looked like it
+  // covered cache-forever, and it never did (see "the no-lifetime invariant" describe).
+  it("no maxAge option caches with the 1s default", async () => {
     let callCount = 0;
     const fn = defineCachedFunction(() => {
       callCount++;
@@ -513,9 +544,13 @@ describe("cachedFunction", () => {
     // SWR mode: if entry.value exists, it returns early with the stale value
     // The resolve promise runs in the background
     expect(callCount).toBe(2);
-    // SWR returns the cached entry value (which was already updated synchronously
-    // since the resolver is sync)
-    expect(r2).toBe("v2");
+    // The stale value, exactly as for an async resolver (the sibling test below). It used to
+    // be `v2` here: a *sync* resolver settled its shared promise within the microtask ticks
+    // the serve path spends on `validate`, so the background refresh's write to the live
+    // entry landed before this call returned. `maxResolveTime` puts one more promise between
+    // the resolution and that write, so the accident no longer fires and both resolver shapes
+    // now agree on what SWR means.
+    expect(r2).toBe("v1");
   });
 
   it("SWR returns stale value for async resolver", async () => {
@@ -556,7 +591,7 @@ describe("cachedFunction", () => {
 
   it("sets storage TTL when swr is false", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -668,7 +703,7 @@ describe("cachedFunction", () => {
 
     // The stale entry should have been removed from storage after the bg error.
     const keys = await fn.resolveKeys();
-    const staleEntry = await useStorage().get(keys[0]!);
+    const staleEntry = await testStorage.get(keys[0]!);
     // BUG: stale entry persists in storage — it should be null after failed revalidation
     expect(staleEntry).toBeNull();
   });
@@ -718,7 +753,7 @@ describe("cachedFunction", () => {
     // The stale entry should have been removed from storage because the
     // bg revalidation produced an invalid result (undefined).
     const keys = await fn.resolveKeys();
-    const staleEntry = await useStorage().get(keys[0]!);
+    const staleEntry = await testStorage.get(keys[0]!);
     // BUG: stale entry persists in storage — it should be null after failed revalidation
     expect(staleEntry).toBeNull();
   });
@@ -744,7 +779,7 @@ describe("cachedFunction", () => {
 
   it("sets storage TTL to maxAge + staleMaxAge when SWR with staleMaxAge", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -758,9 +793,14 @@ describe("cachedFunction", () => {
     expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 180 });
   });
 
+  // The ISR shape, asserted from the storage side: the entry IS written (so it can be served
+  // stale later — see "SWR without staleMaxAge serves stale indefinitely") but with no TTL,
+  // so nothing deletes it at `maxAge`. Arming `{ ttl: maxAge }` here (finding 14.3's proposed
+  // fix) would drop the entry the instant it goes stale and turn SWR into foreground
+  // revalidation; the bound on this shape is storage capacity (14.1), not a timer.
   it("does not set storage TTL when SWR without staleMaxAge", async () => {
     const setSpy = vi.fn();
-    setStorage({
+    useTestStorage({
       get: () => null,
       set: setSpy,
     });
@@ -770,7 +810,12 @@ describe("cachedFunction", () => {
       swr: true,
     });
     await fn();
-    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), undefined);
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ value: "value" }),
+      undefined,
+    );
   });
 
   it("SWR with staleMaxAge: 0 never serves stale", async () => {
@@ -888,7 +933,9 @@ describe("cache key name resolution (#53)", () => {
   it("anonymous function falls back to a stable hash of its source", async () => {
     const fn = defineCachedFunction(async () => 1);
     const key = (await fn.resolveKeys())[0]!;
-    expect(key).toMatch(/^\/cache:functions:anon_[\w-]{16}:\.json$/);
+    // The base64url alphabet includes `-`, which the key escape drops — so a slice carrying one
+    // takes the escaped-plus-hash form (see "cache key name escaping"). Both are accepted.
+    expect(key).toMatch(/^\/cache:functions:anon_\w{1,16}(\.[\w-]+)?:\.json$/);
     // Stable across separate definitions of the identical function source.
     const same = defineCachedFunction(async () => 1);
     expect((await same.resolveKeys())[0]).toBe(key);
@@ -923,6 +970,240 @@ describe("cache key name resolution (#53)", () => {
     }
     expect(aCalls).toBe(1);
     expect(bCalls).toBe(1);
+  });
+});
+
+// Regression: `defineCachedHandler` merged `defaultCacheOptions()` (`name: "_"`) before
+// delegating to `cachedFunction`, so the `opts.name || fn.name || anon_<hash>` resolution
+// above was unreachable and EVERY handler keyed as `_`. Two handlers sharing one storage
+// (the configuration the `storage` docs recommend) then collided on the same path: same
+// source => same integrity => one served the other's cached response; different sources =>
+// each read failed the other's integrity check => 0% hit rate.
+describe("handler cache key name resolution", () => {
+  const handlerEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+
+  it("gives two handlers sharing one storage distinct keys on the same path", async () => {
+    const storage = createMemoryStorage();
+    const acme = _defineCachedHandler(() => new Response("tenant=ACME"), { maxAge: 60, storage });
+    const globex = _defineCachedHandler(() => new Response("tenant=GLOBEX; other source"), {
+      maxAge: 60,
+      storage,
+    });
+
+    const acmeKey = (await acme.resolveKeys(handlerEvent("/dashboard")))[0]!;
+    const globexKey = (await globex.resolveKeys(handlerEvent("/dashboard")))[0]!;
+    expect(acmeKey).not.toBe(globexKey);
+    expect(acmeKey).toMatch(/^\/cache:handlers:anon_\w{1,16}(\.[\w-]+)?:dashboard\./);
+
+    // …and they never serve each other's responses, in either order.
+    expect(await ((await acme(handlerEvent("/dashboard"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex(handlerEvent("/dashboard"))) as Response).text()).toBe(
+      "tenant=GLOBEX; other source",
+    );
+    expect(await ((await acme(handlerEvent("/dashboard"))) as Response).text()).toBe("tenant=ACME");
+  });
+
+  it("uses handler.name in the storage key when no name option is given", async () => {
+    const storage = createMemoryStorage();
+    const dashboard = _defineCachedHandler(
+      async function dashboard() {
+        return new Response("dash");
+      },
+      { maxAge: 60, storage },
+    );
+    const profile = _defineCachedHandler(
+      async function profile() {
+        return new Response("profile");
+      },
+      { maxAge: 60, storage },
+    );
+
+    expect((await dashboard.resolveKeys(handlerEvent("/x")))[0]).toMatch(
+      /^\/cache:handlers:dashboard:/,
+    );
+    expect((await profile.resolveKeys(handlerEvent("/x")))[0]).toMatch(
+      /^\/cache:handlers:profile:/,
+    );
+  });
+
+  it("explicit name option still overrides handler.name", async () => {
+    const storage = createMemoryStorage();
+    const handler = _defineCachedHandler(
+      async function actualName() {
+        return new Response("v");
+      },
+      { maxAge: 60, name: "custom", storage },
+    );
+    expect((await handler.resolveKeys(handlerEvent("/x")))[0]).toMatch(/^\/cache:handlers:custom:/);
+  });
+
+  // DOCUMENTED CAVEAT, not a bug: the anonymous fallback hashes the handler *source*, and
+  // two handlers built by one factory have identical source — only their closed-over
+  // variables differ, which no source hash can see. They therefore share a name (and, since
+  // the integrity hash is derived from the same source, share entries outright when they
+  // also share a storage). A per-instance discriminator (counter/WeakMap/random) is not an
+  // option: keys must be stable across process restarts for persistent/shared backends.
+  // The fix is an explicit `name`, asserted in the second half of this test.
+  it("same-factory handlers share a key unless given an explicit name", async () => {
+    const storage = createMemoryStorage();
+    const make = (tenant: string) =>
+      _defineCachedHandler(() => new Response(`tenant=${tenant}`), { maxAge: 60, storage });
+
+    const acme = make("ACME");
+    const globex = make("GLOBEX");
+    expect((await acme.resolveKeys(handlerEvent("/dash")))[0]).toBe(
+      (await globex.resolveKeys(handlerEvent("/dash")))[0],
+    );
+    // Same source => same integrity too, so the collision is a cross-handler HIT.
+    expect(await ((await acme(handlerEvent("/dash"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex(handlerEvent("/dash"))) as Response).text()).toBe("tenant=ACME");
+
+    // The documented fix: name the instances.
+    const namedMake = (tenant: string) =>
+      _defineCachedHandler(() => new Response(`tenant=${tenant}`), {
+        maxAge: 60,
+        name: `tenant-${tenant}`,
+        storage,
+      });
+    const acme2 = namedMake("ACME");
+    const globex2 = namedMake("GLOBEX");
+    expect((await acme2.resolveKeys(handlerEvent("/dash2")))[0]).not.toBe(
+      (await globex2.resolveKeys(handlerEvent("/dash2")))[0],
+    );
+    expect(await ((await acme2(handlerEvent("/dash2"))) as Response).text()).toBe("tenant=ACME");
+    expect(await ((await globex2(handlerEvent("/dash2"))) as Response).text()).toBe(
+      "tenant=GLOBEX",
+    );
+  });
+});
+
+// `buildCacheKey` joins `[base, group, name, key]` with `:` and used to escape everything but
+// `name` — harmless while every handler keyed as the literal `_`, but `name` now comes from
+// `fn.name`, which is not a controlled alphabet (`named.bind(null)` alone yields `bound named`).
+// An unescaped `:` in it could rebuild another handler's `HEAD:` variant key verbatim.
+describe("cache key name escaping", () => {
+  const handlerEvent = (path: string, method = "GET") => ({
+    req: new Request(`http://localhost${path}`, { method }),
+  });
+
+  it("leaves an ordinary identifier name byte-identical", async () => {
+    // The whole point of escaping this late: no existing entry moves unless its name actually
+    // carries an escapable character.
+    const fn = defineCachedFunction(async function getUser() {
+      return "u";
+    });
+    expect((await fn.resolveKeys())[0]).toBe("/cache:functions:getUser:.json");
+
+    const named = defineCachedFunction(() => "v", { name: "my_fn_2", getKey: () => "k" });
+    expect((await named.resolveKeys())[0]).toBe("/cache:functions:my_fn_2:k.json");
+  });
+
+  it("keeps a `:` in the name out of the key's segment structure", async () => {
+    const fn = defineCachedFunction(() => "v", { name: "a:b", getKey: () => "k", maxAge: 60 });
+    const key = (await fn.resolveKeys())[0]!;
+    // base : group : name : key — exactly four segments, whatever the name contained.
+    expect(key.split(":")).toHaveLength(4);
+    expect(key).toMatch(/^\/cache:functions:ab\.[\w-]+:k\.json$/);
+  });
+
+  it("keeps a space in the name (a bound function) out of the key", async () => {
+    function render() {
+      return "v";
+    }
+    const fn = defineCachedFunction(render.bind(null), { getKey: () => "k" });
+    const key = (await fn.resolveKeys())[0]!;
+    expect(key.split(":")).toHaveLength(4);
+    expect(key).not.toContain(" ");
+    expect(key).toMatch(/^\/cache:functions:boundrender\.[\w-]+:k\.json$/);
+  });
+
+  it("round-trips an escaped name through resolveKeys/invalidate/expire", async () => {
+    const storage = createMemoryStorage();
+    let calls = 0;
+    const opts = { name: "a:b c", getKey: () => "k", maxAge: 60, storage };
+    const fn = _defineCachedFunction(() => `v${++calls}`, opts);
+
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v1");
+
+    // The key the write path used is the key the helpers reconstruct.
+    const key = (await fn.resolveKeys())[0]!;
+    expect(await storage.get(key)).toMatchObject({ value: "v1" });
+    expect((await resolveCacheKeys({ options: opts }))[0]).toBe(key);
+
+    await fn.expire();
+    expect(await storage.get(key)).toMatchObject({ value: "v1", stale: true });
+    expect(await fn()).toBe("v2");
+
+    await fn.invalidate();
+    expect(await storage.get(key)).toBeNull();
+    expect(await fn()).toBe("v3");
+
+    // …and so does the standalone helper, handed the same name.
+    await invalidateCache({ options: opts });
+    expect(await storage.get(key)).toBeNull();
+    expect(await fn()).toBe("v4");
+  });
+
+  it("does not collide two names differing only in where the escapable character sits", async () => {
+    const storage = createMemoryStorage();
+    const ab = _defineCachedFunction(() => "A", { name: "a:bc", getKey: () => "k", storage });
+    const bc = _defineCachedFunction(() => "B", { name: "ab:c", getKey: () => "k", storage });
+
+    expect((await ab.resolveKeys())[0]).not.toBe((await bc.resolveKeys())[0]);
+    expect(await ab()).toBe("A");
+    expect(await bc()).toBe("B");
+    expect(await ab()).toBe("A");
+  });
+
+  // The sharp case: pre-fix, a handler named `page:HEAD` built exactly the key a `page`
+  // handler's HEAD variant writes — `/cache:handlers:page:HEAD:<resource>.json` — so one
+  // anonymous HEAD seeded the other handler's GET entry (h3#1524 finding #3, one segment over).
+  it("cannot forge another handler's HEAD variant key from the name", async () => {
+    const storage = createMemoryStorage();
+    const trap = _defineCachedHandler(() => new Response("trap"), {
+      maxAge: 60,
+      name: "page:HEAD",
+      storage,
+    });
+    const page = _defineCachedHandler(() => new Response("page"), {
+      maxAge: 60,
+      name: "page",
+      storage,
+    });
+
+    const [pageGet, pageHead] = await page.resolveKeys(handlerEvent("/x"));
+    const trapGet = (await trap.resolveKeys(handlerEvent("/x")))[0]!;
+    // The key the trap's name spelled out verbatim before it was escaped.
+    expect(pageHead).toBe(pageGet!.replace("/cache:handlers:page:", "/cache:handlers:page:HEAD:"));
+    expect(trapGet).not.toBe(pageHead);
+    expect(trapGet).not.toBe(pageGet);
+
+    // Neither serves the other, in either order.
+    await page(handlerEvent("/x", "HEAD"));
+    expect(await ((await trap(handlerEvent("/x"))) as Response).text()).toBe("trap");
+    expect(await ((await page(handlerEvent("/x"))) as Response).text()).toBe("page");
+  });
+
+  it("round-trips an escaped handler name through the revalidation helpers", async () => {
+    const storage = createMemoryStorage();
+    let calls = 0;
+    const handler = _defineCachedHandler(() => new Response(`call-${++calls}`), {
+      maxAge: 60,
+      name: "tenant a:b",
+      storage,
+    });
+
+    expect(await ((await handler(handlerEvent("/r"))) as Response).text()).toBe("call-1");
+    expect(await ((await handler(handlerEvent("/r"))) as Response).text()).toBe("call-1");
+
+    const keys = await handler.resolveKeys(handlerEvent("/r"));
+    expect(keys[0]).toMatch(/^\/cache:handlers:tenantab\.[\w-]+:r\./);
+    expect(await storage.get(keys[0]!)).toBeTruthy();
+
+    await handler.invalidate(handlerEvent("/r"));
+    expect(await storage.get(keys[0]!)).toBeNull();
+    expect(await ((await handler(handlerEvent("/r"))) as Response).text()).toBe("call-2");
   });
 });
 
@@ -971,7 +1252,7 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     await fn();
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBe(42);
     expect(entry.staleMaxAge).toBe(7);
   });
@@ -997,7 +1278,7 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(callCount).toBe(1);
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBeUndefined();
   });
 
@@ -1071,9 +1352,11 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
     expect(await fn()).toBe(2);
     expect(callCount).toBe(2);
 
+    // A clamped-to-zero lifetime is not stored at all now: the entry could never be served
+    // (zero maxAge reads as expired on arrival), and writing it left storage holding an entry
+    // with neither an expiry nor a TTL — dead weight only a manual purge removed.
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
-    expect(entry.maxAge).toBe(0);
+    expect(await testStorage.get(keys[0]!)).toBeNull();
   });
 
   it("respects per-entry TTL when expiring via expireCache", async () => {
@@ -1089,13 +1372,511 @@ describe("getMaxAge (dynamic per-entry TTL)", () => {
 
     await fn();
     const keys = await fn.resolveKeys();
-    expect(((await useStorage().get(keys[0]!)) as any).stale).toBeUndefined();
+    expect(((await testStorage.get(keys[0]!)) as any).stale).toBeUndefined();
 
     await expireCache({ options, args: [] });
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.stale).toBe(true);
     // Entry value is preserved for SWR to keep serving
     expect(entry.value).toBe("value");
+  });
+});
+
+// One rule, checked from both sides: a write gets a storage TTL covering exactly the window
+// the entry may still be served in, and an entry with neither an expiry nor a TTL is never
+// written at all (findings 14.3 and 10.6).
+describe("storage TTL and the no-lifetime invariant", () => {
+  let testId = 0;
+  const makeEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+  const uniquePath = () => `/ttl-${++testId}-${Date.now()}`;
+
+  // The ISR semantic end to end: `revalidate` marks an entry eligible for regeneration, it
+  // never deletes it. Finding 14.3 proposed bounding this shape with a `{ ttl: maxAge }`
+  // storage TTL — that would delete the entry at the exact moment this test reads it stale,
+  // so SWR would degrade to foreground revalidation. The bound is storage capacity (14.1).
+  it("swr with no staleMaxAge serves STALE past maxAge and refreshes in the background", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 0.05, swr: true },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(await r1.text()).toBe("v1");
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    await new Promise((r) => setTimeout(r, 80));
+    // Past `maxAge` and still resident: no storage TTL was armed, so nothing reclaimed it.
+    expect(await testStorage.get(key!)).not.toBeNull();
+
+    const r2 = (await handler(makeEvent(path))) as Response;
+    expect(r2.headers.get("x-cache")).toBe("STALE");
+    expect(await r2.text()).toBe("v1");
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(callCount).toBe(2); // refreshed in the background
+    const r3 = (await handler(makeEvent(path))) as Response;
+    expect(r3.headers.get("x-cache")).toBe("HIT");
+    expect(await r3.text()).toBe("v2");
+  });
+
+  it("swr with staleMaxAge and a zero maxAge caches nothing, for a function", async () => {
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { swr: true, staleMaxAge: 600, maxAge: 0, getKey: () => "swr-zero-maxage" },
+    );
+
+    // A zero lifetime under SWR used to store an entry with no expiry and no storage TTL —
+    // cached forever while advertising itself as immediately stale. Nothing is stored now.
+    // (`maxAge: undefined` is NOT this config: an explicitly-undefined option reads as unset,
+    // so it takes the `maxAge: 1` default — see "explicitly-undefined options".)
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+    const keys = await fn.resolveKeys();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("swr with staleMaxAge and a zero maxAge caches nothing, for a handler (and says so)", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { swr: true, staleMaxAge: 600, maxAge: 0 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The zero lifetime is advertised (`s-maxage=0`), and `validate` reads it back as the
+    // storage opt-out it is — so the handler runs every time and nothing is stored.
+    expect(r1.headers.get("cache-control")).toBe(
+      "max-age=0, s-maxage=0, stale-while-revalidate=600",
+    );
+    expect(await r2.text()).toBe("v2");
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("swr with a getMaxAge hook and no static maxAge still caches (the hook is the lifetime)", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      // The documented per-route ISR shape: the window comes from the value, not a static
+      // option, so this is not a "missing maxAge" and must not read as a zero lifetime.
+      { swr: true, getMaxAge: () => 60 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+    // Stored, and — being the SWR-with-no-`staleMaxAge` (ISR) shape — with no storage TTL.
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), undefined);
+  });
+
+  it("a getMaxAge hook that supplies no lifetime falls back to the refused write", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      // The hook declines to give this entry a lifetime, so the static option decides — and
+      // that one is a refused write.
+      { swr: true, maxAge: 0, getMaxAge: () => undefined, getKey: () => "hook-nothing" },
+    );
+
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v2");
+    expect(setSpy).not.toHaveBeenCalled();
+  });
+
+  it("never writes an entry with neither an expiry nor a storage TTL", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { maxAge: 0, swr: false, getKey: () => "no-lifetime" },
+    );
+
+    expect(await fn()).toBe("v1");
+    await new Promise((r) => setTimeout(r, 20));
+    // A zero (or nullish) lifetime used to store an entry with no `expires` and no TTL and
+    // serve it as a permanent HIT — indistinguishable from a leak. Refused outright now, so
+    // the value is simply re-resolved.
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+    expect(setSpy).not.toHaveBeenCalled();
+    const keys = await fn.resolveKeys();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  it("evicts a pre-existing no-lifetime entry instead of rewriting it", async () => {
+    const fn = defineCachedFunction(() => "fresh", {
+      maxAge: 0,
+      getKey: () => "legacy",
+    });
+    const [key] = await fn.resolveKeys();
+    // What an older ocache left behind: a value with no expiry, no TTL, and a stale integrity.
+    await testStorage.set(key!, { value: "legacy", mtime: Date.now(), integrity: "old" });
+
+    expect(await fn()).toBe("fresh");
+
+    expect(await testStorage.get(key!)).toBeNull();
+  });
+
+  it("treats staleMaxAge: 0 as a named zero window, not as unset", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const fn = defineCachedFunction(
+      () => {
+        callCount++;
+        return `v${callCount}`;
+      },
+      { maxAge: 0.05, swr: true, staleMaxAge: 0, getKey: () => "zero-stale" },
+    );
+
+    // Stored and served fresh...
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v1");
+    expect(callCount).toBe(1);
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 0.05 });
+
+    // ...but never served stale: the zero window revalidates in the foreground.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(await fn()).toBe("v2");
+    expect(callCount).toBe(2);
+  });
+
+  it("stores a must-revalidate response with a TTL of maxAge (per-entry staleMaxAge: 0)", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: { "cache-control": "public, max-age=60, must-revalidate" },
+        });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The internal `getMaxAge` wrapper persists `staleMaxAge: 0` on this entry, and a
+    // per-entry `0` is a real window — not a missing one — so the TTL is `maxAge` alone
+    // (60), never `maxAge + 600` from the static option it overrides.
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), { ttl: 60 });
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+  });
+});
+
+// The synthesized `Cache-Control` states the lifetime ocache actually enforces for *this*
+// entry: the one `getMaxAge` resolved onto it, else the static option (finding 10.2); with a
+// `max-age` beside the shared-cache-only `s-maxage` (10.3); and never a bare, unparseable
+// `stale-while-revalidate` (10.4).
+describe("synthesized Cache-Control lifetimes", () => {
+  let testId = 0;
+  const makeEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+  const uniquePath = () => `/cc-${++testId}-${Date.now()}`;
+
+  /** Runs a handler once and reports the header it advertised. */
+  async function advertised(opts: Record<string, unknown>, res?: () => Response) {
+    const path = uniquePath();
+    const handler = defineCachedHandler(res ?? (() => new Response("ok")), opts as any);
+    const first = (await handler(makeEvent(path))) as Response;
+    return first.headers.get("cache-control");
+  }
+
+  it("advertises the maxAge a getMaxAge hook returned as a number", async () => {
+    // The static option said an hour; the hook says two seconds and ocache expires its own
+    // entry on the two. Downstream used to be told the hour regardless.
+    expect(await advertised({ maxAge: 3600, getMaxAge: () => 2 })).toBe("max-age=2");
+  });
+
+  it("advertises both lifetimes a getMaxAge hook returned as an object", async () => {
+    expect(
+      await advertised({
+        maxAge: 3600,
+        staleMaxAge: 7200,
+        swr: true,
+        getMaxAge: () => ({ maxAge: 2, staleMaxAge: 30 }),
+      }),
+    ).toBe("max-age=2, s-maxage=2, stale-while-revalidate=30");
+  });
+
+  it("falls back to the static options when the hook returns nothing", async () => {
+    expect(
+      await advertised({ maxAge: 60, staleMaxAge: 120, swr: true, getMaxAge: () => undefined }),
+    ).toBe("max-age=60, s-maxage=60, stale-while-revalidate=120");
+  });
+
+  it("falls back per field: a hook giving only maxAge keeps the static staleMaxAge", async () => {
+    // Exactly the precedence `cache.ts` applies to the freshness check and the storage TTL
+    // (`entry.x ?? opts.x`), field by field — not all-or-nothing.
+    expect(
+      await advertised({
+        maxAge: 60,
+        staleMaxAge: 120,
+        swr: true,
+        getMaxAge: () => ({ maxAge: 5 }),
+      }),
+    ).toBe("max-age=5, s-maxage=5, stale-while-revalidate=120");
+  });
+
+  it("advertises a per-entry staleMaxAge of 0 as stale-while-revalidate=0", async () => {
+    // A zero window is a real window ("never serve this stale"), and `cache.ts` honors it as
+    // one — so it is advertised, exactly as a zero `maxAge` is.
+    expect(await advertised({ maxAge: 60, swr: true, getMaxAge: () => ({ staleMaxAge: 0 }) })).toBe(
+      "max-age=60, s-maxage=60, stale-while-revalidate=0",
+    );
+  });
+
+  it("advertises a dynamic zero lifetime, and then stores nothing (no gap)", async () => {
+    const setSpy = vi.spyOn(testStorage, "set");
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 600, swr: true, getMaxAge: () => 0 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The advertisement now moves with the storage decision: a hook clamping to 0 refuses the
+    // write (`storageTtl`), and `validate` reads the same zero lifetime back out of our own
+    // header. Before, the entry was refused while `s-maxage=600` shipped anyway.
+    expect(r1.headers.get("cache-control")).toBe("max-age=0, s-maxage=0");
+    expect(await r2.text()).toBe("v2");
+    expect(callCount).toBe(2);
+    expect(setSpy).not.toHaveBeenCalled();
+  });
+
+  it("never emits a bare stale-while-revalidate, whatever the shape", async () => {
+    const shapes = [
+      { maxAge: 60, swr: true },
+      { swr: true, getMaxAge: () => 60 },
+      { maxAge: 60, swr: true, staleMaxAge: undefined },
+      { maxAge: 60, swr: true, getMaxAge: () => ({ maxAge: 30 }) },
+    ];
+    for (const shape of shapes) {
+      const cc = await advertised(shape);
+      // A delta-seconds or nothing — the bare token is unparseable (RFC 5861 §3), so a
+      // conforming cache drops the whole directive and the window evaporates unannounced.
+      expect(cc).not.toMatch(/stale-while-revalidate(?!=)/);
+    }
+  });
+
+  it("keeps max-age alone when swr is off, whatever the hook says", async () => {
+    // `s-maxage` is only synthesized under `swr`; without it `max-age` already governs both
+    // cache kinds, so nothing is added.
+    expect(await advertised({ maxAge: 60, staleMaxAge: 600, getMaxAge: () => 30 })).toBe(
+      "max-age=30",
+    );
+    expect(await advertised({ maxAge: 0 })).toBe("max-age=0");
+  });
+
+  it("does not clobber a handler cache-control, whatever the hook resolved", async () => {
+    expect(
+      await advertised(
+        { maxAge: 60, swr: true, staleMaxAge: 600, getMaxAge: () => 5 },
+        () => new Response("ok", { headers: { "cache-control": "public, max-age=600" } }),
+      ),
+    ).toBe("public, max-age=600");
+  });
+
+  it("a must-revalidate response is stored on its own staleMaxAge: 0 and advertises nothing of ours", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: { "cache-control": "public, max-age=60, must-revalidate" },
+        });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // The internal wrapper's per-entry `staleMaxAge: 0` reaches the synthesis path like any
+    // other resolved lifetime — but there is nothing to synthesize: the response carries the
+    // handler's own header, which is where the `must-revalidate` came from in the first place.
+    expect(r1.headers.get("cache-control")).toBe("public, max-age=60, must-revalidate");
+    expect(r2.headers.get("cache-control")).toBe("public, max-age=60, must-revalidate");
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+  });
+
+  it("sendCacheControl: false still suppresses everything, hook or no hook", async () => {
+    expect(
+      await advertised({ maxAge: 60, swr: true, getMaxAge: () => 5, sendCacheControl: false }),
+    ).toBeNull();
+  });
+});
+
+// `{ ...defaults(), ...opts }` copies undefined-valued own properties, so an explicit
+// `undefined` used to clobber a default an absent key would have kept — the spelling plumbing
+// produces (`{ maxAge: routeConfig.maxAge }` with an unset rule), never one anybody types.
+// `definedOptions` drops them at both merge sites so the two spellings are indistinguishable.
+describe("explicitly-undefined options are treated as unset", () => {
+  let testId = 0;
+  const makeEvent = (path: string) => ({ req: new Request(`http://localhost${path}`) });
+
+  /** Runs a cached function twice; reports resolver calls and the TTL of every storage write. */
+  async function runFn(opts: Record<string, unknown>) {
+    const name = `undef-fn-${++testId}`;
+    const setSpy = vi.spyOn(testStorage, "set");
+    let calls = 0;
+    const fn = defineCachedFunction(
+      () => {
+        calls++;
+        return `v${calls}`;
+      },
+      // A per-run name/key: same-source functions would otherwise share both key and integrity.
+      { name, getKey: () => name, ...opts },
+    );
+    await fn();
+    await fn();
+    const writes = setSpy.mock.calls.filter(([, value]) => value != null).map(([, , o]) => o);
+    setSpy.mockRestore();
+    return { calls, writes };
+  }
+
+  /** The same for a handler, plus what it advertised and how the second request was served. */
+  async function runHandler(opts: Record<string, unknown>) {
+    const path = `/undef-h-${++testId}`;
+    const setSpy = vi.spyOn(testStorage, "set");
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`v${calls}`);
+      },
+      { name: `undef-h-${testId}`, ...opts },
+    );
+    await handler(makeEvent(path));
+    const res = (await handler(makeEvent(path))) as Response;
+    const writes = setSpy.mock.calls.filter(([, value]) => value != null).map(([, , o]) => o);
+    setSpy.mockRestore();
+    return {
+      calls,
+      writes,
+      body: await res.text(),
+      cacheControl: res.headers.get("cache-control"),
+      status: res.headers.get("x-cache"),
+    };
+  }
+
+  it("maxAge: undefined caches exactly like an absent maxAge (function)", async () => {
+    // The measured divergence: `{}` resolved once and wrote `{ ttl: 1 }`, while
+    // `{ maxAge: undefined }` resolved on every call and wrote nothing at all.
+    expect(await runFn({ maxAge: undefined })).toEqual(await runFn({}));
+    expect(await runFn({})).toEqual({ calls: 1, writes: [{ ttl: 1 }] });
+  });
+
+  it("maxAge: undefined caches exactly like an absent maxAge (handler)", async () => {
+    const absent = await runHandler({});
+    const explicit = await runHandler({ maxAge: undefined });
+    expect(explicit).toEqual(absent);
+    expect(absent).toMatchObject({
+      calls: 1,
+      writes: [{ ttl: 1 }],
+      body: "v1",
+      cacheControl: "max-age=1",
+      status: "HIT",
+    });
+  });
+
+  it("swr: undefined and staleMaxAge: undefined behave like absent ones", async () => {
+    const absent = await runFn({ maxAge: 10 });
+    expect(await runFn({ maxAge: 10, swr: undefined })).toEqual(absent);
+    expect(await runFn({ maxAge: 10, staleMaxAge: undefined })).toEqual(absent);
+    expect(await runFn({ maxAge: 10, swr: undefined, staleMaxAge: undefined })).toEqual(absent);
+    expect(absent).toEqual({ calls: 1, writes: [{ ttl: 10 }] });
+
+    // Same for the handler, where `swr` also decides which directive is synthesized.
+    const swrAbsent = await runHandler({ maxAge: 60, staleMaxAge: 600 });
+    expect(await runHandler({ maxAge: 60, staleMaxAge: 600, swr: undefined })).toEqual(swrAbsent);
+    expect(swrAbsent.cacheControl).toBe("max-age=60");
+  });
+
+  it("storage: undefined still gets the per-instance default storage", async () => {
+    let calls = 0;
+    // The raw import: the test wrapper's `storage ??=` would fill an undefined one in itself.
+    const fn = _defineCachedFunction(
+      () => {
+        calls++;
+        return `v${calls}`;
+      },
+      { maxAge: 10, storage: undefined, name: "undef-storage", getKey: () => "k" },
+    );
+
+    expect(await fn()).toBe("v1");
+    expect(await fn()).toBe("v1");
+    expect(calls).toBe(1);
+  });
+
+  it("an option set to a real value still wins over the default", async () => {
+    // The guard against over-stripping: only `undefined` goes, never a falsy value.
+    expect(await runFn({ maxAge: 10 })).toEqual({ calls: 1, writes: [{ ttl: 10 }] });
+    expect(await runFn({ maxAge: 60, swr: true, staleMaxAge: 600 })).toEqual({
+      calls: 1,
+      writes: [{ ttl: 660 }],
+    });
+    expect(await runHandler({ maxAge: 30 })).toMatchObject({ cacheControl: "max-age=30" });
+    // `swr: false` and `maxAge: 0` are values, not absences: the zero lifetime is advertised
+    // and keeps the response out of storage (the 10.6 invariant, unaffected by the strip).
+    expect(await runFn({ maxAge: 0, swr: false })).toEqual({ calls: 2, writes: [] });
+    expect(await runHandler({ maxAge: 0, swr: false })).toMatchObject({
+      calls: 2,
+      writes: [],
+      cacheControl: "max-age=0",
+      status: "MISS",
+    });
+  });
+
+  it("preserves an explicit null lifetime, which is not the same as undefined", async () => {
+    // Only `undefined` reads as unset. A `null` maxAge stays nullish, so it names no lifetime
+    // and the write is refused — the opposite outcome from `maxAge: undefined` above.
+    expect(await runFn({ maxAge: null })).toEqual({ calls: 2, writes: [] });
+    expect(await runFn({ maxAge: undefined })).toEqual({ calls: 1, writes: [{ ttl: 1 }] });
   });
 });
 
@@ -1117,7 +1898,7 @@ describe("serialize (write-time hook)", () => {
 
     // Storage holds the serialized (string) form, not the raw object.
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.value).toBe('{"n":1}');
   });
 
@@ -1203,7 +1984,7 @@ describe("serialize (write-time hook)", () => {
 
     // The per-entry maxAge derived from the raw value is persisted alongside the serialized value.
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.maxAge).toBe(42);
     expect(entry.value).toBe('{"expiresIn":42}');
   });
@@ -1239,7 +2020,7 @@ describe("serialize (write-time hook)", () => {
 
     // Nothing was persisted, so a second call re-resolves.
     const keys = await fn.resolveKeys();
-    expect(await useStorage().get(keys[0]!)).toBeNull();
+    expect(await testStorage.get(keys[0]!)).toBeNull();
     await expect(fn()).rejects.toThrow("cannot serialize");
     expect(resolverCalls).toBe(2);
   });
@@ -1252,18 +2033,6 @@ describe("storage", () => {
     expect(storage.get("unique-ttl-key")).not.toBeNull();
     await new Promise((r) => setTimeout(r, 20));
     expect(storage.get("unique-ttl-key")).toBeNull();
-  });
-
-  it("useStorage returns singleton", () => {
-    const s1 = useStorage();
-    const s2 = useStorage();
-    expect(s1).toBe(s2);
-  });
-
-  it("setStorage overrides storage", () => {
-    const custom = createMemoryStorage();
-    setStorage(custom);
-    expect(useStorage()).toBe(custom);
   });
 
   it("set with null deletes the entry", () => {
@@ -1342,6 +2111,262 @@ describe("storage", () => {
     expect(storage.get("key-1999")).toBe(1999);
   });
 
+  // Finding 14.1: `maxSize` bounds entry *count*, never bytes — measured, 10 000 × 1 MB
+  // documents retained 10 GB of RSS, and because that is external/large-object memory the
+  // process is OOM-killed rather than throwing a catchable RangeError. `maxBytes` is the
+  // bound; it matters most for `{ swr: true, maxAge: N }` (the ISR shape), whose entries
+  // carry an expiry but no storage TTL and are retained until the backend evicts them.
+  describe("maxBytes", () => {
+    // A per-entry weight in exact units, so a test can state its budget in bytes instead of
+    // depending on the built-in estimate.
+    const byLength = (value: unknown) => (typeof value === "string" ? value.length : 1);
+
+    it("evicts least-recently-used entries once the byte budget is exceeded", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      storage.set("a", "12345");
+      storage.set("b", "12345"); // total 10 — at the budget, not over it
+      // Touch "a" so "b" is the least-recently-used.
+      expect(storage.get("a")).toBe("12345");
+      storage.set("c", "12345"); // 15 > 10 -> evicts "b"
+      expect(storage.get("b")).toBeNull();
+      expect(storage.get("a")).toBe("12345");
+      expect(storage.get("c")).toBe("12345");
+    });
+
+    // The regression the finding asks for: a byte budget evicts before RSS grows unbounded.
+    // 120 entries is far under the 10 000-entry ceiling, so only the byte budget can evict.
+    it("bounds total bytes under the default budget where maxSize alone would not", () => {
+      const storage = createMemoryStorage();
+      const body = "x".repeat(1024 * 1024); // ~2 MB estimated per entry
+      for (let i = 0; i < 120; i++) {
+        storage.set(`key-${i}`, { body: `${i}-${body}` });
+      }
+      let live = 0;
+      for (let i = 0; i < 120; i++) {
+        if (storage.get(`key-${i}`) !== null) {
+          live++;
+        }
+      }
+      expect(storage.get("key-0")).toBeNull();
+      expect(storage.get("key-119")).not.toBeNull();
+      // 100 MB / ~2 MB ≈ 48 entries retained, nowhere near 120.
+      expect(live).toBeGreaterThan(30);
+      expect(live).toBeLessThan(60);
+    });
+
+    it("counts the key's own bytes", () => {
+      // The finding's second measurement is pure key weight: 10 000 × 8 KB
+      // attacker-chosen paths, 93 MB heap / 296 MB RSS in 6 s, with 1-byte values.
+      const storage = createMemoryStorage({ maxBytes: 100_000 });
+      for (let i = 0; i < 20; i++) {
+        storage.set(`/${"p".repeat(8000)}/${i}`, 1);
+      }
+      let live = 0;
+      for (let i = 0; i < 20; i++) {
+        if (storage.get(`/${"p".repeat(8000)}/${i}`) !== null) {
+          live++;
+        }
+      }
+      // ~16 KB per key -> ~6 fit in 100 KB.
+      expect(live).toBeGreaterThan(2);
+      expect(live).toBeLessThan(10);
+    });
+
+    it("charges binary payloads their byte length", () => {
+      const storage = createMemoryStorage({ maxBytes: 4096 });
+      storage.set("a", new Uint8Array(3000));
+      storage.set("b", new Uint8Array(3000)); // 6000 > 4096 -> evicts "a"
+      expect(storage.get("a")).toBeNull();
+      expect(storage.get("b")).not.toBeNull();
+    });
+
+    it("disables the byte budget when maxBytes is 0 or Infinity", () => {
+      for (const maxBytes of [0, Number.POSITIVE_INFINITY, -1]) {
+        const sizeOf = vi.fn(() => 50 * 1024 * 1024);
+        const storage = createMemoryStorage({ maxBytes, sizeOf });
+        for (let i = 0; i < 10; i++) {
+          storage.set(`key-${i}`, i);
+        }
+        expect(storage.get("key-0")).toBe(0);
+        expect(storage.get("key-9")).toBe(9);
+        // With no budget armed, the estimate is never even computed.
+        expect(sizeOf).not.toHaveBeenCalled();
+      }
+    });
+
+    it("honors a custom sizeOf, which owns the whole per-entry charge", () => {
+      const seen: string[] = [];
+      const storage = createMemoryStorage({
+        maxBytes: 100,
+        sizeOf: (_value, key) => {
+          seen.push(key);
+          return key.length * 10;
+        },
+      });
+      storage.set("aaaa", "x"); // 40
+      storage.set("bbbb", "x"); // 80
+      storage.set("cccc", "x"); // 120 > 100 -> evicts "aaaa"
+      expect(seen).toEqual(["aaaa", "bbbb", "cccc"]);
+      expect(storage.get("aaaa")).toBeNull();
+      expect(storage.get("bbbb")).toBe("x");
+      expect(storage.get("cccc")).toBe("x");
+    });
+
+    it("falls back to the built-in estimate when sizeOf throws or returns a non-number", () => {
+      const hooks = [
+        () => {
+          throw new Error("boom");
+        },
+        () => Number.NaN,
+        () => -1,
+        () => "big" as unknown as number,
+      ];
+      for (const sizeOf of hooks) {
+        const storage = createMemoryStorage({ maxBytes: 10_000, sizeOf });
+        storage.set("a", "small");
+        // 50 000 chars -> 100 000 estimated bytes, over the whole budget on its own.
+        storage.set("big", "x".repeat(50_000));
+        expect(storage.get("big")).toBeNull();
+        expect(storage.get("a")).toBe("small");
+      }
+    });
+
+    // The running total is maintained incrementally, so every path that removes an entry has
+    // to release its bytes. A leak converges on evicting everything, silently.
+    it("does not leak bytes when a key is overwritten", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      for (let i = 0; i < 10; i++) {
+        storage.set("a", "123456789"); // 9 bytes, ten times over — total must stay 9
+      }
+      storage.set("b", "1");
+      expect(storage.get("a")).toBe("123456789");
+      expect(storage.get("b")).toBe("1");
+    });
+
+    it("does not leak bytes when an entry expires via its TTL timer", async () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      storage.set("a", "123456789", { ttl: 0.01 });
+      await new Promise((r) => setTimeout(r, 30));
+      // Fits only if the timer released "a"'s 9 bytes.
+      storage.set("b", "123456789");
+      expect(storage.get("b")).toBe("123456789");
+    });
+
+    it("does not leak bytes when an entry expires lazily on read", () => {
+      vi.useFakeTimers();
+      try {
+        const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+        storage.set("a", "123456789", { ttl: 60 });
+        // Move the clock without running timers, so the entry is reclaimed by `get`'s lazy
+        // expiry check rather than by its `setTimeout`.
+        vi.setSystemTime(Date.now() + 120_000);
+        expect(storage.get("a")).toBeNull();
+        storage.set("b", "123456789");
+        expect(storage.get("b")).toBe("123456789");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not leak bytes when an entry is deleted by a nullish set", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      storage.set("a", "123456789");
+      storage.set("a", null);
+      storage.set("b", "123456789");
+      expect(storage.get("a")).toBeNull();
+      expect(storage.get("b")).toBe("123456789");
+    });
+
+    it("does not leak bytes across LRU evictions", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      for (let i = 0; i < 50; i++) {
+        storage.set(`k${i}`, "123456789"); // only one 9-byte entry fits at a time
+      }
+      expect(storage.get("k49")).toBe("123456789");
+      expect(storage.get("k48")).toBeNull();
+    });
+
+    it("refuses an entry larger than the whole budget instead of flushing the cache", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      storage.set("a", "12345");
+      storage.set("b", "12345");
+      storage.set("huge", "1234567890123456789"); // 19 > 10
+      expect(storage.get("huge")).toBeNull();
+      // The hot set survives: one oversized value must not evict everything else.
+      expect(storage.get("a")).toBe("12345");
+      expect(storage.get("b")).toBe("12345");
+    });
+
+    it("drops the previous value when an oversized entry replaces it", () => {
+      const storage = createMemoryStorage({ maxBytes: 10, sizeOf: byLength });
+      storage.set("a", "12345");
+      storage.set("a", "1234567890123456789");
+      // `set` was asked to replace it; serving the old value afterwards would be a lie.
+      expect(storage.get("a")).toBeNull();
+    });
+
+    it("applies maxSize and maxBytes together", () => {
+      // Entry ceiling binds first.
+      const byCount = createMemoryStorage({ maxSize: 2, maxBytes: 1000, sizeOf: () => 10 });
+      byCount.set("a", 1);
+      byCount.set("b", 2);
+      byCount.set("c", 3);
+      expect(byCount.get("a")).toBeNull();
+      expect(byCount.get("b")).toBe(2);
+      expect(byCount.get("c")).toBe(3);
+
+      // Byte ceiling binds first.
+      const byBytes = createMemoryStorage({ maxSize: 100, maxBytes: 25, sizeOf: () => 10 });
+      byBytes.set("a", 1);
+      byBytes.set("b", 2);
+      byBytes.set("c", 3);
+      expect(byBytes.get("a")).toBeNull();
+      expect(byBytes.get("b")).toBe(2);
+      expect(byBytes.get("c")).toBe(3);
+    });
+
+    it("estimates exotic values without throwing", () => {
+      const storage = createMemoryStorage({ maxBytes: 10 * 1024 * 1024 });
+      const cyclic: Record<string, unknown> = { name: "cyclic" };
+      cyclic.self = cyclic;
+      cyclic.again = [cyclic, { deep: cyclic }];
+      class Instance {
+        field = "x";
+        get computed() {
+          return "y";
+        }
+      }
+      const throwingGetter = Object.defineProperty({}, "boom", {
+        get() {
+          throw new Error("no");
+        },
+        enumerable: true,
+      });
+      const values: unknown[] = [
+        cyclic,
+        new Instance(),
+        throwingGetter,
+        new Uint8Array([1, 2, 3]),
+        new DataView(new ArrayBuffer(8)),
+        new ArrayBuffer(16),
+        new Map<unknown, unknown>([["k", { v: 1 }]]),
+        new Set([1, "two", { three: 3 }]),
+        [1, [2, [3, [4]]]],
+        new Date(),
+        /re/g,
+        10n,
+        Symbol("s"),
+        () => {},
+        Number.NaN,
+        Object.create(null),
+      ];
+      for (const [i, value] of values.entries()) {
+        expect(() => storage.set(`exotic-${i}`, value)).not.toThrow();
+        expect(storage.get(`exotic-${i}`)).toBe(value);
+      }
+    });
+  });
+
   // Regression: nitro#2138 — expired cache entries never get flushed from memory.
   // When entries expire via TTL, they should eventually be removed from the underlying
   // Map even if nobody reads them again, to prevent unbounded memory growth.
@@ -1375,6 +2400,238 @@ describe("storage", () => {
       expect(origGet(`key-${i}`)).toBeNull();
     }
   });
+
+  // The `storage` option and the per-instance default that replaced the global
+  // `setStorage()`/`useStorage()` singleton. These use the raw `_`-prefixed imports so the
+  // test harness doesn't inject a shared storage over the behavior under test.
+  describe("storage option", () => {
+    // Regression (h3#1524 audit, finding #2): two independent apps, each building the same
+    // cached function from a shared module (so same name, same key, same integrity) but
+    // owning its own cache, used to land in the one global storage and serve each other's
+    // values. Nothing but the per-instance default prevents that — a caller cannot pick a
+    // "unique enough" name for an app it doesn't know exists.
+    it("gives each cached function its own storage by default", async () => {
+      const calls: string[] = [];
+      const makeApp = (app: string) =>
+        _defineCachedFunction(
+          () => {
+            calls.push(app);
+            return `body-from-${app}`;
+          },
+          { maxAge: 10, name: "render", getKey: () => "/index" },
+        );
+
+      const a = makeApp("a");
+      const b = makeApp("b");
+
+      expect(await a()).toBe("body-from-a");
+      expect(await b()).toBe("body-from-b");
+      // Each still serves its own value from its own cache.
+      expect(await a()).toBe("body-from-a");
+      expect(await b()).toBe("body-from-b");
+      expect(calls).toEqual(["a", "b"]);
+    });
+
+    it("shares entries between cached functions given the same storage", async () => {
+      const storage = createMemoryStorage();
+      const calls: string[] = [];
+      const makeApp = (app: string) =>
+        _defineCachedFunction(
+          () => {
+            calls.push(app);
+            return `body-from-${app}`;
+          },
+          { maxAge: 10, name: "render", getKey: () => "/index", storage },
+        );
+
+      const a = makeApp("a");
+      const b = makeApp("b");
+
+      expect(await a()).toBe("body-from-a");
+      // Sharing is opt-in and explicit: `b` reads the entry `a` wrote.
+      expect(await b()).toBe("body-from-a");
+      expect(calls).toEqual(["a"]);
+    });
+
+    it("writes to a ready storage instance", async () => {
+      const storage = createMemoryStorage();
+      const fn = _defineCachedFunction(() => "value", {
+        maxAge: 10,
+        name: "ready",
+        getKey: () => "k",
+        storage,
+      });
+
+      expect(await fn()).toBe("value");
+      expect(await storage.get("/cache:functions:ready:k.json")).toMatchObject({ value: "value" });
+      expect((await fn.resolveKeys())[0]).toBe("/cache:functions:ready:k.json");
+    });
+
+    it("resolves a storage factory lazily and only once", async () => {
+      const storage = createMemoryStorage();
+      let factoryCalls = 0;
+      const fn = _defineCachedFunction(() => "value", {
+        maxAge: 10,
+        name: "lazy",
+        getKey: () => "k",
+        storage: () => {
+          factoryCalls++;
+          return storage;
+        },
+      });
+
+      // Late binding: the factory must not run at definition time — a handler is commonly
+      // defined at module load, before the real backend has been configured.
+      expect(factoryCalls).toBe(0);
+
+      // A purge issued before anything was cached must resolve the *same* store the read/
+      // write path will use, not run the factory a second time on its own copy of the opts.
+      await fn.invalidate();
+      expect(factoryCalls).toBe(1);
+
+      await fn();
+      await fn();
+      await fn();
+      await fn.invalidate();
+      await fn.expire();
+      await fn();
+
+      expect(factoryCalls).toBe(1);
+      expect(await storage.get("/cache:functions:lazy:k.json")).toBeTruthy();
+    });
+
+    it("standalone helpers reach the default storage via the same options object", async () => {
+      let calls = 0;
+      // No `storage`: this instance builds its own. The helpers can only find it because
+      // the resolved instance is memoized back onto this very object (same mechanism as
+      // the resolved `name`).
+      const opts = { maxAge: 10, name: "standalone-default", getKey: () => "k" };
+      const fn = _defineCachedFunction(() => `v${++calls}`, opts);
+
+      expect(await fn()).toBe("v1");
+      expect(await fn()).toBe("v1");
+
+      await invalidateCache({ options: opts });
+      expect(await fn()).toBe("v2");
+
+      await expireCache({ options: opts });
+      expect(await fn()).toBe("v3");
+
+      // A *different* object — even a structurally identical literal — carries no resolved
+      // storage, so it cannot know which backend to purge. That used to resolve a fresh
+      // empty store and report success while the stale entry kept being served; it throws
+      // instead, so the mistake is impossible to miss.
+      await expect(
+        invalidateCache({ options: { name: "standalone-default", getKey: () => "k" } }),
+      ).rejects.toThrow(/requires `options.storage`/);
+      await expect(
+        expireCache({ options: { name: "standalone-default", getKey: () => "k" } }),
+      ).rejects.toThrow(/requires `options.storage`/);
+      expect(await fn()).toBe("v3");
+    });
+
+    it("does not perturb the integrity hash", async () => {
+      const s1 = createMemoryStorage();
+      const s2 = createMemoryStorage();
+      const fn = () => "value";
+      const key = "/cache:functions:integrity:k.json";
+
+      // Identical in every way except where entries live, and in which *form* the storage
+      // was passed — `serialize` hashes a factory and a ready instance differently, so this
+      // would diverge if `storage` reached the integrity hash.
+      const a = _defineCachedFunction(fn, {
+        maxAge: 10,
+        name: "integrity",
+        getKey: () => "k",
+        storage: s1,
+      });
+      const b = _defineCachedFunction(fn, {
+        maxAge: 10,
+        name: "integrity",
+        getKey: () => "k",
+        storage: () => s2,
+      });
+
+      await a();
+      await b();
+
+      const entryA = (await s1.get(key)) as any;
+      const entryB = (await s2.get(key)) as any;
+      expect(entryA.integrity).toBe(entryB.integrity);
+    });
+
+    it("handler revalidation methods act on the handler's own storage", async () => {
+      const storage = createMemoryStorage();
+      let callCount = 0;
+      const handler = _defineCachedHandler(() => new Response(`call-${++callCount}`), {
+        maxAge: 60,
+        swr: true,
+        staleMaxAge: 60,
+        storage,
+      });
+      const event = () => ({ req: new Request("http://localhost/resource") });
+
+      const r1 = (await handler(event())) as Response;
+      expect(await r1.text()).toBe("call-1");
+
+      // Keys resolve against this handler's own store — and the entry is really there.
+      const keys = await handler.resolveKeys(event());
+      expect(keys).toHaveLength(2); // GET + HEAD variants of the resource
+      expect(await storage.get(keys[0]!)).toBeTruthy();
+
+      await handler.expire(event());
+      expect(await storage.get(keys[0]!)).toMatchObject({ stale: true });
+
+      await handler.invalidate(event());
+      expect(await storage.get(keys[0]!)).toBeNull();
+
+      const r2 = (await handler(event())) as Response;
+      expect(await r2.text()).toBe("call-2");
+    });
+
+    it("handler revalidation resolves the handler's storage once, before the first request", async () => {
+      const storage = createMemoryStorage();
+      let factoryCalls = 0;
+      const handler = _defineCachedHandler(() => new Response("ok"), {
+        maxAge: 60,
+        storage: () => {
+          factoryCalls++;
+          return storage;
+        },
+      });
+      const event = () => ({ req: new Request("http://localhost/cold") });
+
+      // `_variantOptions` spreads one fresh options object per method variant; without
+      // resolving the handler's storage into `_opts` first, each copy would resolve its own
+      // (running the factory once per variant, then again on the first request).
+      await handler.invalidate(event());
+      expect(factoryCalls).toBe(1);
+
+      await handler(event());
+      const keys = await handler.resolveKeys(event());
+      expect(await storage.get(keys[0]!)).toBeTruthy();
+
+      await handler.invalidate(event());
+      expect(await storage.get(keys[0]!)).toBeNull();
+      expect(factoryCalls).toBe(1);
+    });
+
+    it("handler revalidation reaches the handler's own default storage", async () => {
+      let callCount = 0;
+      // No `storage`: the handler owns a private memory storage nobody else can reach, so
+      // its purge methods are the only way in.
+      const handler = _defineCachedHandler(() => new Response(`call-${++callCount}`), {
+        maxAge: 60,
+      });
+      const event = () => ({ req: new Request("http://localhost/default-store") });
+
+      expect(await ((await handler(event())) as Response).text()).toBe("call-1");
+      expect(await ((await handler(event())) as Response).text()).toBe("call-1");
+
+      await handler.invalidate(event());
+      expect(await ((await handler(event())) as Response).text()).toBe("call-2");
+    });
+  });
 });
 
 describe("defineCachedHandler", () => {
@@ -1386,6 +2643,17 @@ describe("defineCachedHandler", () => {
   }
   function uniquePath() {
     return `/test-${++testId}-${Date.now()}`;
+  }
+  // The `HEAD:` component is inserted right after the name segment. That segment is the
+  // resolved handler name (`fn.name` / `anon_<hash>` — see "handler cache key name
+  // resolution (#53)"), not the old shared `_` literal, so match it structurally. `[^:]+` is
+  // exact rather than merely usual: `buildCacheKey` escapes the name, so that segment can
+  // never itself contain a `:` (see "cache key name escaping").
+  function headVariantKey(getKey: string) {
+    const key = getKey.replace(/^(\/cache:handlers:[^:]+:)/, "$1HEAD:");
+    // Guard against the helper silently matching nothing and asserting a no-op.
+    expect(key).not.toBe(getKey);
+    return key;
   }
 
   it("caches GET responses", async () => {
@@ -1487,7 +2755,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
-  it("allows HEAD requests to use cache", async () => {
+  it("allows HEAD requests to use cache (keyed apart from GET)", async () => {
     let callCount = 0;
     const path = uniquePath();
     const handler = defineCachedHandler(
@@ -1499,8 +2767,12 @@ describe("defineCachedHandler", () => {
     );
 
     await handler(makeEvent(path));
+    // A HEAD response is a different representation (a spec-compliant host strips its
+    // body), so it gets its own entry — one origin dispatch per method per TTL.
     await handler(makeEvent(path, { method: "HEAD" }));
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
+    await handler(makeEvent(path, { method: "HEAD" }));
+    expect(callCount).toBe(2);
   });
 
   it("honors a user-supplied shouldBypassCache (issue #50)", async () => {
@@ -1636,7 +2908,7 @@ describe("defineCachedHandler", () => {
     // A storage backend that JSON-serializes entries (like most real ones) — a raw
     // Uint8Array wouldn't survive this, but a base64 string does.
     const inner = createMemoryStorage();
-    setStorage({
+    useTestStorage({
       get: (key) => {
         const raw = inner.get<string>(key) as string | null;
         return raw == null ? null : JSON.parse(raw);
@@ -1690,18 +2962,22 @@ describe("defineCachedHandler", () => {
     });
 
     const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-control")).toContain("s-maxage=60");
-    expect(res.headers.get("cache-control")).toContain("stale-while-revalidate=120");
+    // `max-age` accompanies `s-maxage`: the latter is shared-cache-only, and a private cache
+    // fell back to a heuristic freshness of ≈ 0 (`last-modified` is stamped at fill time).
+    expect(res.headers.get("cache-control")).toBe(
+      "max-age=60, s-maxage=60, stale-while-revalidate=120",
+    );
   });
 
-  it("sets cache-control with SWR without staleMaxAge", async () => {
+  it("sets cache-control with SWR without staleMaxAge, and never a bare stale-while-revalidate", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), { maxAge: 60, swr: true });
 
     const res = (await handler(makeEvent(path))) as Response;
-    const cc = res.headers.get("cache-control")!;
-    expect(cc).toContain("s-maxage=60");
-    expect(cc).toContain("stale-while-revalidate");
+    // The ISR shape. `stale-while-revalidate` needs a delta-seconds (RFC 5861 §3) and this
+    // shape's stale window is unbounded, so nothing is advertised rather than a bare token a
+    // conforming cache must ignore anyway (or an invented number ocache couldn't promise).
+    expect(res.headers.get("cache-control")).toBe("max-age=60, s-maxage=60");
   });
 
   it("sets max-age when swr is false", async () => {
@@ -1792,7 +3068,7 @@ describe("defineCachedHandler", () => {
 
   it("does not write to storage (no redundant eviction) on a no-store miss", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const handler = defineCachedHandler(
       () => new Response("ok", { headers: { "cache-control": "no-store" } }),
@@ -1822,17 +3098,329 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
+  // Response-side Cache-Control is *the* documented way for a handler to opt a response out
+  // of the cache, but only `no-store`/`private` (the two tests above) were ever recognized.
+  // `no-cache` and `max-age=0`/`s-maxage=0` — the commonest ways a developer writes "don't
+  // reuse this" — were stored and replayed while the directive was faithfully echoed to the
+  // client, i.e. the response advertised non-reusability while ocache was already sharing it.
+  describe("response Cache-Control opt-outs", () => {
+    /** Runs the same request twice and reports what the handler and the cache did. */
+    async function twice(cacheControl: string | undefined, opts: any = { maxAge: 10 }) {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: cacheControl ? { "cache-control": cacheControl } : undefined,
+        });
+      }, opts);
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+      return {
+        callCount,
+        first: { body: await r1.text(), status: r1.headers.get("x-cache") },
+        second: { body: await r2.text(), status: r2.headers.get("x-cache") },
+        cacheControl: r2.headers.get("cache-control"),
+      };
+    }
+
+    it("does not cache a response with Cache-Control: no-cache", async () => {
+      const result = await twice("no-cache");
+      // Rejected outright (see the TODO in `_cacheControlForbidsReuse` for the
+      // store-and-always-revalidate alternative): the handler runs on every request.
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      // Still returned to the caller, directive intact.
+      expect(result.second.body).toBe("v2");
+      expect(result.cacheControl).toBe("no-cache");
+    });
+
+    it("does not cache a response with Cache-Control: max-age=0", async () => {
+      const result = await twice("max-age=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.second.body).toBe("v2");
+    });
+
+    it("does not cache a response with Cache-Control: s-maxage=0", async () => {
+      const result = await twice("public, s-maxage=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("does not cache the common no-cache, max-age=0, must-revalidate combination", async () => {
+      const result = await twice("no-cache, max-age=0, must-revalidate");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it('rejects the qualified no-cache="field" form too', async () => {
+      // RFC 9111 §5.2.2.4 scopes the qualified form to the named fields, but ocache replays
+      // a stored response's headers verbatim, so honoring it would mean stripping those
+      // fields on every reuse. Rejecting is the fail-safe reading. Also a parser check: the
+      // comma inside the quoted value must not be read as a directive separator.
+      const result = await twice('no-cache="set-cookie, x-user"');
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("still caches a response with Cache-Control: max-age=600", async () => {
+      const result = await twice("public, max-age=600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+    });
+
+    it("does not read max-age=0600 as a zero lifetime", async () => {
+      // Leading zeros are digits, not octal: `delta-seconds` here is 600. A substring or
+      // prefix match on `max-age=0` would reject this.
+      const result = await twice("public, max-age=0600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("caches max-age=0, s-maxage=600 — s-maxage governs for a shared cache", async () => {
+      // The canonical "browsers revalidate, the shared cache keeps it" idiom. `s-maxage`
+      // overrides `max-age` for a shared cache (RFC 9111 §5.2.2.10) and ocache is one, so
+      // this is a request *to* be stored. Rejecting on the first zero of either directive
+      // refused it outright.
+      const result = await twice("public, max-age=0, s-maxage=600");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+    });
+
+    it("caches s-maxage=600, max-age=0 too — order does not decide it", async () => {
+      const result = await twice("public, s-maxage=600, max-age=0");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("still rejects s-maxage=0, max-age=600 (s-maxage governs both ways)", async () => {
+      // Precedence, not "ignore a zero when the other directive is positive": with
+      // `s-maxage` present it alone decides, so a zero there is an opt-out however large
+      // `max-age` is.
+      const result = await twice("public, s-maxage=0, max-age=600");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("falls back to max-age when s-maxage is malformed", async () => {
+      // An unparseable `delta-seconds` states nothing (RFC 9111 §5.2), so it must not
+      // silently disable the zero-lifetime check by "being present".
+      const result = await twice("public, s-maxage=oops, max-age=0");
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+    });
+
+    it("does not reject on a zero in another directive's value", async () => {
+      const result = await twice("public, max-age=600, stale-while-revalidate=0");
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("caches normally when the response has no Cache-Control at all", async () => {
+      const result = await twice(undefined);
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.second.body).toBe("v1");
+      // ocache synthesizes its own lifetime when the handler didn't set one.
+      expect(result.cacheControl).toBe("max-age=10");
+    });
+
+    it("never stores a response with Vary: * — and never advertises one either", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`v${callCount}`, { headers: { vary: "*" } });
+        },
+        { maxAge: 60, swr: true, staleMaxAge: 600, name: "vary-wildcard" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // `Vary: *` is the strongest "do not share this" signal short of `no-store`: no
+      // stored response may ever match such a request (RFC 9111 §4.1). ocache keeps one
+      // entry per key and does not key on the response's `Vary`, so it must not store it.
+      expect(callCount).toBe(2);
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+      expect(r1.headers.get("vary")).toBe("*");
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(keys[0]!)).toBeNull();
+
+      // And no synthesized lifetime: unlike every other opt-out, a `Vary: *` response
+      // carries no `Cache-Control` of its own, so the "don't clobber the handler's header"
+      // check does not suppress synthesis here — the gate has to name `Vary: *` itself.
+      // Without that it shipped `s-maxage=60, stale-while-revalidate=600` for a response the
+      // origin was going to be asked for every single time.
+      expect(r1.headers.get("cache-control")).toBeNull();
+      expect(r2.headers.get("cache-control")).toBeNull();
+    });
+
+    it.each(["no-store", "private", "no-cache"])(
+      "does not synthesize a lifetime alongside an explicit %s",
+      async (directive) => {
+        // The other `validate` rejections need no gate of their own precisely because they
+        // are spelled in a `Cache-Control` the handler set — and we never clobber one, so
+        // synthesis is already suppressed. This locks that reasoning in: if the
+        // "preserve if present" rule ever changed, these would start advertising
+        // `s-maxage`/`stale-while-revalidate` for responses that are never stored.
+        const result = await twice(directive, { maxAge: 60, swr: true, staleMaxAge: 600 });
+        expect(result.callCount).toBe(2);
+        expect(result.second.status).toBe("MISS");
+        expect(result.cacheControl).toBe(directive);
+      },
+    );
+
+    it("stores a response with Cache-Control: must-revalidate (not an opt-out)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        { maxAge: 10, swr: true, staleMaxAge: 600, name: "must-revalidate-store" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // `must-revalidate` constrains *stale* serving, not storage — a fresh entry is a
+      // normal HIT.
+      expect(await r1.text()).toBe("v1");
+      expect(await r2.text()).toBe("v1");
+      expect(callCount).toBe(1);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+
+      // Expressed as a per-entry `staleMaxAge: 0` (the mechanism that disables the SWR
+      // window for this entry alone), persisted alongside the value.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      const entry = (await testStorage.get(keys[0]!)) as any;
+      expect(entry.staleMaxAge).toBe(0);
+      expect(entry.value.body).toBe("v1");
+    });
+
+    it("never serves a stale must-revalidate entry, revalidating in the foreground", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          // A slow resolver: under SWR a stale entry would be returned immediately (as the
+          // sibling test below shows), so a fresh body here proves the foreground path.
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        { maxAge: 0.02, swr: true, staleMaxAge: 10, name: "must-revalidate-stale" },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(await r1.text()).toBe("v1");
+      expect(callCount).toBe(1);
+
+      // Past maxAge but well inside the configured 10s stale window.
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(callCount).toBe(2);
+      // The caller waited for the revalidated response instead of getting the stale one.
+      expect(await r2.text()).toBe("v2");
+      expect(r2.headers.get("x-cache")).not.toBe("STALE");
+    });
+
+    it("enforces must-revalidate even when the caller's getMaxAge throws", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const onError = vi.fn();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60, must-revalidate" },
+          });
+        },
+        {
+          maxAge: 0.02,
+          swr: true,
+          staleMaxAge: 10,
+          name: "must-revalidate-throwing-getmaxage",
+          getMaxAge: () => {
+            throw new Error("boom");
+          },
+          onError,
+        },
+      );
+
+      expect(await ((await handler(makeEvent(path))) as Response).text()).toBe("v1");
+
+      // ocache's own `staleMaxAge: 0` is computed independently of the caller's hook. With
+      // the caller's call awaited unguarded, `cache.ts` caught the throw and left *both*
+      // values undefined, taking the `must-revalidate` override down with it.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(((await testStorage.get(keys[0]!)) as any).staleMaxAge).toBe(0);
+
+      // Reported, not swallowed — through the same `onError` channel `cache.ts` uses for
+      // this hook, and exactly once.
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError.mock.calls[0]![0]).toBeInstanceOf(Error);
+
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r2.text()).toBe("v2");
+      expect(r2.headers.get("x-cache")).not.toBe("STALE");
+    });
+
+    it("serves stale within the window without must-revalidate (contrast)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        async () => {
+          callCount++;
+          await new Promise((r) => setTimeout(r, 5));
+          return new Response(`v${callCount}`, {
+            headers: { "cache-control": "public, max-age=60" },
+          });
+        },
+        { maxAge: 0.02, swr: true, staleMaxAge: 10, name: "no-must-revalidate-stale" },
+      );
+
+      expect(await ((await handler(makeEvent(path))) as Response).text()).toBe("v1");
+
+      await new Promise((r) => setTimeout(r, 30));
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      // Same setup minus `must-revalidate`: the stale body is served immediately while the
+      // refresh runs in the background.
+      expect(await r2.text()).toBe("v1");
+      expect(r2.headers.get("x-cache")).toBe("STALE");
+    });
+  });
+
   it("does not cache responses rejected by shouldCache", async () => {
     let callCount = 0;
     const path = uniquePath();
     const handler = defineCachedHandler(
       () => {
         callCount++;
-        // A 3xx redirect passes the built-in checks (status < 400) but the caller
-        // wants to keep it out of the cache.
-        return new Response("", { status: 302, headers: { location: "/elsewhere" } });
+        // A permanent redirect passes the built-in checks (301 is on the cacheable-status
+        // allowlist) but the caller wants redirects kept out of the cache. Deliberately
+        // *not* a 302 — the built-ins reject that one themselves now, which would leave
+        // this test passing without ever consulting `shouldCache`.
+        return new Response("", { status: 301, headers: { location: "/elsewhere" } });
       },
-      { maxAge: 10, shouldCache: (res) => res.status < 300 || res.status >= 400 },
+      { maxAge: 10, shouldCache: (res) => res.status < 300 },
     );
 
     await handler(makeEvent(path));
@@ -1931,7 +3519,7 @@ describe("defineCachedHandler", () => {
   // check (which runs before the status/body guards).
   it("degrades to a miss on a corrupt cache entry with no headers", async () => {
     let callCount = 0;
-    setStorage({
+    useTestStorage({
       get: () => ({ value: { status: 200 } }) as any,
       set: () => {},
     });
@@ -2191,65 +3779,265 @@ describe("defineCachedHandler", () => {
     expect(res.headers.get("vary")).toBe("User-Agent, *");
   });
 
-  it("emits a Cache-Tag header from the opt-in tags option", async () => {
-    const path = uniquePath();
-    const handler = defineCachedHandler(() => new Response("ok"), {
-      maxAge: 10,
-      tags: ["products", "product:123"],
+  describe("cache tags", () => {
+    it("emits Cache-Tag from the tags option", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => new Response("ok"), {
+        maxAge: 10,
+        tags: ["products", "product:123"],
+      });
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.headers.get("cache-tag")).toBe("products, product:123");
     });
 
-    const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-tag")).toBe("products, product:123");
-  });
+    it("emits no Cache-Tag without the tags option", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => new Response("ok"), { maxAge: 10 });
 
-  it("does not set Cache-Tag when the tags option is omitted", async () => {
-    const path = uniquePath();
-    const handler = defineCachedHandler(() => new Response("ok"), { maxAge: 10 });
-
-    const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-tag")).toBeNull();
-  });
-
-  it("does not set Cache-Tag for an empty or whitespace-only tags list", async () => {
-    const path = uniquePath();
-    const handler = defineCachedHandler(() => new Response("ok"), {
-      maxAge: 10,
-      tags: ["", "  ", "product:123", "  ", ""],
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.headers.get("cache-tag")).toBeNull();
     });
 
-    // Blank/whitespace entries are trimmed + deduped out; only the real tag survives.
-    const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-tag")).toBe("product:123");
-  });
+    it("trims and deduplicates tags", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => new Response("ok"), {
+        maxAge: 10,
+        tags: ["", "  ", " products ", "products", "product:123"],
+      });
 
-  it("does not overwrite an explicit Cache-Tag set by the handler", async () => {
-    const path = uniquePath();
-    const handler = defineCachedHandler(
-      () =>
-        new Response("ok", {
-          headers: { "cache-tag": "handler-tag" },
-        }),
-      { maxAge: 10, tags: ["products", "product:123"] },
-    );
-
-    const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-tag")).toBe("handler-tag");
-  });
-
-  it("replays the Cache-Tag on a cache hit (stored, not re-synthesized)", async () => {
-    const path = uniquePath();
-    const handler = defineCachedHandler(() => new Response("ok"), {
-      maxAge: 10,
-      tags: ["products", "product:123"],
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.headers.get("cache-tag")).toBe("products, product:123");
     });
 
-    const r1 = (await handler(makeEvent(path))) as Response;
-    const r2 = (await handler(makeEvent(path))) as Response;
+    it("emits no Cache-Tag for a whitespace-only list", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => new Response("ok"), {
+        maxAge: 10,
+        tags: ["", "  "],
+      });
 
-    // Both the miss and the hit carry the tag — it was persisted in the
-    // serialized entry, not re-derived (handler runs once).
-    expect(r1.headers.get("cache-tag")).toBe("products, product:123");
-    expect(r2.headers.get("cache-tag")).toBe("products, product:123");
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.headers.get("cache-tag")).toBeNull();
+    });
+
+    it("keeps a handler Cache-Tag header", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => new Response("ok", { headers: { "cache-tag": "handler-tag" } }),
+        { maxAge: 10, tags: ["products", "product:123"] },
+      );
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.headers.get("cache-tag")).toBe("handler-tag");
+    });
+
+    it("replays the stored Cache-Tag on a hit", async () => {
+      const path = uniquePath();
+      let callCount = 0;
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("ok");
+        },
+        { maxAge: 10, tags: ["products", "product:123"] },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(callCount).toBe(1);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+      expect(r1.headers.get("cache-tag")).toBe("products, product:123");
+      expect(r2.headers.get("cache-tag")).toBe("products, product:123");
+    });
+
+    it("emits no Cache-Tag for a bypassed request", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => new Response("ok"), {
+        maxAge: 10,
+        tags: ["products"],
+      });
+
+      const res = (await handler(makeEvent(path, { method: "POST" }))) as Response;
+      expect(res.headers.get("cache-tag")).toBeNull();
+    });
+  });
+
+  describe("handler-declared Vary", () => {
+    /**
+     * ocache *writes* `Vary` but keys only on `varies`/`allowCookies`, so a handler that
+     * declares a header ocache doesn't key on used to get one entry served to every value of
+     * it — while that very `Vary` was attached for downstream caches to propagate. The
+     * fail-closed fix: refuse the entry, and refuse to advertise a lifetime for it.
+     */
+    async function twice(
+      responseVary: string | undefined,
+      opts: any,
+      reqHeaders: (i: number) => Record<string, string> = () => ({}),
+    ) {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(() => {
+        callCount++;
+        return new Response(`v${callCount}`, {
+          headers: responseVary ? { vary: responseVary } : undefined,
+        });
+      }, opts);
+
+      const r1 = (await handler(makeEvent(path, { headers: reqHeaders(1) }))) as Response;
+      const r2 = (await handler(makeEvent(path, { headers: reqHeaders(2) }))) as Response;
+      return {
+        callCount,
+        first: { body: await r1.text(), status: r1.headers.get("x-cache") },
+        second: { body: await r2.text(), status: r2.headers.get("x-cache") },
+        cacheControl: r1.headers.get("cache-control"),
+        vary: r1.headers.get("vary"),
+      };
+    }
+
+    it("never stores a response whose Vary names an unkeyed header", async () => {
+      const result = await twice("Accept-Language", { maxAge: 60 });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.second.body).toBe("v2");
+      // Still returned to the caller, its own `Vary` intact.
+      expect(result.vary).toBe("Accept-Language");
+    });
+
+    it("re-runs the handler per request when it declares Vary: Accept-Language", async () => {
+      // The finding's exact scenario: `en` rendered, then `de` got `x-cache: HIT` with the
+      // English body. Failing closed costs the hit rate on this (misconfigured) route and
+      // gives every request its own resolution again.
+      //
+      // The route is misconfigured in *both* directions — the handler varies on a header the
+      // cache was never told about — so narrowing now hides `accept-language` too and both
+      // callers get the default rendering. Declaring `varies: ["accept-language"]` fixes both
+      // halves at once: the header reaches the handler, keys the entry and is advertised.
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        (event) => {
+          callCount++;
+          return new Response(`lang=${event.req.headers.get("accept-language") ?? "none"}`, {
+            headers: { vary: "Accept-Language" },
+          });
+        },
+        { maxAge: 60, name: "handler-vary-lang" },
+      );
+
+      const en = (await handler(
+        makeEvent(path, { headers: { "accept-language": "en" } }),
+      )) as Response;
+      const de = (await handler(
+        makeEvent(path, { headers: { "accept-language": "de" } }),
+      )) as Response;
+
+      expect(await en.text()).toBe("lang=none");
+      expect(await de.text()).toBe("lang=none");
+      // The finding's invariant, unchanged: the second caller is served the handler, not a
+      // stored entry — so a route that *does* vary its rendering can never leak across it.
+      expect(de.headers.get("x-cache")).toBe("MISS");
+      expect(callCount).toBe(2);
+      // And nothing under the key either variant reads.
+      const keys = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(keys[0]!)).toBeNull();
+    });
+
+    it("never advertises a lifetime for a response whose Vary is unkeyed", async () => {
+      // The gate, and the reason it is needed: unlike the `Cache-Control` opt-outs, a
+      // handler declaring `Vary: Accept-Language` sets no `Cache-Control` of its own, so
+      // the "don't clobber the handler's header" check does not suppress synthesis. Without
+      // this the response was refused storage — origin takes every request — while being
+      // advertised `s-maxage=60, stale-while-revalidate=600` to every shared cache.
+      const result = await twice("Accept-Language", { maxAge: 60, swr: true, staleMaxAge: 600 });
+
+      expect(result.callCount).toBe(2);
+      expect(result.cacheControl).toBeNull();
+    });
+
+    it("caches normally when the handler's Vary is a subset of the advertised names", async () => {
+      const result = await twice("Accept-Language", {
+        maxAge: 60,
+        varies: ["accept-language"],
+      });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.cacheControl).toBe("max-age=60");
+      // Merged, not duplicated: the handler's casing wins, ours is deduped away.
+      expect(result.vary).toBe("Accept-Language");
+    });
+
+    it("caches a handler-declared Vary: Cookie under allowCookies", async () => {
+      // The two-list distinction: `allowCookies` drops `cookie` from `keyHeaderNames` (the
+      // key carries the finer allowlisted subset) but keeps it in `varyHeaderNames`, which
+      // is what this check reads — so the response is keyed at least as finely as it claims.
+      const result = await twice("Cookie", { maxAge: 60, allowCookies: ["theme"] }, () => ({
+        cookie: "theme=dark",
+      }));
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.vary).toBe("Cookie");
+    });
+
+    it.each([
+      "accept-language",
+      "ACCEPT-LANGUAGE",
+      "  Accept-Language  ",
+      "accept-language,x-custom",
+      "Accept-Language , X-Custom",
+      "accept-language, x-custom,",
+    ])("matches %o case-insensitively and whitespace-tolerantly", async (responseVary) => {
+      const result = await twice(responseVary, {
+        maxAge: 60,
+        varies: ["accept-language", "x-custom"],
+      });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
+
+    it("rejects a Vary that mixes keyed and unkeyed names", async () => {
+      const result = await twice("Accept-Language, User-Agent", {
+        maxAge: 60,
+        varies: ["accept-language"],
+      });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.cacheControl).toBeNull();
+    });
+
+    it("still rejects Vary: * — a different verdict on the same header", async () => {
+      // Unchanged guard (landed with the `Cache-Control` opt-outs). `hasUnkeyedVary`
+      // deliberately skips the `*` token, so this is `hasVaryWildcard` alone.
+      const result = await twice("*", { maxAge: 60, varies: ["accept-language"] });
+
+      expect(result.callCount).toBe(2);
+      expect(result.second.status).toBe("MISS");
+      expect(result.cacheControl).toBeNull();
+      expect(result.vary).toBe("*");
+    });
+
+    it("caches normally when the handler declares no Vary at all", async () => {
+      const result = await twice(undefined, { maxAge: 60 });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+      expect(result.cacheControl).toBe("max-age=60");
+      expect(result.vary).toBeNull();
+    });
+
+    it("caches an empty Vary header", async () => {
+      // Nothing is named, so nothing is unkeyed — an empty list must not fail closed.
+      const result = await twice(" , ", { maxAge: 60 });
+
+      expect(result.callCount).toBe(1);
+      expect(result.second.status).toBe("HIT");
+    });
   });
 
   it("echoes the Vary header on a 304 response", async () => {
@@ -2349,6 +4137,200 @@ describe("defineCachedHandler", () => {
     await handler(makeEvent(`${path}?color=red&lang=de&_=123`));
 
     expect(seen).toEqual(["?color=red"]);
+  });
+
+  // The request authority (scheme/host/port) is part of the resource identity. One handler
+  // instance serving several hostnames — the normal vhost deployment — used to store one
+  // entry per path across all of them (tenant A's rendering served to tenant B, and an
+  // attacker-supplied Host reaching a rendered absolute URL published under the shared key).
+  describe("request authority in the cache key", () => {
+    const originEvent = (origin: string, path: string, opts?: RequestInit) => ({
+      req: new Request(`${origin}${path}`, opts),
+    });
+
+    it("keys two hosts apart on one handler instance", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://shop.example.com", path))) as Response;
+      const r2 = (await handler(originEvent("http://evil.attacker.test", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(r1.headers.get("x-cache")).toBe("MISS");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://shop.example.com", path));
+      const [k2] = await handler.resolveKeys(originEvent("http://evil.attacker.test", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("keys two schemes apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://a.example", path))) as Response;
+      const r2 = (await handler(originEvent("https://a.example", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://a.example", path));
+      const [k2] = await handler.resolveKeys(originEvent("https://a.example", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("keys two ports apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(originEvent("http://a.example:8080", path))) as Response;
+      const r2 = (await handler(originEvent("http://a.example:9090", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+
+      const [k1] = await handler.resolveKeys(originEvent("http://a.example:8080", path));
+      const [k2] = await handler.resolveKeys(originEvent("http://a.example:9090", path));
+      expect(k1).not.toBe(k2);
+    });
+
+    it("never serves one host's rendered absolute URL to another", async () => {
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        (event) => {
+          const url = event.url ?? new URL(event.req.url);
+          return new Response(`<link rel="canonical" href="${url.origin}${url.pathname}">`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://evil.attacker.test", path));
+      const victim = (await handler(originEvent("http://shop.example.com", path))) as Response;
+
+      const body = await victim.text();
+      expect(body).toBe(`<link rel="canonical" href="http://shop.example.com${path}">`);
+      expect(body).not.toContain("evil.attacker.test");
+    });
+
+    it("still HITs for the same origin and path", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://a.example", path));
+      const r2 = (await handler(originEvent("http://a.example", path))) as Response;
+
+      expect(callCount).toBe(1);
+      expect(await r2.text()).toBe("call-1");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    it("normalizes the default port (http://h:80 is http://h)", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      await handler(originEvent("http://a.example", path));
+      const r2 = (await handler(originEvent("http://a.example:80", path))) as Response;
+
+      expect(callCount).toBe(1);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    // An opaque origin (`URL.origin === "null"`) still carries a real authority for every
+    // non-special scheme, so the key falls back to `protocol//host` rather than collapsing
+    // every such request onto one shared "null" bucket.
+    it("keys opaque-origin authorities apart", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10 },
+      );
+
+      expect(new URL(`x-proxy://a.example${path}`).origin).toBe("null");
+
+      const r1 = (await handler(originEvent("x-proxy://a.example", path))) as Response;
+      const r2 = (await handler(originEvent("x-proxy://b.example", path))) as Response;
+      const r3 = (await handler(originEvent("x-proxy://a.example", path))) as Response;
+
+      expect(callCount).toBe(2);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-2");
+      expect(await r3.text()).toBe("call-1");
+    });
+
+    it("still narrows the search component by allowQuery within one origin", async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(`call-${callCount}`);
+        },
+        { maxAge: 10, allowQuery: ["color"] },
+      );
+
+      const r1 = (await handler(
+        originEvent("http://a.example", `${path}?color=red&lang=en`),
+      )) as Response;
+      const r2 = (await handler(
+        originEvent("http://a.example", `${path}?color=red&lang=de&_=1`),
+      )) as Response;
+      const r3 = (await handler(originEvent("http://a.example", `${path}?color=blue`))) as Response;
+      // ...but the narrowed search is still scoped to one authority.
+      const r4 = (await handler(
+        originEvent("http://b.example", `${path}?color=red&lang=en`),
+      )) as Response;
+
+      expect(callCount).toBe(3);
+      expect(await r1.text()).toBe("call-1");
+      expect(await r2.text()).toBe("call-1");
+      expect(await r3.text()).toBe("call-2");
+      expect(await r4.text()).toBe("call-3");
+    });
   });
 
   it("by default strips the Cookie header before the handler and never varies the key", async () => {
@@ -2472,7 +4454,7 @@ describe("defineCachedHandler", () => {
     expect(b.headers.get("set-cookie")).toBeNull();
   });
 
-  it("keeps allowlisted Set-Cookies and strips the rest, caching the result", async () => {
+  it("strips an allowlisted Set-Cookie too, and still caches the rest", async () => {
     let allowedCalls = 0;
     const allowedPath = uniquePath();
     const allowedHandler = defineCachedHandler(
@@ -2487,9 +4469,12 @@ describe("defineCachedHandler", () => {
 
     const a1 = (await allowedHandler(makeEvent(allowedPath))) as Response;
     await allowedHandler(makeEvent(allowedPath));
-    // Allowlisted cookie -> kept and cached, second request is a hit.
+    // `allowCookies` governs the request side only: even its own names never survive as
+    // Set-Cookie — not on the stored entry and not on the direct caller's MISS response.
+    // The rest of the response is still cached, so the second request is a hit.
     expect(allowedCalls).toBe(1);
-    expect(a1.headers.get("set-cookie")).toBe("theme=dark; Path=/");
+    expect(a1.headers.get("set-cookie")).toBeNull();
+    expect(await a1.text()).toBe("call-1");
 
     let mixedCalls = 0;
     const mixedPath = uniquePath();
@@ -2506,16 +4491,140 @@ describe("defineCachedHandler", () => {
 
     const m1 = (await mixedHandler(makeEvent(mixedPath))) as Response;
     await mixedHandler(makeEvent(mixedPath));
-    // The non-allowlisted `sid` is stripped; the allowed `theme` remains, so the
-    // response is cached and the second request is a hit.
+    // Both cookies go — the allowlisted `theme` alongside the unlisted `sid`.
     expect(mixedCalls).toBe(1);
-    expect(m1.headers.getSetCookie()).toEqual(["theme=dark"]);
+    expect(m1.headers.getSetCookie()).toEqual([]);
   });
 
-  it("strips Set-Cookie conservatively on runtimes without getSetCookie", async () => {
-    // Simulate an environment whose Headers lacks getSetCookie (older Node / polyfills):
-    // the guard can't enumerate individual cookies, so it must strip every Set-Cookie
-    // (fail safe) rather than risk replaying one.
+  it("never replays an allowlisted Set-Cookie to a later caller (h3#1524 audit, #15c)", async () => {
+    // The session-fixation repro. The handler mints a session id on every call and
+    // `sid` is allowlisted, so it used to be stored on the entry: the first visitor
+    // (no `sid` cookie) seeded the *no-sid* key with `Set-Cookie: sid=s1`, and every
+    // subsequent first-time visitor — same key, since they also have no `sid` — was
+    // served that same `sid=s1` on a HIT. Measured as `MISS sid=s1 / HIT sid=s1`.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const existing = event.req.headers.get("cookie");
+        return new Response(existing ?? "anonymous", {
+          headers: { "set-cookie": `sid=s${callCount}; Path=/; HttpOnly` },
+        });
+      },
+      { maxAge: 10, swr: false, allowCookies: ["sid"] },
+    );
+
+    // Visitor A: no cookie yet -> MISS.
+    const a = (await handler(makeEvent(path))) as Response;
+    // Visitor B: also no cookie, so the very same cache key -> HIT.
+    const b = (await handler(makeEvent(path))) as Response;
+
+    expect(callCount).toBe(1);
+    expect(a.headers.get("set-cookie")).toBeNull();
+    expect(b.headers.get("set-cookie")).toBeNull();
+    // And nothing was stored that a later hit could replay.
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const stored = (await testStorage.get(key!)) as { value: { headers: Record<string, string> } };
+    expect(stored.value.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("allowCookies still keys on and forwards the cookie it no longer returns", async () => {
+    // The two directions are decoupled: the allowlisted cookie is fully live on the
+    // request side (visible to the handler, part of the key) while its Set-Cookie
+    // counterpart is unconditionally dropped.
+    const seen: (string | null)[] = [];
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`, {
+          headers: { "set-cookie": "theme=dark; Path=/" },
+        });
+      },
+      { maxAge: 10, swr: false, allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=secret; theme=dark" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light" } }),
+    )) as Response;
+    const darkAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=other" } }),
+    )) as Response;
+
+    // Request side, unchanged: only `theme` reaches the handler, and it varies the key.
+    expect(seen).toEqual(["theme=dark", "theme=light"]);
+    expect(callCount).toBe(2);
+    expect(await darkAgain.text()).toBe("call-1");
+    // Response side: no Set-Cookie, on the misses or the hit.
+    expect(dark.headers.get("set-cookie")).toBeNull();
+    expect(light.headers.get("set-cookie")).toBeNull();
+    expect(darkAgain.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("passes Set-Cookie through untouched on a bypassed (non-GET/HEAD) request", async () => {
+    // The documented escape hatch: mint per-request cookies from a route that never
+    // reaches the cache. A bypassed call skips `serialize` entirely, so the handler's
+    // live Response — Set-Cookie included — is returned as-is.
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        const headers = new Headers();
+        headers.append("set-cookie", "sid=minted; Path=/; HttpOnly");
+        headers.append("set-cookie", "csrf=token");
+        return new Response("ok", { headers });
+      },
+      { maxAge: 10, allowCookies: ["theme"] },
+    );
+
+    const res = (await handler(makeEvent(path, { method: "POST" }))) as Response;
+
+    expect(res.headers.getSetCookie()).toEqual(["sid=minted; Path=/; HttpOnly", "csrf=token"]);
+  });
+
+  it("rejects a stored entry carrying a Set-Cookie (defense-in-depth)", async () => {
+    // Entries written before the unconditional strip existed (e.g. by an older ocache
+    // that kept allowlisted cookies on the response), or by another writer sharing the
+    // storage, must not be replayed until expiry — `validate` rejects any stored
+    // Set-Cookie, allowlist or no allowlist.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, swr: false, allowCookies: ["theme"] },
+    );
+
+    // Seed a genuine entry (correct integrity/key), then poison it in place.
+    await handler(makeEvent(path));
+    expect(callCount).toBe(1);
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const stored = (await testStorage.get(key!)) as {
+      value: { headers: Record<string, string> };
+    };
+    stored.value.headers["set-cookie"] = "theme=dark; Path=/";
+    await testStorage.set(key!, stored);
+
+    const res = (await handler(makeEvent(path))) as Response;
+
+    // The poisoned entry is refused, so the handler runs again and its cookie-free
+    // response is served instead.
+    expect(callCount).toBe(2);
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(await res.text()).toBe("call-2");
+  });
+
+  it("strips Set-Cookie on runtimes without getSetCookie", async () => {
+    // Simulate an environment whose Headers lacks getSetCookie (older Node / polyfills).
+    // The strip is a bare `headers.delete("set-cookie")`, which drops every value
+    // everywhere, so it must not depend on being able to enumerate cookies individually.
     const original = Object.getOwnPropertyDescriptor(Headers.prototype, "getSetCookie");
     // @ts-expect-error - deliberately removing the method for this test
     delete Headers.prototype.getSetCookie;
@@ -2575,6 +4684,258 @@ describe("defineCachedHandler", () => {
     expect(seen).toEqual(["theme=dark"]);
   });
 
+  it("advertises Vary: cookie when allowCookies is set", async () => {
+    // `allowCookies` keys on a hash of the allowlisted *subset* rather than on the raw
+    // header, so `cookie` is dropped from the key list — but the response still varies by
+    // the `Cookie` request header, which is the only granularity a downstream cache
+    // understands. Without the advertisement a CDN stores one visitor's variant and serves
+    // it to everyone under the `s-maxage` we synthesize.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 60, swr: true, allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light; sid=2" } }),
+    )) as Response;
+    const darkAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=3; theme=dark" } }),
+    )) as Response;
+
+    // The advertisement ...
+    expect(dark.headers.get("vary")).toBe("cookie");
+    expect(light.headers.get("vary")).toBe("cookie");
+    // ... accompanies a shared-cacheability claim, which is exactly why it must be there.
+    expect(dark.headers.get("cache-control")).toBe("max-age=60, s-maxage=60");
+    // ... and it is true: two `theme` values are two entries, while the unlisted `sid`
+    // still doesn't split them (key composition unchanged).
+    expect(callCount).toBe(2);
+    expect(await dark.text()).toBe("call-1");
+    expect(await light.text()).toBe("call-2");
+    expect(await darkAgain.text()).toBe("call-1");
+  });
+
+  it("advertises Vary: cookie exactly once for varies: ['cookie'] + allowCookies", async () => {
+    // The allowlist supersedes the coarse `varies` entry for *keying* only; the caller's
+    // explicit `varies: ["cookie"]` must not silently lose its `Vary`, and must not be
+    // duplicated by the allowlist adding the same name back.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"], allowCookies: ["theme"] },
+    );
+
+    const r1 = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const r2 = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=2" } }),
+    )) as Response;
+
+    expect(r1.headers.get("vary")).toBe("cookie");
+    expect(r2.headers.get("vary")).toBe("cookie");
+    // Still keyed by the allowlisted subset, never the raw header: `sid` doesn't split.
+    expect(callCount).toBe(1);
+    expect(await r2.text()).toBe("call-1");
+  });
+
+  it("advertises Vary: cookie for varies: ['cookie'] without an allowlist", async () => {
+    // Regression guard for the unchanged half: with no `allowCookies`, `cookie` is in both
+    // lists and the raw header keys the entry.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"] },
+    );
+
+    const r1 = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    const r2 = (await handler(makeEvent(path, { headers: { cookie: "sid=2" } }))) as Response;
+
+    expect(r1.headers.get("vary")).toBe("cookie");
+    expect(callCount).toBe(2);
+    expect(await r2.text()).toBe("call-2");
+  });
+
+  it("forwards the raw Cookie header to the handler for varies: ['cookie'] (coarse opt-in)", async () => {
+    // `varies: ["cookie"]` without an allowlist is a coarse opt-in, symmetric with
+    // `varies: ["authorization"]` == `allowAuthorization: true`: the raw header composes the
+    // key, so the handler may read it. It used to be hashed into the key *and* stripped from
+    // the request, so every per-cookie entry held the identical cookie-less default
+    // rendering — pure fragmentation, and a contradiction of the documented "`varies`
+    // headers are forwarded to the handler" rule.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const cookie = event.req.headers.get("cookie");
+        seen.push(cookie);
+        return new Response(`call-${callCount}:${cookie}`);
+      },
+      { maxAge: 10, varies: ["cookie"] },
+    );
+
+    const a = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=1; theme=dark" } }),
+    )) as Response;
+    const b = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=2; theme=light" } }),
+    )) as Response;
+    const aAgain = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=1; theme=dark" } }),
+    )) as Response;
+
+    // The handler sees the full raw header, unfiltered — this is the bug: it used to see
+    // nothing at all.
+    expect(seen).toEqual(["sid=1; theme=dark", "sid=2; theme=light"]);
+    // Two distinct headers -> two entries AND two distinct renderings.
+    expect(callCount).toBe(2);
+    expect(await a.text()).toBe("call-1:sid=1; theme=dark");
+    expect(await b.text()).toBe("call-2:sid=2; theme=light");
+    // The same header again is a hit.
+    expect(await aAgain.text()).toBe("call-1:sid=1; theme=dark");
+    // And the response advertises the dimension it varies on.
+    expect(a.headers.get("vary")).toBe("cookie");
+  });
+
+  it("derives the same key from an already-served event under varies: ['cookie'] (no drift)", async () => {
+    // The documented issue-#71 pattern: serve, then purge with the very same event.
+    // Narrowing mutates `event.req`, so while the Cookie header was stripped from the
+    // handler-visible request but still hashed into the key, re-deriving the key from the
+    // served event produced the *no-cookie* key — a different one than the entry had just
+    // been written under, so the purge silently hit nothing and the stale entry kept being
+    // served for the rest of the TTL.
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, swr: false, varies: ["cookie"] },
+    );
+
+    const event = makeEvent(path, { headers: { cookie: "sid=1" } });
+    await handler(event);
+    expect(callCount).toBe(1);
+
+    // Re-derived AFTER the event was served: still the key the entry lives under.
+    const [key] = await handler.resolveKeys(event);
+    expect(await testStorage.get(key!)).toBeDefined();
+
+    await handler.invalidate(event);
+
+    expect(await testStorage.get(key!)).toBeNull();
+    // ... so the next request for that cookie is a genuine miss.
+    const res = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    expect(callCount).toBe(2);
+    expect(await res.text()).toBe("call-2");
+  });
+
+  it("allowCookies supersedes varies: ['cookie'] for handler visibility too", async () => {
+    // The allowlist is the finer form and stays in charge in both directions: unlisted
+    // cookies neither vary the key nor reach the handler, even with the coarse
+    // `varies: ["cookie"]` opt-in also set.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10, varies: ["cookie"], allowCookies: ["theme"] },
+    );
+
+    const dark = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark; sid=1" } }),
+    )) as Response;
+    const darkOtherSid = (await handler(
+      makeEvent(path, { headers: { cookie: "sid=2; theme=dark" } }),
+    )) as Response;
+    const light = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=light; sid=3" } }),
+    )) as Response;
+
+    // Only `theme` is forwarded — the raw header never reaches the handler.
+    expect(seen).toEqual(["theme=dark", "theme=light"]);
+    // ... and only `theme` varies the key: the differing `sid` doesn't split the entry.
+    expect(callCount).toBe(2);
+    expect(await dark.text()).toBe("call-1");
+    expect(await darkOtherSid.text()).toBe("call-1");
+    expect(await light.text()).toBe("call-2");
+  });
+
+  it("keeps cookies out of caching entirely with neither varies: ['cookie'] nor allowCookies", async () => {
+    // The untouched secure default: no cookie in the key, none visible to the handler, and
+    // nothing advertised downstream.
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push(event.req.headers.get("cookie"));
+        return new Response(`call-${callCount}`);
+      },
+      { maxAge: 10 },
+    );
+
+    const r1 = (await handler(makeEvent(path, { headers: { cookie: "sid=1" } }))) as Response;
+    const r2 = (await handler(makeEvent(path, { headers: { cookie: "sid=2" } }))) as Response;
+
+    expect(seen).toEqual([null]);
+    expect(callCount).toBe(1);
+    expect(await r2.text()).toBe("call-1");
+    expect(r1.headers.get("vary")).toBeNull();
+    expect(r2.headers.get("vary")).toBeNull();
+  });
+
+  it("advertises the credential headers alongside cookie when both are opted into", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 10,
+      allowCookies: ["theme"],
+      allowAuthorization: true,
+    });
+
+    const res = (await handler(
+      makeEvent(path, { headers: { cookie: "theme=dark", authorization: "Bearer t" } }),
+    )) as Response;
+
+    expect(res.headers.get("vary")).toBe("authorization, cookie, proxy-authorization");
+  });
+
+  it("merges Vary: cookie into a handler-set Vary without clobbering it", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => new Response("ok", { headers: { vary: "User-Agent" } }),
+      { maxAge: 10, allowCookies: ["theme"] },
+    );
+
+    const res = (await handler(makeEvent(path, { headers: { cookie: "theme=dark" } }))) as Response;
+
+    expect(res.headers.get("vary")).toBe("User-Agent, cookie");
+  });
+
   it("does not narrow requests that bypass caching (non-GET/HEAD)", async () => {
     const seen: Array<{ cookie: string | null; varied: string | null; url: string; body: string }> =
       [];
@@ -2614,10 +4975,563 @@ describe("defineCachedHandler", () => {
     ]);
   });
 
+  // --- Narrowing is gated on the *composed* bypass (finding 09) ---
+  //
+  // Narrowing used to consult the built-in method/Range check alone, so a GET the caller
+  // excluded via `shouldBypassCache` still reached the handler stripped — breaking the one
+  // escape hatch the credential defaults document ("set `allowAuthorization`, or bypass
+  // those requests"): the handler served the anonymous page to every authenticated user.
+
+  /** The finding's fixture: bypass on `Authorization`, narrow the query to `page`. */
+  function bypassOnAuth(seen: Array<Record<string, string | null>>) {
+    return defineCachedHandler(
+      (event) => {
+        seen.push({
+          auth: event.req.headers.get("authorization"),
+          cookie: event.req.headers.get("cookie"),
+          url: event.req.url,
+        });
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        allowQuery: ["page"],
+        shouldBypassCache: (event) => event.req.headers.has("authorization"),
+      },
+    );
+  }
+
+  it("does not narrow a request the caller's shouldBypassCache excluded (finding 09)", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = bypassOnAuth(seen);
+
+    await handler(
+      makeEvent(`${path}?page=2&token=abc`, {
+        headers: { authorization: "Bearer t0ken", cookie: "sid=s1" },
+      }),
+    );
+
+    // Excluded from the cache, so it is never keyed: credentials and the full query must
+    // arrive intact, exactly as they do for a POST.
+    expect(seen).toEqual([
+      {
+        auth: "Bearer t0ken",
+        cookie: "sid=s1",
+        url: `http://localhost${path}?page=2&token=abc`,
+      },
+    ]);
+  });
+
+  it("still narrows a cacheable request when a caller shouldBypassCache is set", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = bypassOnAuth(seen);
+
+    // Same handler, same request minus the credential the bypass keys on: this one *is*
+    // cached, so the unchanged guard applies — cookie stripped, query narrowed.
+    await handler(makeEvent(`${path}?page=2&token=abc`, { headers: { cookie: "sid=s1" } }));
+
+    expect(seen).toEqual([{ auth: null, cookie: null, url: `http://localhost${path}?page=2` }]);
+  });
+
+  it("evaluates an async caller shouldBypassCache exactly once per call", async () => {
+    let hookCalls = 0;
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        // Async, and counted: narrowing must read the verdict this produced, not ask again.
+        shouldBypassCache: async (event) => {
+          hookCalls++;
+          await Promise.resolve();
+          return event.req.headers.has("x-bypass");
+        },
+      },
+    );
+
+    await handler(makeEvent(path));
+    expect(hookCalls).toBe(1);
+    await handler(makeEvent(path, { headers: { "x-bypass": "1" } }));
+    expect(hookCalls).toBe(2);
+    expect(callCount).toBe(2);
+  });
+
+  it("evaluates a caller shouldBypassCache once per call under concurrent deduplication", async () => {
+    let hookCalls = 0;
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      async () => {
+        callCount++;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return new Response("ok");
+      },
+      {
+        maxAge: 10,
+        shouldBypassCache: async (event) => {
+          hookCalls++;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return event.req.headers.has("x-bypass");
+        },
+      },
+    );
+
+    await Promise.all(Array.from({ length: 5 }, () => handler(makeEvent(path))));
+
+    // One hook call per request (the hook is per-request by contract — it may answer
+    // differently for each), and one handler call for all five: they coalesce onto the
+    // leader's resolution, whose narrowing reuses the verdict rather than re-asking.
+    expect(hookCalls).toBe(5);
+    expect(callCount).toBe(1);
+  });
+
+  it("keeps the bypass contract for a caller-excluded request: not stored, not serialized", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const original = new Response("live");
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return original;
+      },
+      { maxAge: 10, shouldBypassCache: (event) => event.req.headers.has("x-bypass") },
+    );
+
+    const headers = { "x-bypass": "1" };
+    const res = (await handler(makeEvent(path, { headers }))) as Response;
+
+    // The live Response instance flows straight back out — no `serialize`, so no
+    // synthesized cache headers — and nothing is stored, so the handler runs every time.
+    expect(res).toBe(original);
+    expect(res.headers.has("etag")).toBe(false);
+    expect(res.headers.has("last-modified")).toBe(false);
+    expect(res.headers.has("cache-control")).toBe(false);
+    expect(res.headers.has("x-cache")).toBe(false);
+    await handler(makeEvent(path, { headers }));
+    expect(callCount).toBe(2);
+    // And a later cacheable request still misses: the bypassed one wrote no entry.
+    const cacheable = (await handler(makeEvent(path))) as Response;
+    expect(cacheable.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(3);
+  });
+
+  it("a Range request still narrows nothing and caches nothing (built-in bypass)", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        seen.push({
+          auth: event.req.headers.get("authorization"),
+          cookie: event.req.headers.get("cookie"),
+          range: event.req.headers.get("range"),
+          url: event.req.url,
+        });
+        return new Response("ok");
+      },
+      { maxAge: 10, allowQuery: ["page"], allowCookies: ["theme"] },
+    );
+
+    const headers = {
+      range: "bytes=0-0",
+      authorization: "Bearer t0ken",
+      cookie: "sid=s1; theme=dark",
+    };
+    const res = (await handler(makeEvent(`${path}?page=2&token=abc`, { headers }))) as Response;
+
+    expect(seen).toEqual([
+      {
+        auth: "Bearer t0ken",
+        cookie: "sid=s1; theme=dark",
+        range: "bytes=0-0",
+        url: `http://localhost${path}?page=2&token=abc`,
+      },
+    ]);
+    expect(res.headers.has("x-cache")).toBe(false);
+    await handler(makeEvent(`${path}?page=2&token=abc`, { headers }));
+    expect(callCount).toBe(2);
+  });
+
+  it("by default hides Authorization from the handler so token content is never shared", async () => {
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const auth = event.req.headers.get("authorization");
+        seen.push(auth);
+        // A handler that renders per-user content from the token — the exact shape that
+        // used to be stored under the anonymous key and replayed to everyone.
+        return new Response(auth ? `private-for-${auth}` : "anonymous");
+      },
+      { maxAge: 10 },
+    );
+
+    const authed = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const anon = (await handler(makeEvent(path))) as Response;
+
+    // The credential never reaches the handler, so there is no per-user body to leak.
+    expect(seen).toEqual([null]);
+    expect(await authed.text()).toBe("anonymous");
+    expect(await anon.text()).toBe("anonymous");
+    // ... and it never varies the key either (one shared entry).
+    expect(callCount).toBe(1);
+    expect(authed.headers.get("vary")).toBeNull();
+  });
+
+  it("by default hides Proxy-Authorization from the handler", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("proxy-authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    await handler(makeEvent(path, { headers: { "proxy-authorization": "Basic zzz" } }));
+
+    expect(seen).toEqual([null]);
+  });
+
+  it("allowAuthorization keys per credential, varies, and exposes the header", async () => {
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const auth = event.req.headers.get("authorization");
+        seen.push(auth);
+        return new Response(`call-${callCount}:${auth}`);
+      },
+      { maxAge: 10, allowAuthorization: true },
+    );
+
+    const a1 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const a2 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+    const b1 = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer bob" } }),
+    )) as Response;
+
+    // The handler can read the credential ...
+    expect(seen).toEqual(["Bearer alice", "Bearer bob"]);
+    // ... and each distinct value gets its own entry (same value = a hit).
+    expect(callCount).toBe(2);
+    expect(await a1.text()).toBe("call-1:Bearer alice");
+    expect(await a2.text()).toBe("call-1:Bearer alice");
+    expect(await b1.text()).toBe("call-2:Bearer bob");
+    // Downstream caches are told about the dimension too.
+    const vary = a1.headers.get("vary")!.toLowerCase();
+    expect(vary.split(",").map((v) => v.trim())).toEqual(["authorization", "proxy-authorization"]);
+  });
+
+  // The documented "private response" recipe (docs/1.guide/8.cache-control.md): the
+  // `Cache-Control: private` opt-out is only meaningful if the handler could identify the user
+  // in the first place, which under the credential defaults takes `allowAuthorization`. Pins
+  // the two halves working *together* — credential visible, personalized response never stored,
+  // anonymous rendering still cached under its own key.
+  it("allowAuthorization + Cache-Control: private serves per-user without storing it", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const user = event.req.headers.get("authorization");
+        return user
+          ? new Response(`dashboard for ${user} (call ${callCount})`, {
+              headers: { "cache-control": "private" },
+            })
+          : new Response(`public (call ${callCount})`);
+      },
+      { maxAge: 10, allowAuthorization: true },
+    );
+
+    const auth = (user: string) => makeEvent(path, { headers: { authorization: user } });
+    const alice1 = (await handler(auth("alice"))) as Response;
+    const alice2 = (await handler(auth("alice"))) as Response;
+    const bob = (await handler(auth("bob"))) as Response;
+
+    // The credential reaches the handler, and the opt-out keeps every rendering out of
+    // storage — so even the same user re-runs it rather than replaying a stored body.
+    expect(await alice1.text()).toBe("dashboard for alice (call 1)");
+    expect(await alice2.text()).toBe("dashboard for alice (call 2)");
+    expect(await bob.text()).toBe("dashboard for bob (call 3)");
+    // The directive is returned to the caller untouched.
+    expect(alice1.headers.get("cache-control")).toBe("private");
+
+    // The anonymous branch sets no opt-out, so it caches under its own (credential-free) key.
+    const anon1 = (await handler(makeEvent(path))) as Response;
+    const anon2 = (await handler(makeEvent(path))) as Response;
+    expect(await anon1.text()).toBe("public (call 4)");
+    expect(await anon2.text()).toBe("public (call 4)");
+    expect(anon2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(4);
+  });
+
+  it("treats varies: ['authorization'] as an opt-in (no double vary entry)", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10, varies: ["authorization"], allowAuthorization: true },
+    );
+
+    const res = (await handler(
+      makeEvent(path, { headers: { authorization: "Bearer alice" } }),
+    )) as Response;
+
+    expect(seen).toEqual(["Bearer alice"]);
+    expect(res.headers.get("vary")!.toLowerCase()).toBe("authorization, proxy-authorization");
+  });
+
+  it("lets the handler read varied headers and stores one rendering per value", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return new Response(`page-${event.req.headers.get("accept-language") ?? "default"}`);
+      },
+      { maxAge: 10, varies: ["accept-language"] },
+    );
+
+    const en = (await handler(
+      makeEvent(path, { headers: { "accept-language": "en" } }),
+    )) as Response;
+    const fr = (await handler(
+      makeEvent(path, { headers: { "accept-language": "fr" } }),
+    )) as Response;
+    const en2 = (await handler(
+      makeEvent(path, { headers: { "accept-language": "en" } }),
+    )) as Response;
+
+    // Distinct values render distinctly (the handler can see the header) under distinct
+    // keys, and a repeat value is a hit.
+    expect(await en.text()).toBe("page-en");
+    expect(await fr.text()).toBe("page-fr");
+    expect(await en2.text()).toBe("page-en");
+    expect(callCount).toBe(2);
+    expect(en.headers.get("vary")).toBe("accept-language");
+  });
+
+  it("does not strip Authorization from requests that bypass caching (non-GET/HEAD)", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push(event.req.headers.get("authorization"));
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    await handler(
+      makeEvent(path, {
+        method: "POST",
+        headers: { authorization: "Bearer alice" },
+      }),
+    );
+
+    expect(seen).toEqual(["Bearer alice"]);
+  });
+
+  // --- Narrowing is an allowlist: a handler may read exactly what the key covers ---
+  //
+  // It used to strip `authorization`/`proxy-authorization`/`cookie` and forward every other
+  // header, while the key covers only `keyHeaderNames`. Any undeclared header the handler read
+  // was therefore rendered into an entry nothing distinguished: a MISS carrying the header
+  // followed by a request without it replayed the first caller's rendering, under a synthesized
+  // `max-age` and with no `Vary` to warn a shared cache off it. The credential strip was this
+  // same rule applied to two names by hand.
+
+  it("hides an undeclared header and cannot replay one caller's rendering to the next", async () => {
+    let callCount = 0;
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        const tenant = event.req.headers.get("x-api-key");
+        seen.push(tenant);
+        return new Response(`tenant:${tenant ?? "anonymous"}`);
+      },
+      { maxAge: 10 },
+    );
+
+    const first = (await handler(
+      makeEvent(path, { headers: { "x-api-key": "alice-secret" } }),
+    )) as Response;
+    const second = (await handler(makeEvent(path))) as Response;
+
+    // Undeclared ⇒ outside the key ⇒ invisible, so the entry can only ever hold the one
+    // rendering every caller on that key is entitled to.
+    expect(seen).toEqual([null]);
+    expect(await first.text()).toBe("tenant:anonymous");
+    expect(await second.text()).toBe("tenant:anonymous");
+    expect(second.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(1);
+  });
+
+  it("hides x-forwarded-host, which the URL authority in the key never covered", async () => {
+    const seen: (string | null)[] = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        const host = event.req.headers.get("x-forwarded-host");
+        seen.push(host);
+        return new Response(`site:${host ?? "canonical"}`);
+      },
+      { maxAge: 10 },
+    );
+
+    // Behind a proxy the key's authority is the *internal* one, identical for both tenants —
+    // so a visible `x-forwarded-host` is the h3#1524 cross-tenant replay by another route.
+    const a = (await handler(
+      makeEvent(path, { headers: { "x-forwarded-host": "a.example" } }),
+    )) as Response;
+    const b = (await handler(
+      makeEvent(path, { headers: { "x-forwarded-host": "b.example" } }),
+    )) as Response;
+
+    expect(seen).toEqual([null]);
+    expect(await a.text()).toBe("site:canonical");
+    expect(await b.text()).toBe("site:canonical");
+  });
+
+  it("forwards host and the propagation headers, but not user-agent or baggage", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        const get = (name: string) => event.req.headers.get(name);
+        seen.push({
+          host: get("host"),
+          traceparent: get("traceparent"),
+          requestId: get("x-request-id"),
+          userAgent: get("user-agent"),
+          baggage: get("baggage"),
+        });
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    await handler(
+      makeEvent(path, {
+        headers: {
+          host: "localhost",
+          traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+          "x-request-id": "req-1",
+          "user-agent": "curl/8",
+          baggage: "tenant=acme",
+        },
+      }),
+    );
+
+    // `host` is already keyed (the URL authority) and the trace pair is per-request plumbing
+    // no key could cover; `user-agent` (device branching) and `baggage` (OTel's app-readable
+    // tenant/flag context) are rendering inputs, so they follow the general rule.
+    expect(seen).toEqual([
+      {
+        host: "localhost",
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        requestId: "req-1",
+        userAgent: null,
+        baggage: null,
+      },
+    ]);
+  });
+
+  it("restores a stripped header through varies (the documented escape hatch)", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return new Response(`ua:${event.req.headers.get("user-agent") ?? "unknown"}`);
+      },
+      { maxAge: 10, varies: ["user-agent"] },
+    );
+
+    const ua = (agent: string) => makeEvent(path, { headers: { "user-agent": agent } });
+    const mobile = (await handler(ua("phone"))) as Response;
+    const desktop = (await handler(ua("laptop"))) as Response;
+
+    // Declared ⇒ keyed ⇒ visible, and each value gets its own entry and its own `Vary`.
+    expect(await mobile.text()).toBe("ua:phone");
+    expect(await desktop.text()).toBe("ua:laptop");
+    expect(callCount).toBe(2);
+    expect(mobile.headers.get("vary")).toBe("user-agent");
+  });
+
+  it("keeps the conditional headers visible, so a MISS can still answer 304", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("body", { headers: { etag: '"v1"' } });
+      },
+      { maxAge: 10 },
+    );
+
+    // First request on this key, so this is a MISS — and `handleCacheHeaders` reads
+    // `if-none-match` off `event.req` *after* narrowing has already swapped it. Stripping it
+    // would leave 304s working on a HIT and silently never firing on a MISS.
+    const res = (await handler(
+      makeEvent(path, { headers: { "if-none-match": '"v1"' } }),
+    )) as Response;
+
+    expect(res.status).toBe(304);
+    expect(callCount).toBe(1);
+  });
+
+  it("leaves an undeclared header intact on bypassed requests (non-GET/HEAD, Range)", async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        seen.push({
+          apiKey: event.req.headers.get("x-api-key"),
+          userAgent: event.req.headers.get("user-agent"),
+        });
+        return new Response("ok");
+      },
+      { maxAge: 10 },
+    );
+
+    const headers = { "x-api-key": "alice-secret", "user-agent": "curl/8" };
+    await handler(makeEvent(path, { method: "POST", headers }));
+    await handler(makeEvent(path, { headers: { ...headers, range: "bytes=0-0" } }));
+
+    // Never keyed ⇒ never narrowed: a bypassed request reaches the handler as it arrived.
+    const intact = { apiKey: "alice-secret", userAgent: "curl/8" };
+    expect(seen).toEqual([intact, intact]);
+  });
+
   it("rejects stored entries carrying a non-allowlisted Set-Cookie (pre-upgrade entries)", async () => {
     const written: string[] = [];
     const memory = createMemoryStorage();
-    setStorage({
+    useTestStorage({
       get: (key) => memory.get(key),
       set: (key, value, opts) => {
         written.push(key);
@@ -2722,7 +5636,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(2);
   });
 
-  it("filters variable headers from handler request", async () => {
+  it("forwards variable headers to the handler request", async () => {
     let receivedHeaders: string | null = null;
     const path = uniquePath();
     const handler = defineCachedHandler(
@@ -2738,7 +5652,9 @@ describe("defineCachedHandler", () => {
         headers: { "x-custom": "value" },
       }),
     );
-    expect(receivedHeaders).toBeNull();
+    // The header is part of the cache key, so the handler is allowed (and expected) to
+    // read it — hiding it made every variant hold the same default rendering.
+    expect(receivedHeaders).toBe("value");
   });
 
   it("inherits runtime context on filtered request", async () => {
@@ -2782,7 +5698,7 @@ describe("defineCachedHandler", () => {
     expect(callCount).toBe(1);
   });
 
-  it("sets s-maxage=0 when swr with maxAge: 0", async () => {
+  it("sets max-age=0, s-maxage=0 when swr with maxAge: 0", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), {
       maxAge: 0,
@@ -2790,9 +5706,9 @@ describe("defineCachedHandler", () => {
     });
 
     const res = (await handler(makeEvent(path))) as Response;
-    const cc = res.headers.get("cache-control")!;
-    expect(cc).toContain("s-maxage=0");
-    expect(cc).toContain("stale-while-revalidate");
+    // A zero lifetime is advertised on both axes (and read back by `validate` as the storage
+    // opt-out it is). No stale window is named, so none is advertised.
+    expect(res.headers.get("cache-control")).toBe("max-age=0, s-maxage=0");
   });
 
   it("sets stale-while-revalidate=0 when swr with staleMaxAge: 0", async () => {
@@ -2809,12 +5725,56 @@ describe("defineCachedHandler", () => {
     expect(cc).toContain("stale-while-revalidate=0");
   });
 
-  it("no cache-control when no maxAge and no swr", async () => {
+  it("sets max-age=0 when maxAge: 0 and no swr (same rule as the swr branch)", async () => {
     const path = uniquePath();
     const handler = defineCachedHandler(() => new Response("ok"), { maxAge: 0, swr: false });
 
+    // The two synthesis branches treat `maxAge` identically: present (`0` included) is
+    // advertised, absent is not. This one used to emit nothing while the swr branch above
+    // emitted `s-maxage=0` for the very same option. See the storage consequence below.
     const res = (await handler(makeEvent(path))) as Response;
-    expect(res.headers.get("cache-control")).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("max-age=0");
+  });
+
+  it("does not store a maxAge: 0 response (its own zero lifetime is an opt-out)", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 0, swr: false },
+    );
+
+    await handler(makeEvent(path));
+    const r2 = (await handler(makeEvent(path))) as Response;
+
+    // `validate` reads the synthesized `max-age=0` exactly as it reads a hand-written one,
+    // so a zero lifetime keeps the response out of storage on both branches now (it already
+    // did under `swr`, via `s-maxage=0`). The handler ran on every request before this too —
+    // the entry it used to write was already expired when written — so what changed is that
+    // there is no longer a dead entry in storage, not how often the origin is asked.
+    expect(callCount).toBe(2);
+    expect(await r2.text()).toBe("v2");
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(keys[0]!)).toBeNull();
+  });
+
+  // Was "no cache-control when maxAge is absent and no swr", asserting `null` for
+  // `{ maxAge: undefined }`. That was the old undefined-vs-absent divergence, not an absent
+  // `maxAge`: an unset `maxAge` has always taken the `maxAge: 1` default (`{}` did), and an
+  // explicit `undefined` now does too. Silence is `sendCacheControl: false`, tested above.
+  it("advertises the maxAge default when maxAge is explicitly undefined and no swr", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: undefined,
+      swr: false,
+    });
+
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.headers.get("cache-control")).toBe("max-age=1");
   });
 
   it("uses custom toResponse hook", async () => {
@@ -2999,8 +5959,9 @@ describe("defineCachedHandler", () => {
     await handler(event);
 
     const keys = await handler.resolveKeys(event);
-    expect(keys.length).toBe(1);
-    const stored = await useStorage().get(keys[0]!);
+    // The event's own (GET) key first, then the sibling HEAD variant of the same resource.
+    expect(keys.length).toBe(2);
+    const stored = await testStorage.get(keys[0]!);
     expect(stored).toBeTruthy();
     expect((stored as any).value.body).toBe("ok");
   });
@@ -3025,7 +5986,7 @@ describe("defineCachedHandler", () => {
 
     await handler.invalidate(makeEvent(path));
     const [key] = await handler.resolveKeys(makeEvent(path));
-    expect(await useStorage().get(key!)).toBeFalsy();
+    expect(await testStorage.get(key!)).toBeFalsy();
 
     // Next call re-resolves.
     const r3 = (await handler(makeEvent(path))) as Response;
@@ -3091,6 +6052,684 @@ describe("defineCachedHandler", () => {
     }
     expect(await r2.text()).toBe("decoded body");
   });
+
+  // --- immutable response headers ---
+
+  // `serialize` used to synthesize/strip headers on the handler's live `Response`. Anything
+  // built by `fetch()`, `Response.redirect()` or `Response.error()` carries the spec's
+  // *immutable* header guard, so the very first write threw, the shared resolution rejected
+  // and the entry was evicted — every request, no configuration avoiding it (the
+  // `set-cookie`/`Vary`/transport deletes are unconditional, so even `sendCacheControl: false`
+  // plus an upstream `etag` still threw). Every other 301 test here builds a mutable
+  // `new Response(...)`, which is why this went unnoticed.
+  describe("immutable response headers", () => {
+    // Guard the premise: if a runtime ever stops enforcing it, these tests prove nothing.
+    it("Response.redirect really is header-immutable", () => {
+      expect(() => Response.redirect("http://localhost/elsewhere", 301).headers.set("x", "1")) //
+        .toThrow();
+    });
+
+    it("caches a Response.redirect (301) instead of throwing", async () => {
+      const path = uniquePath();
+      let callCount = 0;
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return Response.redirect("http://localhost/elsewhere", 301);
+        },
+        { maxAge: 10 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      expect(r1.status).toBe(301);
+      expect(r1.headers.get("x-cache")).toBe("MISS");
+      expect(r2.status).toBe(301);
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+      expect(r2.headers.get("location")).toBe("http://localhost/elsewhere");
+      // Synthesis still lands on the entry — it just happens on the copy.
+      expect(r2.headers.get("cache-control")).toBe("max-age=10");
+      expect(r2.headers.get("etag")).toBeTruthy();
+      expect(callCount).toBe(1);
+    });
+
+    it("caches an immutable-headers response with cookies and transport headers stripped", async () => {
+      const path = uniquePath();
+      // The `fetch()` shape: a reverse-proxy handler returning an upstream response verbatim.
+      // `Response.redirect` is the only immutable response constructible without a network,
+      // so proxy the strip path through a hand-frozen `Headers` instead.
+      const frozen = () => {
+        const res = new Response("upstream body", {
+          headers: {
+            "set-cookie": "sid=s1",
+            "content-encoding": "gzip",
+            "content-type": "text/plain",
+          },
+        });
+        for (const method of ["set", "append", "delete"] as const) {
+          Object.defineProperty(res.headers, method, {
+            value: () => {
+              throw new TypeError("immutable");
+            },
+          });
+        }
+        return res;
+      };
+      const handler = defineCachedHandler(frozen, { maxAge: 10, varies: ["accept-language"] });
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      const r2 = (await handler(makeEvent(path))) as Response;
+
+      for (const res of [r1, r2]) {
+        expect(res.status).toBe(200);
+        // The unconditional strips must still apply — they just apply to the copy.
+        expect(res.headers.get("set-cookie")).toBeNull();
+        expect(res.headers.get("content-encoding")).toBeNull();
+        expect(res.headers.get("content-type")).toBe("text/plain");
+        expect(res.headers.get("vary")).toBe("accept-language");
+      }
+      expect(await r2.text()).toBe("upstream body");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+    });
+
+    it("does not mutate the handler's own Response headers", async () => {
+      const path = uniquePath();
+      const res = new Response("body");
+      const handler = defineCachedHandler(() => res, { maxAge: 10 });
+
+      await handler(makeEvent(path));
+
+      // The copy absorbs the synthesis; the handler's object is left as it was handed over.
+      expect(res.headers.get("etag")).toBeNull();
+      expect(res.headers.get("cache-control")).toBeNull();
+      expect(res.headers.get("last-modified")).toBeNull();
+    });
+  });
+
+  // --- GET/HEAD cache key separation (h3#1524 audit, finding #3) ---
+
+  // Every real framework integration nulls the body of a HEAD response in `toResponse`
+  // (h3 does), and that body-less `Response` is exactly what ocache stores. ocache's own
+  // default `toResponse` does not strip it, so the poisoning is only reproducible through
+  // the integration hook — simulate a spec-compliant host here.
+  function headStrippingToResponse(value: unknown, event: HTTPEvent): Response {
+    const res = value instanceof Response ? value : new Response(String(value));
+    return event.req.method === "HEAD"
+      ? new Response(null, {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+        })
+      : res;
+  }
+
+  it("does not let a HEAD request poison the GET entry with an empty body", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world", { status: 200 });
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    // Attacker-controlled HEAD lands first and stores a body-less entry.
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+
+    // The GET must not be served that entry.
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(get.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+
+    // ...and the GET entry it wrote is the one replayed to later GETs.
+    const get2 = (await handler(makeEvent(path))) as Response;
+    expect(await get2.text()).toBe("hello world");
+    expect(get2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+  });
+
+  it("serves HEAD from its own entry without disturbing the GET entry", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(callCount).toBe(1);
+
+    // HEAD does not reuse the GET entry: it costs its own origin dispatch.
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head.headers.get("x-cache")).toBe("MISS");
+    expect(await head.text()).toBe("");
+    expect(callCount).toBe(2);
+
+    // ...but it is cached under its own key.
+    const head2 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(head2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+
+    // ...and the GET entry is untouched.
+    const get2 = (await handler(makeEvent(path))) as Response;
+    expect(await get2.text()).toBe("hello world");
+    expect(get2.headers.get("x-cache")).toBe("HIT");
+    expect(callCount).toBe(2);
+  });
+
+  it("separates HEAD from GET under a custom getKey", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      {
+        maxAge: 100,
+        // A custom key expresses *content* identity — the GET/HEAD split is still ocache's
+        // to enforce, or a custom-key user is exposed to exactly the poisoning above.
+        getKey: () => `custom-key${path}`,
+        toResponse: headStrippingToResponse,
+      },
+    );
+
+    const head = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(await head.text()).toBe("");
+
+    const get = (await handler(makeEvent(path))) as Response;
+    expect(await get.text()).toBe("hello world");
+    expect(get.headers.get("x-cache")).toBe("MISS");
+    expect(callCount).toBe(2);
+
+    const keys = await handler.resolveKeys(makeEvent(path));
+    expect(keys[1]).toBe(headVariantKey(keys[0]!));
+  });
+
+  it("composes the HEAD discriminator with varies and allowCookies key components", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("hello world");
+      },
+      {
+        maxAge: 100,
+        varies: ["accept-language"],
+        allowCookies: ["sid"],
+        toResponse: headStrippingToResponse,
+      },
+    );
+    const event = (method: string, lang: string, sid: string) =>
+      makeEvent(path, { method, headers: { "accept-language": lang, cookie: `sid=${sid}` } });
+
+    await handler(event("GET", "en", "1"));
+    expect(callCount).toBe(1);
+    await handler(event("GET", "en", "1")); // hit
+    expect(callCount).toBe(1);
+    await handler(event("GET", "fr", "1")); // varies component still splits the key
+    expect(callCount).toBe(2);
+    await handler(event("GET", "en", "2")); // allowCookies component still splits the key
+    expect(callCount).toBe(3);
+
+    // The HEAD discriminator is orthogonal to both: one HEAD entry per variant.
+    await handler(event("HEAD", "en", "1"));
+    expect(callCount).toBe(4);
+    await handler(event("HEAD", "en", "1")); // hit
+    expect(callCount).toBe(4);
+    await handler(event("HEAD", "fr", "1"));
+    expect(callCount).toBe(5);
+
+    // Key shape: the HEAD key is the GET key with the `HEAD:` discriminator, so the
+    // vary/cookie components are preserved verbatim on both sides.
+    const [getKey, getSibling] = await handler.resolveKeys(event("GET", "en", "1"));
+    const [headKey, headSibling] = await handler.resolveKeys(event("HEAD", "en", "1"));
+    expect(headKey).toBe(headVariantKey(getKey!));
+    expect(getSibling).toBe(headKey);
+    expect(headSibling).toBe(getKey);
+    expect(getKey).toMatch(/:acceptlanguage\.[^:]+:cookie\.[^:]+\.json$/);
+  });
+
+  // Populates both the GET and the HEAD entry of one path and returns their storage keys.
+  // The keys are derived from the key shape itself (`HEAD:` component) rather than read
+  // back from `.resolveKeys`, so the assertions below check actual storage state.
+  async function primeBothVariants(handler: ReturnType<typeof defineCachedHandler>, path: string) {
+    await handler(makeEvent(path));
+    await handler(makeEvent(path, { method: "HEAD" }));
+    const getKey = (await handler.resolveKeys(makeEvent(path)))[0]!;
+    const keys = [getKey, headVariantKey(getKey)];
+    for (const key of keys) {
+      expect(await testStorage.get(key)).toBeTruthy();
+    }
+    return keys;
+  }
+
+  it(".resolveKeys(event) enumerates every method variant, the event's own first", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 100,
+      toResponse: headStrippingToResponse,
+    });
+
+    const getKeys = await handler.resolveKeys(makeEvent(path));
+    const headKeys = await handler.resolveKeys(makeEvent(path, { method: "HEAD" }));
+    expect(getKeys).toHaveLength(2);
+    expect(headKeys).toHaveLength(2);
+    expect(headKeys[0]).toBe(getKeys[1]);
+    expect(headKeys[1]).toBe(getKeys[0]);
+
+    // keys[0] is still exactly the key that event reads/writes.
+    await handler(makeEvent(path));
+    expect(await testStorage.get(getKeys[0]!)).toBeTruthy();
+    expect(await testStorage.get(getKeys[1]!)).toBeFalsy();
+    await handler(makeEvent(path, { method: "HEAD" }));
+    expect(await testStorage.get(headKeys[0]!)).toBeTruthy();
+  });
+
+  it(".invalidate(event) clears every method variant of the resource", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response(`v${callCount}`);
+      },
+      { maxAge: 100, toResponse: headStrippingToResponse },
+    );
+
+    // Invalidating from a GET event must not leave the HEAD entry behind — it would keep
+    // advertising the dead etag/last-modified for downstream caches to revalidate against.
+    const keys = await primeBothVariants(handler, path);
+    await handler.invalidate(makeEvent(path));
+    for (const key of keys) {
+      expect(await testStorage.get(key)).toBeFalsy();
+    }
+
+    // ...and the same in the other direction, from a HEAD event.
+    await primeBothVariants(handler, path);
+    await handler.invalidate(makeEvent(path, { method: "HEAD" }));
+    for (const key of keys) {
+      expect(await testStorage.get(key)).toBeFalsy();
+    }
+  });
+
+  it(".expire(event) marks every method variant of the resource stale", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response("ok"), {
+      maxAge: 100,
+      swr: true,
+      staleMaxAge: 100,
+      toResponse: headStrippingToResponse,
+    });
+
+    const keys = await primeBothVariants(handler, path);
+    await handler.expire(makeEvent(path));
+    for (const key of keys) {
+      expect(await testStorage.get(key)).toMatchObject({ stale: true });
+    }
+
+    // ...and from a HEAD event.
+    await handler.invalidate(makeEvent(path));
+    await primeBothVariants(handler, path);
+    await handler.expire(makeEvent(path, { method: "HEAD" }));
+    for (const key of keys) {
+      expect(await testStorage.get(key)).toMatchObject({ stale: true });
+    }
+  });
+
+  // --- Null-body statuses (204 / 205 / 304) ---
+
+  // `serialize` stores a body-less response as `""`, which is not nullish, so replaying it
+  // as `new Response("", { status: 204 })` used to throw — on the MISS too, since the miss
+  // is served through the freshly serialized entry. Two guards: the read path forces the
+  // body to `null` for these statuses, and `validate` refuses to store them at all.
+  for (const status of [204, 205, 304]) {
+    it(`serves a ${status} response without throwing and never stores it`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response(null, { status });
+        },
+        { maxAge: 100 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(r1.status).toBe(status);
+      expect(r1.body).toBeNull();
+
+      const r2 = (await handler(makeEvent(path))) as Response;
+      expect(r2.status).toBe(status);
+      expect(r2.body).toBeNull();
+
+      // Not a servable stored representation: nothing is kept, so every request re-resolves.
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+      expect(callCount).toBe(2);
+      expect(r2.headers.get("x-cache")).toBe("MISS");
+    });
+  }
+
+  it("does not let a handler's own 304 poison the unconditional path", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        // A handler doing its own conditional handling (h3 `serveStatic`, nitro public
+        // assets, any route proxying the conditional headers upstream).
+        return event.req.headers.get("if-modified-since")
+          ? new Response(null, { status: 304 })
+          : new Response("fresh body", { status: 200 });
+      },
+      { maxAge: 100 },
+    );
+
+    // One crafted conditional request used to store a 304 that every later unconditional
+    // request was then served (and crashed on).
+    const attacker = (await handler(
+      makeEvent(path, { headers: { "if-modified-since": "Fri, 31 Dec 2999 23:59:59 GMT" } }),
+    )) as Response;
+    expect(attacker.status).toBe(304);
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+
+    // The unconditional path still reaches the handler and gets the real representation.
+    const victim = (await handler(makeEvent(path))) as Response;
+    expect(victim.status).toBe(200);
+    expect(await victim.text()).toBe("fresh body");
+    expect(callCount).toBe(2);
+  });
+
+  it("serves HEAD against a 204 route", async () => {
+    const path = uniquePath();
+    const handler = defineCachedHandler(() => new Response(null, { status: 204 }), {
+      maxAge: 100,
+      // A spec-compliant host nulls a HEAD body — the same shape a 204 already has.
+      toResponse: headStrippingToResponse,
+    });
+
+    const r1 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(r1.status).toBe(204);
+    expect(r1.body).toBeNull();
+
+    const r2 = (await handler(makeEvent(path, { method: "HEAD" }))) as Response;
+    expect(r2.status).toBe(204);
+    expect(r2.body).toBeNull();
+    expect(r2.headers.get("x-cache")).toBe("MISS");
+  });
+
+  // --- Range requests and 206 (finding 07) ---
+
+  /** A range-honoring handler, i.e. what any static-file / media / `serveStatic` route is. */
+  function rangeHandler(body: string) {
+    return (event: HTTPEvent) => {
+      const range = event.req.headers.get("range");
+      if (!range) {
+        return new Response(body, { status: 200 });
+      }
+      const [, start = "0", end = ""] = /bytes=(\d*)-(\d*)/.exec(range) || [];
+      const from = Number(start);
+      const to = end ? Number(end) : body.length - 1;
+      const slice = body.slice(from, to + 1);
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          "content-range": `bytes ${from}-${to}/${body.length}`,
+          "content-length": String(slice.length),
+        },
+      });
+    };
+  }
+
+  it("does not populate the plain GET entry from a Range request", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const inner = rangeHandler("ABCDEFGHIJ");
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return inner(event);
+      },
+      { maxAge: 100 },
+    );
+
+    const ranged = (await handler(
+      makeEvent(path, { headers: { range: "bytes=0-0" } }),
+    )) as Response;
+    expect(ranged.status).toBe(206);
+    expect(await ranged.text()).toBe("A");
+
+    // Bypassed, so nothing is stored under the plain key (nor under any key).
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+    expect(callCount).toBe(1);
+
+    // And bypassed responses pass through untouched: no serialization, no synthesized
+    // cache headers, no cache-status header, so a second ranged request re-resolves.
+    expect(ranged.headers.get("cache-control")).toBeNull();
+    expect(ranged.headers.get("etag")).toBeNull();
+    expect(ranged.headers.get("x-cache")).toBeNull();
+    // Range framing survives untouched on the bypass path (nothing is stripped there).
+    expect(ranged.headers.get("content-range")).toBe("bytes 0-0/10");
+    await handler(makeEvent(path, { headers: { range: "bytes=0-0" } }));
+    expect(callCount).toBe(2);
+  });
+
+  it("serves the full 200 body to a plain GET after a ranged one", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const inner = rangeHandler("ABCDEFGHIJ");
+    const handler = defineCachedHandler(
+      (event) => {
+        callCount++;
+        return inner(event);
+      },
+      { maxAge: 100 },
+    );
+
+    // Attacker truncates: one byte, with a Content-Range describing it.
+    await handler(makeEvent(path, { headers: { range: "bytes=0-0" } }));
+
+    // Victim, no Range: must get the complete representation, never the poisoned partial.
+    const victim = (await handler(makeEvent(path))) as Response;
+    expect(victim.status).toBe(200);
+    expect(await victim.text()).toBe("ABCDEFGHIJ");
+    expect(victim.headers.get("content-range")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  it("never serves a stored entry with status 206", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("ABCDEFGHIJ");
+      },
+      { maxAge: 100 },
+    );
+
+    await handler(makeEvent(path));
+    expect(callCount).toBe(1);
+    const [key] = await handler.resolveKeys(makeEvent(path));
+
+    // Simulate an entry written by another writer sharing the storage, or by an older
+    // ocache that still admitted 206: same shape and integrity, partial payload.
+    const entry = (await testStorage.get(key!)) as any;
+    entry.value.status = 206;
+    entry.value.body = "A";
+    entry.value.headers["content-range"] = "bytes 0-0/10";
+    await testStorage.set(key!, entry);
+
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ABCDEFGHIJ");
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  it("strips content-range from a stored entry", async () => {
+    const path = uniquePath();
+    // A proxying handler that copied upstream headers onto a complete 200 response.
+    const handler = defineCachedHandler(
+      () => new Response("full body", { headers: { "content-range": "bytes 0-8/9" } }),
+      { maxAge: 100 },
+    );
+
+    const r1 = (await handler(makeEvent(path))) as Response;
+    expect(r1.headers.get("content-range")).toBeNull();
+
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    const entry = (await testStorage.get(key!)) as any;
+    expect(entry.value.headers["content-range"]).toBeUndefined();
+  });
+
+  // --- Cacheable-status allowlist (findings 10.1 / 10.5) ---
+
+  it("does not store a 302 nor advertise a synthesized cache-control for it", async () => {
+    let callCount = 0;
+    const path = uniquePath();
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return new Response("", { status: 302, headers: { location: "/elsewhere" } });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const res = (await handler(makeEvent(path))) as Response;
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/elsewhere");
+    // A per-request answer, not a representation: never stored...
+    const [key] = await handler.resolveKeys(makeEvent(path));
+    expect(await testStorage.get(key!)).toBeFalsy();
+    // ...and therefore never published as cacheable to clients/CDNs either.
+    expect(res.headers.get("cache-control")).toBeNull();
+
+    await handler(makeEvent(path));
+    expect(callCount).toBe(2);
+  });
+
+  it("never serves an anonymous login redirect to a later request (10.5)", async () => {
+    let callCount = 0;
+    const path = `${uniquePath()}/dashboard`;
+    // Auth middleware: anonymous visitors are bounced to /login, authenticated ones get their
+    // dashboard. The auth signal is deliberately *not* in the request — every candidate
+    // (cookie, bearer token, a proxy-injected header) is stripped by the request-side
+    // allowlist, and none is in the key — so both callers land on the *same* anonymous cache
+    // key, which is exactly why the 302 must never stick to it. Branching on the call instead
+    // pins the storage decision itself: the second request must reach the handler.
+    const handler = defineCachedHandler(
+      () => {
+        callCount++;
+        return callCount > 1
+          ? new Response("alice's dashboard")
+          : new Response("", {
+              status: 302,
+              headers: { location: `/login?next=${path}` },
+            });
+      },
+      { maxAge: 60, swr: true, staleMaxAge: 600 },
+    );
+
+    const anonymous = (await handler(makeEvent(path))) as Response;
+    expect(anonymous.status).toBe(302);
+    expect(anonymous.headers.get("cache-control")).toBeNull();
+
+    // The authenticated user must reach the handler, not the stored redirect.
+    const authenticated = (await handler(makeEvent(path))) as Response;
+    expect(authenticated.status).toBe(200);
+    expect(authenticated.headers.get("location")).toBeNull();
+    expect(callCount).toBe(2);
+  });
+
+  for (const status of [404, 500]) {
+    it(`returns a ${status} to the caller but neither stores nor advertises it`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("boom", { status });
+        },
+        { maxAge: 60, swr: true, staleMaxAge: 600 },
+      );
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.status).toBe(status);
+      expect(await res.text()).toBe("boom");
+      // Not stored — so the origin takes every request. Advertising a lifetime for it
+      // would pin the error at every shared cache for maxAge + staleMaxAge while ocache
+      // itself offered no protection at all: inverted on both sides.
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+      expect(res.headers.get("cache-control")).toBeNull();
+
+      await handler(makeEvent(path));
+      expect(callCount).toBe(2);
+    });
+  }
+
+  for (const status of [200, 203, 301, 308]) {
+    it(`stores and serves a ${status} response`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("body", { status, headers: { location: "/new" } });
+        },
+        { maxAge: 60 },
+      );
+
+      const r1 = (await handler(makeEvent(path))) as Response;
+      expect(r1.status).toBe(status);
+      expect(r1.headers.get("cache-control")).toBe("max-age=60");
+
+      const r2 = (await handler(makeEvent(path))) as Response;
+      expect(r2.status).toBe(status);
+      expect(await r2.text()).toBe("body");
+      expect(r2.headers.get("x-cache")).toBe("HIT");
+      expect(callCount).toBe(1);
+    });
+  }
+
+  for (const status of [201, 202, 300, 307]) {
+    it(`never stores a ${status} response`, async () => {
+      let callCount = 0;
+      const path = uniquePath();
+      const handler = defineCachedHandler(
+        () => {
+          callCount++;
+          return new Response("body", { status, headers: { location: "/new" } });
+        },
+        { maxAge: 60 },
+      );
+
+      const res = (await handler(makeEvent(path))) as Response;
+      expect(res.status).toBe(status);
+      expect(res.headers.get("cache-control")).toBeNull();
+
+      const [key] = await handler.resolveKeys(makeEvent(path));
+      expect(await testStorage.get(key!)).toBeFalsy();
+
+      await handler(makeEvent(path));
+      expect(callCount).toBe(2);
+    });
+  }
 });
 
 describe("resolveCacheKeys", () => {
@@ -3118,7 +6757,7 @@ describe("resolveCacheKeys", () => {
 
   it("matches the key used internally by defineCachedFunction", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const opts = {
       maxAge: 10,
@@ -3209,7 +6848,7 @@ describe("invalidateCache", () => {
 
     await fn();
 
-    const storage = useStorage();
+    const storage = testStorage;
     expect(await storage.get("/tier1:functions:myFn:k.json")).not.toBeNull();
     expect(await storage.get("/tier2:functions:myFn:k.json")).not.toBeNull();
 
@@ -3236,9 +6875,9 @@ describe("invalidateCache", () => {
   });
 
   it("invalidating non-existent key is a no-op", async () => {
-    // Should not throw
+    // Should not throw (a missing *entry* is fine; only a missing `storage` is an error)
     await invalidateCache({
-      options: { name: "nonexistent", getKey: () => "nope" },
+      options: { name: "nonexistent", getKey: () => "nope", storage: testStorage },
     });
   });
 });
@@ -3283,7 +6922,7 @@ describe("expireCache", () => {
     await fn(); // triggers revalidation (sync resolver updates the entry)
 
     const keys = await fn.resolveKeys();
-    const entry = (await useStorage().get(keys[0]!)) as any;
+    const entry = (await testStorage.get(keys[0]!)) as any;
     expect(entry.stale).toBeUndefined();
   });
 
@@ -3328,7 +6967,7 @@ describe("expireCache", () => {
     const fn = defineCachedFunction(() => "value", opts);
     await fn();
 
-    const storage = useStorage();
+    const storage = testStorage;
     const setSpy = vi.spyOn(storage, "set");
 
     await fn.expire();
@@ -3336,6 +6975,25 @@ describe("expireCache", () => {
       expect.any(String),
       expect.objectContaining({ stale: true, value: "value" }),
       { ttl: 180 },
+    );
+  });
+
+  it("expiring an SWR entry with no staleMaxAge leaves it TTL-less, as the write did", async () => {
+    const opts = { maxAge: 60, swr: true, name: "myFn", getKey: () => "k" };
+    const fn = defineCachedFunction(() => "value", opts);
+    await fn();
+
+    const setSpy = vi.spyOn(testStorage, "set");
+    await fn.expire();
+
+    // `expireCache` rewrites the entry, so it derives its TTL from the same `storageTtl` the
+    // write path uses. Inventing a `{ ttl: 60 }` here would delete the entry at `maxAge` —
+    // the opposite of what `.expire()` means for the ISR shape (serve it stale once more,
+    // refresh in the background).
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ stale: true, value: "value" }),
+      undefined,
     );
   });
 
@@ -3350,7 +7008,7 @@ describe("expireCache", () => {
     await fn();
     await fn.expire();
 
-    const storage = useStorage();
+    const storage = testStorage;
     const tier1 = (await storage.get("/tier1:functions:myFn:k.json")) as any;
     const tier2 = (await storage.get("/tier2:functions:myFn:k.json")) as any;
     expect(tier1.stale).toBe(true);
@@ -3375,11 +7033,12 @@ describe("expireCache", () => {
   });
 
   it("expiring non-existent key is a no-op", async () => {
-    // Should not throw and should not create an entry
+    // Should not throw and should not create an entry (a missing *entry* is fine; only a
+    // missing `storage` is an error)
     await expireCache({
-      options: { name: "nonexistent", getKey: () => "nope" },
+      options: { name: "nonexistent", getKey: () => "nope", storage: testStorage },
     });
-    expect(await useStorage().get("/cache:functions:nonexistent:nope.json")).toBeNull();
+    expect(await testStorage.get("/cache:functions:nonexistent:nope.json")).toBeNull();
   });
 });
 
@@ -3420,7 +7079,7 @@ describe("multi-tier base", () => {
 
   it("writes to all tiers on full miss", async () => {
     const setSpy = vi.fn();
-    setStorage({ get: () => null, set: setSpy });
+    useTestStorage({ get: () => null, set: setSpy });
 
     const fn = defineCachedFunction(() => "value", {
       maxAge: 10,
@@ -3437,7 +7096,7 @@ describe("multi-tier base", () => {
 
   it("skips writing to lower tiers when a higher tier hits", async () => {
     const sharedIntegrity = "shared-integrity";
-    const storage = useStorage();
+    const storage = testStorage;
 
     // Populate both tiers
     const entry = {
@@ -3474,7 +7133,7 @@ describe("multi-tier base", () => {
     };
 
     // Custom storage: tier1 misses, tier2 hits, tier3 is never checked
-    setStorage({
+    useTestStorage({
       get: (key: string): any => {
         if (key === "/tier2:functions:myFn:k.json") return tier2Entry;
         return null;
@@ -3513,7 +7172,7 @@ describe("multi-tier base", () => {
     await fn1();
 
     // Copy tier1 entry to tier2 with different value
-    const storage = useStorage();
+    const storage = testStorage;
     const tier1Entry = (await storage.get("/tier1:functions:myFn:k.json")) as any;
     await storage.set("/tier2:functions:myFn:k.json", { ...tier1Entry, value: "from-tier2" });
 
@@ -3536,5 +7195,408 @@ describe("multi-tier base", () => {
     const result = await fn2();
     expect(result).toBe("from-tier1");
     expect(callCount).toBe(0);
+  });
+});
+
+// The in-flight dedup registry used to be a plain object, so a caller-controlled key that
+// happened to name an `Object.prototype` member read truthy with nothing in flight: the call
+// was treated as a deduplicated follower, `await`ed the inherited member (not a thenable, so
+// it resolved to itself), skipped the resolver entirely and cached `undefined`. Reachable
+// through the *documented* `getKey: (id) => id`. Fixed by making the registry a `Map`.
+describe("getKey returning Object.prototype member names", () => {
+  const protoNames = [
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__proto__",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+  ];
+
+  it.each(protoNames)("cachedFunction resolves and caches key %s", async (id) => {
+    let calls = 0;
+    const fn = defineCachedFunction(
+      (key: string) => {
+        calls++;
+        return { id: key, name: `user-${key}` };
+      },
+      { maxAge: 10, name: "protoFn", getKey: (key: string) => key },
+    );
+
+    // Miss: the resolver must actually run.
+    expect(await fn(id)).toEqual({ id, name: `user-${id}` });
+    expect(calls).toBe(1);
+
+    // Hit: served from storage, resolver not called again.
+    expect(await fn(id)).toEqual({ id, name: `user-${id}` });
+    expect(calls).toBe(1);
+  });
+
+  it("cachedFunction deduplicates concurrent calls for a prototype-named key", async () => {
+    let calls = 0;
+    const fn = defineCachedFunction(
+      async (key: string) => {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return `value-${key}`;
+      },
+      { maxAge: 10, name: "protoConcurrentFn", getKey: (key: string) => key },
+    );
+
+    const results = await Promise.all([fn("__proto__"), fn("__proto__"), fn("__proto__")]);
+    expect(results).toEqual(["value-__proto__", "value-__proto__", "value-__proto__"]);
+    expect(calls).toBe(1);
+  });
+
+  it.each(protoNames)("defineCachedHandler serves bare-word key %s", async (word) => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`page for /${word}`, { status: 200 });
+      },
+      { maxAge: 10, name: "protoHandler", getKey: () => word },
+    );
+
+    const event = { req: new Request(`http://localhost/${word}`) };
+
+    const r1 = (await handler(event)) as Response;
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toBe(`page for /${word}`);
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(calls).toBe(1);
+
+    const r2 = (await handler(event)) as Response;
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toBe(`page for /${word}`);
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(calls).toBe(1);
+  });
+});
+
+// Request narrowing swaps `event.req` for a plain `new Request(...)` and used to copy only
+// `runtime`, dropping `waitUntil`. Every background cache write, SWR refresh and eviction in
+// `cache.ts` reads `event.req.waitUntil` *after* that swap, so on the very runtimes that
+// provide it (Cloudflare Workers, srvx) none of them were ever handed to the runtime: the
+// isolate can be torn down before the write lands, making every request a MISS forever.
+// The copy must be *bound* to the original request — a bare copy loses the receiver.
+describe("waitUntil survives request narrowing", () => {
+  // The original request carries a cookie, which narrowing always strips (no `allowCookies`),
+  // so a receiver-dependent `waitUntil` can tell the original request from the narrowed one.
+  function makeWaitUntilEvent(path: string) {
+    const promises: Promise<unknown>[] = [];
+    const receivers: unknown[] = [];
+    const seenCookies: (string | null)[] = [];
+    const req = new Request(`http://localhost${path}`, { headers: { cookie: "sid=s1" } });
+    (req as any).waitUntil = function (this: Request, promise: Promise<unknown>) {
+      receivers.push(this);
+      seenCookies.push(this.headers.get("cookie"));
+      promises.push(promise);
+    };
+    return { event: { req } as HTTPEvent, req, promises, receivers, seenCookies };
+  }
+
+  it("registers exactly one waitUntil call for the cache write on a MISS", async () => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response("ok");
+      },
+      { maxAge: 10, name: "wuMiss" },
+    );
+
+    const { event, promises } = makeWaitUntilEvent("/wu-miss");
+    const r1 = (await handler(event)) as Response;
+    expect(r1.headers.get("x-cache")).toBe("MISS");
+    expect(calls).toBe(1);
+    // The cache write — and nothing else — was handed to the runtime.
+    expect(promises).toHaveLength(1);
+
+    await Promise.all(promises);
+    const r2 = (await handler({ req: new Request("http://localhost/wu-miss") })) as Response;
+    expect(r2.headers.get("x-cache")).toBe("HIT");
+    expect(calls).toBe(1);
+  });
+
+  it("registers the SWR background refresh on a stale read", async () => {
+    let calls = 0;
+    const handler = defineCachedHandler(
+      () => {
+        calls++;
+        return new Response(`v${calls}`);
+      },
+      { maxAge: 0.01, swr: true, staleMaxAge: 10, name: "wuSwr" },
+    );
+
+    const first = makeWaitUntilEvent("/wu-swr");
+    await handler(first.event);
+    await Promise.all(first.promises);
+    expect(calls).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const second = makeWaitUntilEvent("/wu-swr");
+    const stale = (await handler(second.event)) as Response;
+    expect(stale.headers.get("x-cache")).toBe("STALE");
+    expect(await stale.text()).toBe("v1");
+    // The background revalidation was handed to the runtime instead of being left to run
+    // untracked (where the isolate would be free to die before it finishes).
+    expect(second.promises.length).toBeGreaterThanOrEqual(1);
+
+    await Promise.all(second.promises);
+    // The refresh's own cache write is registered too; drain it as the runtime would.
+    await Promise.all(second.promises);
+    expect(calls).toBe(2);
+  });
+
+  it("hands waitUntil to the resolver bound to the original request", async () => {
+    let seenInHandler: unknown;
+    const handler = defineCachedHandler(
+      (event: HTTPEvent) => {
+        seenInHandler = event.req.waitUntil;
+        return new Response("ok");
+      },
+      { maxAge: 10, name: "wuBound" },
+    );
+
+    const { event, req, promises, receivers, seenCookies } = makeWaitUntilEvent("/wu-bound");
+    await handler(event);
+
+    // The resolver ran against the narrowed request (cookie stripped) and still saw waitUntil.
+    expect(event.req).not.toBe(req);
+    expect(typeof seenInHandler).toBe("function");
+    expect(event.req.headers.get("cookie")).toBe(null);
+
+    // Bound: every call ran with the ORIGINAL request as `this`, so a receiver-dependent
+    // implementation still sees the real request. A bare copy would pass the narrowed one.
+    expect(receivers.length).toBeGreaterThan(0);
+    expect(receivers.every((r) => r === req)).toBe(true);
+    expect(seenCookies.every((c) => c === "sid=s1")).toBe(true);
+
+    // Still reachable and callable after the handler returned.
+    const later = Promise.resolve("later");
+    event.req.waitUntil!(later);
+    expect(promises.at(-1)).toBe(later);
+    expect(receivers.at(-1)).toBe(req);
+  });
+});
+
+// `serialize`, `getMaxAge` and the resolver all run inside the shared in-flight promise, so a
+// resolution that never settles used to pin its `pending` slot for the lifetime of the
+// process: every later call for that key joined a resolution that would never finish, so one
+// hung upstream took the key down for every client until a restart (finding 03). The deadline
+// makes the shared promise always settle — the waiters reject, and the slot is freed by the
+// same cleanup path a resolver error already goes through.
+describe("maxResolveTime", () => {
+  /** A resolver that never settles, plus a handle on how many times it was entered. */
+  function hangingResolver() {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      fn: () => {
+        calls++;
+        return new Promise<string>(() => {});
+      },
+    };
+  }
+
+  it("rejects a resolution that never settles", async () => {
+    const hang = hangingResolver();
+    const fn = defineCachedFunction(hang.fn, {
+      maxAge: 10,
+      name: "hangReject",
+      maxResolveTime: 0.02,
+    });
+
+    await expect(fn()).rejects.toThrow(/timed out after 0.02s/);
+    expect(hang.calls).toBe(1);
+  });
+
+  it("names the failure TimeoutError", async () => {
+    const hang = hangingResolver();
+    const fn = defineCachedFunction(hang.fn, {
+      maxAge: 10,
+      name: "hangNamed",
+      maxResolveTime: 0.02,
+    });
+
+    await expect(fn()).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  // The finding's own regression test: a second request for a wedged key must not block
+  // indefinitely. Both callers are in flight *before* the deadline, so the second one is a
+  // deduplicated follower of the resolution that never settles.
+  it("does not block a second request for a wedged key", async () => {
+    const hang = hangingResolver();
+    const fn = defineCachedFunction(hang.fn, {
+      maxAge: 10,
+      name: "hangSecond",
+      maxResolveTime: 0.02,
+    });
+
+    const first = fn();
+    const second = fn();
+    const settled = await Promise.allSettled([first, second]);
+
+    expect(settled.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+    // One resolution, shared: the follower joined it rather than starting its own.
+    expect(hang.calls).toBe(1);
+  });
+
+  // ...and the key is usable again afterwards: the freed slot means the next call elects a
+  // fresh leader instead of joining the abandoned resolution.
+  it("recovers: a later call with a healthy resolver caches normally", async () => {
+    let hang = true;
+    let calls = 0;
+    const fn = defineCachedFunction(
+      () => {
+        calls++;
+        return hang ? new Promise<string>(() => {}) : Promise.resolve("healthy");
+      },
+      { maxAge: 10, name: "hangRecover", maxResolveTime: 0.02 },
+    );
+
+    await expect(fn()).rejects.toThrow(/timed out/);
+
+    hang = false;
+    expect(await fn()).toBe("healthy");
+    expect(calls).toBe(2);
+    // Cached, not just resolved.
+    expect(await fn()).toBe("healthy");
+    expect(calls).toBe(2);
+  });
+
+  // Also the unit guard: the deadline is **seconds**, so `1` is a full second and a resolver
+  // that takes 10ms is nowhere near it. Read as milliseconds it would fire at ~1ms — before
+  // the resolver settles — and this test would fail. (The tests where a timeout *does* fire
+  // can't catch that misreading: a deadline that is too short still fires.)
+  it("does not fire for a resolver that settles in time", async () => {
+    let calls = 0;
+    const fn = defineCachedFunction(
+      async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 10));
+        return "value";
+      },
+      { maxAge: 10, name: "inTime", maxResolveTime: 1 },
+    );
+
+    expect(await fn()).toBe("value");
+    expect(await fn()).toBe("value");
+    expect(calls).toBe(1);
+  });
+
+  // The hooks run inside the same shared promise, so the deadline has to cover them too —
+  // `serialize` is where a never-ending body would be drained.
+  it("covers a serialize hook that never settles", async () => {
+    const fn = defineCachedFunction(() => "value", {
+      maxAge: 10,
+      name: "hangSerialize",
+      maxResolveTime: 0.02,
+      serialize: () => new Promise(() => {}),
+    });
+
+    await expect(fn()).rejects.toThrow(/timed out/);
+  });
+
+  it.each([0, Number.POSITIVE_INFINITY, -1])("%s disables the deadline", async (timeout) => {
+    let settle: ((value: string) => void) | undefined;
+    const fn = defineCachedFunction(() => new Promise<string>((r) => (settle = r)), {
+      maxAge: 10,
+      name: `noDeadline${timeout}`,
+      maxResolveTime: timeout,
+    });
+
+    const call = fn();
+    let done = false;
+    void call.then(() => (done = true));
+
+    // Well past a deadline that would have fired had one been armed.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(done).toBe(false);
+
+    settle!("late");
+    expect(await call).toBe("late");
+  });
+
+  // A timed-out resolution is a failed one in every respect, the eviction included: a hung
+  // background refresh must not leave a dead entry behind for SWR to keep serving.
+  it("evicts the entry a timed-out background refresh was refreshing", async () => {
+    let hang = false;
+    const fn = defineCachedFunction(
+      () => (hang ? new Promise<string>(() => {}) : Promise.resolve("v1")),
+      {
+        maxAge: 0.01,
+        swr: true,
+        staleMaxAge: 60,
+        name: "hangSwr",
+        maxResolveTime: 0.02,
+        onError: () => {},
+      },
+    );
+
+    expect(await fn()).toBe("v1");
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Expired: served stale while the background refresh runs — and hangs.
+    hang = true;
+    expect(await fn()).toBe("v1");
+    await vi.waitFor(async () => {
+      const keys = await fn.resolveKeys();
+      expect(await testStorage.get(keys[0]!)).toBeNull();
+    });
+  });
+
+  // Every armed deadline must be cleared when the resolution settles, or a long-lived process
+  // accumulates one live timer per resolution.
+  it("leaves no timer behind across many resolutions", async () => {
+    // A delay no other timer in the process would pick, so the armed set is exactly ours —
+    // and, since the option is in seconds while `setTimeout` is in milliseconds, the literal
+    // pins that conversion too (`987.5` is exactly representable, so no float dust).
+    const timeoutSeconds = 987.5;
+    const timeout = 987_500;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const armed: unknown[] = [];
+    const cleared = new Set<unknown>();
+    const setSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      cb: any,
+      ms?: any,
+      ...rest: any[]
+    ) => {
+      const handle = realSetTimeout(cb, ms, ...rest);
+      if (ms === timeout) {
+        armed.push(handle);
+      }
+      return handle;
+    }) as any);
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((handle: any) => {
+      cleared.add(handle);
+      realClearTimeout(handle);
+    }) as any);
+
+    try {
+      const fn = defineCachedFunction((i: number) => `v${i}`, {
+        maxAge: 10,
+        name: "noTimerLeak",
+        getKey: (i: number) => String(i),
+        maxResolveTime: timeoutSeconds,
+      });
+
+      for (let i = 0; i < 25; i++) {
+        expect(await fn(i)).toBe(`v${i}`);
+      }
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+
+    expect(armed.length).toBe(25);
+    expect(armed.every((handle) => cleared.has(handle))).toBe(true);
   });
 });

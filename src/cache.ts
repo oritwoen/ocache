@@ -1,6 +1,7 @@
-import { hash } from "ohash";
-import { useStorage } from "./storage.ts";
+import { hash } from "./hash.ts";
+import { resolveStorage } from "./storage.ts";
 
+import type { StorageInterface, StorageOption } from "./storage.ts";
 import type { HTTPEvent, CacheEntry, CacheOptions, CacheStatus } from "./types.ts";
 
 function defaultCacheOptions() {
@@ -12,55 +13,54 @@ function defaultCacheOptions() {
   } as const;
 }
 
+/** Default deadline for the resolver and its hooks, in seconds. */
+const DEFAULT_MAX_RESOLVE_TIME = 30;
+
 type ResolvedCacheEntry<T> = CacheEntry<T> & { value: T; status: CacheStatus };
 
 export type CachedFunction<T, ArgsT extends unknown[]> = {
   (...args: ArgsT): Promise<T>;
-  /** Resolves all storage keys (one per base prefix) for the given arguments. */
+  /** Returns one storage key per base prefix. */
   resolveKeys: (...args: ArgsT) => Promise<string[]>;
-  /** Invalidates (removes) cached entries for the given arguments across all base prefixes. */
+  /** Removes matching entries from all base prefixes. */
   invalidate: (...args: ArgsT) => Promise<void>;
-  /** Marks cached entries as stale across all base prefixes. With SWR, stale values are still served (within `staleMaxAge`) while the next access triggers a background refresh. */
+  /** Marks matching entries as stale in all base prefixes. */
   expire: (...args: ArgsT) => Promise<void>;
 };
 
 /**
- * Wraps a function with caching support including TTL, SWR, integrity checks, and request deduplication.
+ * Wraps a function with caching, SWR, integrity checks, and request deduplication.
  *
- * @param fn - The function to cache.
- * @param opts - Cache configuration options.
- * @returns A cached function with a `.resolveKey(...args)` method for cache key resolution.
+ * @param fn - Function to cache.
+ * @param opts - Cache options.
+ * @returns The cached function and its cache management methods.
  */
 export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   fn: (...args: ArgsT) => T | Promise<T>,
   opts: CacheOptions<T, ArgsT> = {},
 ): CachedFunction<T, ArgsT> {
-  // Resolve `name` from the caller's opts BEFORE merging defaults: defaultCacheOptions()
-  // sets a truthy `name: "_"`, so if defaults were merged first `opts.name` would always
-  // be `"_"` and the `fn.name` fallback would be unreachable (silent cache-key collision
-  // across every unnamed cached function — https://github.com/unjs/ocache/issues/53).
-  //
-  // For anonymous functions (no `opts.name`, no `fn.name`) fall back to a hash of the
-  // function source instead of a shared literal: two distinct inline arrows would
-  // otherwise resolve to the same key and thrash each other (each read fails the
-  // integrity check and re-resolves). This can't disambiguate same-source functions
-  // that only differ by closed-over variables — pass an explicit `name`/`getKey` for
-  // those (the integrity hash collides there too, so it's unfixable from the source alone).
-  const name = opts.name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
-  opts = { ...defaultCacheOptions(), ...opts, name };
+  // Resolve the name before defaults because the default name would hide the function name.
+  const name = resolveName(opts.name, fn);
+  // Storage resolution writes the instance to the caller's options object.
+  const _optsRef = opts;
+  // Explicit `undefined` values do not override defaults.
+  opts = { ...defaultCacheOptions(), ...definedOptions(opts), name };
 
-  // Deduplicates concurrent resolutions for the same key. The shared result carries
-  // the storable (post-`serialize`) value plus any dynamic TTL, so `getMaxAge` and
-  // `serialize` run exactly once and every caller observes the same value.
-  const pending: {
-    [key: string]: Promise<{ value: T; maxAge?: number; staleMaxAge?: number }>;
-  } = {};
+  // Resolve factories on first use and create one default store per cached function.
+  const getStorage = (): StorageInterface => resolveStorage(_optsRef, opts);
 
-  // Normalize cache params
+  // A Map prevents user-controlled keys from reading Object prototype members.
+  const pending = new Map<string, Promise<{ value: T; maxAge?: number; staleMaxAge?: number }>>();
+
+  // Resolve settings shared by every call.
   const group = opts.group || "functions";
-  const integrity = opts.integrity || hash([fn, _integrityOpts(opts)]);
+  const integrity = opts.integrity || hash([fn, integrityOpts(opts)]);
   const validate = opts.validate || ((entry) => entry.value !== undefined);
-  const _onError = (context: string, error: unknown) => {
+  // Keep the default outside `defaultCacheOptions` to preserve existing integrity hashes.
+  const rawMaxResolveTime = opts.maxResolveTime ?? DEFAULT_MAX_RESOLVE_TIME;
+  const maxResolveTime =
+    Number.isFinite(rawMaxResolveTime) && rawMaxResolveTime > 0 ? rawMaxResolveTime : undefined;
+  const onError = (context: string, error: unknown) => {
     if (opts.onError) {
       opts.onError(error);
     } else {
@@ -76,17 +76,16 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
     event?: HTTPEvent,
   ): Promise<ResolvedCacheEntry<T>> {
     const validateCtx = { args };
-    // Use extension for key to avoid conflicting with parent namespace (foo/bar and foo/bar/baz)
-    const bases = _normalizeBases(opts.base);
+    // The extension separates a key from a parent namespace with the same prefix.
+    const bases = normalizeBases(opts.base);
 
     let entry: CacheEntry<T> = {} as CacheEntry<T>;
-    // Index of the base that had a cache hit (-1 = miss on all tiers)
+    // A negative index means that all storage tiers missed.
     let hitIndex = -1;
     try {
-      // Multi-tier read: try each base prefix in order, use first hit
       for (let i = 0; i < bases.length; i++) {
-        const result = (await useStorage().get(
-          _buildCacheKey(key, { group, name }, bases[i]!),
+        const result = (await getStorage().get(
+          buildCacheKey(key, { group, name }, bases[i]!),
         )) as CacheEntry<T> | null;
         if (result) {
           entry = result;
@@ -95,24 +94,20 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         }
       }
     } catch (error) {
-      _onError("[cache] Cache read error.", error);
+      onError("[cache] Cache read error.", error);
     }
 
     // https://github.com/nitrojs/nitro/issues/2160
     if (typeof entry !== "object") {
       entry = {};
       const error = new Error("Malformed data read from cache.");
-      _onError("[cache]", error);
+      onError("[cache]", error);
     } else {
-      // Work on a per-call shallow clone: a storage backend may return the entry by
-      // reference (the built-in memory storage does), so all subsequent in-place
-      // mutations below — freshness resets, the `status` attach, the SWR value
-      // refresh — must not corrupt the object still held in storage or let
-      // concurrent same-key calls overwrite each other's per-call fields.
+      // Clone entries because a backend may return a shared object reference.
       entry = { ...entry };
     }
 
-    // Per-entry TTL (set by the `getMaxAge` hook on the previous write) takes precedence over static options.
+    // Per-entry lifetimes override static options.
     const readMaxAge = entry.maxAge ?? opts.maxAge;
     const readStaleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
 
@@ -126,20 +121,15 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
         ? readStaleMaxAge * 1000
         : undefined;
 
-    // A zero stale window means stale must never be served (e.g. upstream
-    // proxy-revalidate semantics): revalidate in the foreground instead.
+    // A zero stale window requires foreground revalidation.
     const swr = opts.swr && staleTtl !== 0;
 
-    // When staleMaxAge is set, an entry is completely dead after maxAge + staleMaxAge
     const isFullyExpired =
       staleTtl !== undefined &&
       readMaxAge != null &&
       Date.now() - (entry.mtime || 0) > ttl + staleTtl;
 
-    // Computed once and reused for both the `expired` check and the `status`
-    // decision below (same entry state, so re-validating would just repeat work).
-    // `validate` may be async (e.g. checking the cached value against an external source),
-    // so await it here. A sync return is fine too — `await` on a non-promise is a no-op.
+    // Run asynchronous validation once per read.
     const _isValid = (await validate(entry, validateCtx)) !== false;
 
     const expired =
@@ -150,7 +140,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       (ttl > 0 && Date.now() - (entry.mtime || 0) > ttl) ||
       !_isValid;
 
-    // If fully expired beyond staleMaxAge, clear the stale value so SWR won't serve it
+    // Remove values that are older than the complete stale window.
     if (isFullyExpired) {
       entry.value = undefined;
       entry.integrity = undefined;
@@ -158,12 +148,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       entry.expires = undefined;
     }
 
-    // Determine how this call will be served (mirrors the serve decision below):
-    // - no usable cached value -> resolved fresh (miss)
-    // - fresh cached value -> hit
-    // - expired but served stale under SWR -> stale
-    // - a prior value existed but was expired/invalid and re-resolved in the
-    //   foreground (no stale served) -> revalidated
+    // This status must match the serve decision below.
     const status: CacheStatus =
       entry.value === undefined
         ? "miss"
@@ -173,129 +158,108 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
             ? "stale"
             : "revalidated";
 
-    const _resolve = async () => {
-      const isPending = pending[key];
+    const resolveEntry = async () => {
+      const isPending = pending.has(key);
       if (!isPending) {
         if (entry.value !== undefined && (opts.staleMaxAge || 0) >= 0 && opts.swr === false) {
-          // Remove cached entry to prevent using expired cache on concurrent requests
           entry.value = undefined;
           entry.integrity = undefined;
           entry.mtime = undefined;
           entry.expires = undefined;
         }
-        // Resolve the value once and share it (plus any dynamic TTL and the
-        // storable form) with all concurrent callers. `getMaxAge` and `serialize`
-        // run exactly once here — critical for `serialize`, which may consume a
-        // one-shot source (e.g. a `ReadableStream`).
-        pending[key] = (async () => {
+        // Share serialization because it may consume a one-use stream.
+        const resolution = (async () => {
           const value = await resolver();
-          // Throwaway entry so the hooks can inspect resolution metadata.
+          // Hooks inspect this entry before storage.
           const resolvedEntry: CacheEntry<T> = { value, mtime: Date.now(), integrity };
           let maxAge: number | undefined;
           let staleMaxAge: number | undefined;
-          // Derive per-entry lifetime from the resolved value, overriding static options for this write.
           if (opts.getMaxAge) {
             try {
               const resolved = await opts.getMaxAge(resolvedEntry);
-              // A bare number is shorthand for `{ maxAge }`.
               const dynamic = typeof resolved === "number" ? { maxAge: resolved } : resolved;
-              // Clamp to a non-negative TTL: a value <= 0 means "don't cache" (re-resolve every
-              // access), never "cache forever as fresh". Non-finite (NaN) falls back to static options.
-              maxAge = _clampTtl(dynamic?.maxAge);
-              staleMaxAge = _clampTtl(dynamic?.staleMaxAge);
+              // Non-positive lifetimes disable storage.
+              maxAge = clampTtl(dynamic?.maxAge);
+              staleMaxAge = clampTtl(dynamic?.staleMaxAge);
               resolvedEntry.maxAge = maxAge;
               resolvedEntry.staleMaxAge = staleMaxAge;
             } catch (error) {
-              _onError("[cache] getMaxAge hook error.", error);
+              onError("[cache] getMaxAge hook error.", error);
             }
           }
-          // Prepare the value for storage (write-side counterpart of `transform`).
-          // Runs after `getMaxAge` so that hook still sees the raw resolved value.
+          // Run `serialize` after `getMaxAge` so the lifetime hook sees the live value.
           const stored = opts.serialize ? await opts.serialize(resolvedEntry, validateCtx) : value;
           return { value: stored, maxAge, staleMaxAge };
         })();
+        // Reject all waiters on timeout and prevent a late result from reaching storage.
+        pending.set(key, maxResolveTime ? withDeadline(resolution, maxResolveTime) : resolution);
       }
 
       let resolved: { value: T; maxAge?: number; staleMaxAge?: number };
       try {
-        resolved = await pending[key]!;
+        resolved = await pending.get(key)!;
       } catch (error) {
-        // Make sure entries that reject get removed.
+        // Treat a timeout like any other failed resolution.
         if (!isPending) {
-          delete pending[key];
-          // Evict stale entry from storage so SWR doesn't keep serving it
-          const evictPromise = _evictFromStorage(key, bases, group, name).catch((error) => {
-            _onError("[cache] Cache eviction error.", error);
-          });
+          pending.delete(key);
+          const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
+            (error) => {
+              onError("[cache] Cache eviction error.", error);
+            },
+          );
           event?.req.waitUntil?.(evictPromise);
         }
-        // Re-throw error to make sure the caller knows the task failed.
         throw error;
       }
 
-      // Every caller (leader + deduplicated followers) observes the same storable
-      // value, so `transform` deserializes consistently on every path.
+      // Leaders and followers use the same serialized value.
       entry.value = resolved.value;
 
       if (!isPending) {
-        // Update mtime, integrity + validate and set the value in cache only the first time the request is made.
         entry.mtime = Date.now();
         entry.integrity = integrity;
         entry.stale = undefined;
-        delete pending[key];
-        // Persist the per-entry lifetime derived by `getMaxAge` above, overriding static options for this write.
+        pending.delete(key);
+        // Store dynamic lifetimes with the entry.
         if (opts.getMaxAge) {
           entry.maxAge = resolved.maxAge;
           entry.staleMaxAge = resolved.staleMaxAge;
         }
-        if ((await validate(entry, validateCtx)) !== false) {
-          // Per-entry TTL (from the `getMaxAge` hook) falls back to static options when not provided.
-          const writeMaxAge = entry.maxAge ?? opts.maxAge;
-          const writeStaleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
-          let setOpts: { ttl?: number } | undefined;
-          if (writeMaxAge != null && writeMaxAge > 0) {
-            if (opts.swr) {
-              // With SWR, storage TTL must cover maxAge + staleMaxAge window
-              if (writeStaleMaxAge != null && writeStaleMaxAge >= 0) {
-                setOpts = { ttl: writeMaxAge + writeStaleMaxAge };
-              }
-              // If staleMaxAge is not set, no storage TTL (entry lives until manually evicted)
-            } else {
-              setOpts = { ttl: writeMaxAge };
-            }
-          }
-          // Multi-tier write: only write to tiers up to the one that matched.
-          // If no tier had a hit (hitIndex === -1), write to all tiers.
-          // If tier N matched, write to tiers 0..N (promote upward + refresh hit tier).
+        const setOpts = storageTtl(
+          entry.maxAge ?? opts.maxAge,
+          entry.staleMaxAge ?? opts.staleMaxAge,
+          opts.swr,
+        );
+        if ((await validate(entry, validateCtx)) !== false && setOpts !== false) {
+          // Write misses to all tiers and promote lower-tier hits.
           const writeBases = hitIndex < 0 ? bases : bases.slice(0, hitIndex + 1);
-          // `status` is a per-call field — never persist it to storage.
+          // Never persist per-call status.
           const { status: _status, ...toStore } = entry;
           const promise = (async () => {
             try {
               await Promise.all(
                 writeBases.map((b) =>
-                  useStorage().set(_buildCacheKey(key, { group, name }, b), toStore, setOpts),
+                  getStorage().set(buildCacheKey(key, { group, name }, b), toStore, setOpts),
                 ),
               );
             } catch (error) {
-              _onError("[cache] Cache write error.", error);
+              onError("[cache] Cache write error.", error);
             }
           })();
           event?.req.waitUntil?.(promise);
         } else if (hitIndex >= 0) {
-          // A prior cached entry existed but revalidation produced an invalid result —
-          // evict it so SWR doesn't keep serving the stale value. When there was no
-          // cache hit (hitIndex === -1) nothing is stored, so skip the redundant delete
-          // (e.g. a handler returning `Cache-Control: no-store`/`private` on every request).
-          const evictPromise = _evictFromStorage(key, bases, group, name).catch((error) => {
-            _onError("[cache] Cache eviction error.", error);
-          });
+          // Remove an old entry when its replacement cannot be stored.
+          const evictPromise = evictFromStorage(getStorage(), key, bases, group, name).catch(
+            (error) => {
+              onError("[cache] Cache eviction error.", error);
+            },
+          );
           event?.req.waitUntil?.(evictPromise);
         }
       }
     };
 
-    const _resolvePromise = expired ? _resolve() : Promise.resolve();
+    const _resolvePromise = expired ? resolveEntry() : Promise.resolve();
 
     if (entry.value === undefined) {
       await _resolvePromise;
@@ -303,14 +267,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
       event?.req.waitUntil?.(_resolvePromise);
     }
 
-    // Attach the per-call `status` to `entry`. `entry` is a per-call clone (see the
-    // read path above), never the object a ref-sharing storage backend still holds,
-    // so this can't corrupt shared state or race with concurrent same-key calls. It's
-    // still marked NON-ENUMERABLE as defence-in-depth so it stays out of every
-    // persistence path (object spreads, JSON/structuredClone). Attaching to the live
-    // clone (rather than a fresh return-time copy) means a synchronous SWR
-    // revalidation that updates `entry.value` in a microtask is reflected in the
-    // returned value.
+    // Keep status non-enumerable so storage cannot persist it.
     Object.defineProperty(entry, "status", {
       value: status,
       enumerable: false,
@@ -320,7 +277,7 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
 
     if (swr && (await validate(entry, validateCtx)) !== false) {
       _resolvePromise.catch((error) => {
-        _onError("[cache] SWR handler error.", error);
+        onError("[cache] SWR handler error.", error);
       });
       return entry as ResolvedCacheEntry<T>;
     }
@@ -350,8 +307,15 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
   };
 
   cachedFn.resolveKeys = (...args: ArgsT) => resolveCacheKeys({ options: opts, args });
-  cachedFn.invalidate = (...args: ArgsT) => invalidateCache({ options: opts, args });
-  cachedFn.expire = (...args: ArgsT) => expireCache({ options: opts, args });
+  // Resolve storage before purge helpers copy the options.
+  cachedFn.invalidate = (...args: ArgsT) => {
+    getStorage();
+    return invalidateCache({ options: opts, args });
+  };
+  cachedFn.expire = (...args: ArgsT) => {
+    getStorage();
+    return expireCache({ options: opts, args });
+  };
 
   return cachedFn;
 }
@@ -359,20 +323,14 @@ export function defineCachedFunction<T, ArgsT extends unknown[] = any[]>(
 /** Alias for {@link defineCachedFunction}. */
 export const cachedFunction = defineCachedFunction;
 
-// --- Public helpers ---
-
 /**
- * Resolves all cache storage keys (one per base prefix) for given arguments and cache options.
+ * Returns one storage key per base prefix.
  *
- * Uses the same key derivation as `defineCachedFunction` internally:
- * - When `opts.getKey` is provided, it is called with `args` to produce the key segment.
- * - Otherwise, `args` are hashed with `ohash` (same default as `defineCachedFunction`).
+ * Pass the same `getKey`, `name`, `group`, and `base` options as the cached function.
+ * This helper computes keys without accessing storage.
  *
- * Pass the same `getKey`, `name`, `group`, and `base` options you use in
- * `defineCachedFunction` / `defineCachedHandler` to get the exact storage keys.
- *
- * @param input - Object with `options` (cache options) and optional `args` (function arguments).
- * @returns An array of storage key strings (one per base prefix).
+ * @param input - Cache options and function arguments.
+ * @returns Storage keys in base-prefix order.
  *
  * @example
  * ```ts
@@ -380,9 +338,6 @@ export const cachedFunction = defineCachedFunction;
  *   options: { name: "fetchUser", getKey: (id: string) => id },
  *   args: ["user-123"],
  * });
- * for (const key of keys) {
- *   await useStorage().set(key, null); // invalidate all tiers
- * }
  * ```
  */
 export async function resolveCacheKeys<ArgsT extends unknown[] = any[]>(
@@ -394,56 +349,51 @@ export async function resolveCacheKeys<ArgsT extends unknown[] = any[]>(
   const opts = input.options ?? {};
   const args = input.args ?? ([] as unknown as ArgsT);
   const key = await (opts.getKey || getKey)(...args);
-  return _normalizeBases(opts.base).map((base) => _buildCacheKey(key, opts, base));
+  return normalizeBases(opts.base).map((base) => buildCacheKey(key, opts, base));
 }
 
 /**
- * Invalidates (removes) cached entries for given arguments and cache options across all base prefixes.
+ * Removes matching entries from all base prefixes.
  *
- * Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
+ * Pass the original options object or the same explicit storage backend.
+ * This function throws when `options.storage` is unset because no global store exists.
+ * Prefer the cached function's `.invalidate()` method when available.
  *
- * @param input - Object with `options` (cache options) and optional `args` (function arguments).
+ * @param input - Cache options and function arguments.
  *
  * @example
  * ```ts
- * // Invalidate a specific cached entry
  * await invalidateCache({
- *   options: { name: "fetchUser", getKey: (id: string) => id },
+ *   options: { name: "fetchUser", getKey: (id: string) => id, storage },
  *   args: ["user-123"],
  * });
  * ```
  */
 export async function invalidateCache<ArgsT extends unknown[] = any[]>(
   input: {
-    options?: Pick<CacheOptions<any, ArgsT>, "base" | "group" | "name" | "getKey">;
+    options?: Pick<CacheOptions<any, ArgsT>, "base" | "group" | "name" | "getKey" | "storage">;
     args?: ArgsT;
   } = {},
 ): Promise<void> {
   const keys = await resolveCacheKeys(input);
-  const storage = useStorage();
+  const storage = requireStorage(input.options, "invalidateCache");
   await Promise.all(keys.map((key) => storage.set(key, null)));
 }
 
 /**
- * Expires cached entries for given arguments and cache options across all base prefixes,
- * without removing them.
+ * Marks matching entries as stale without removing them.
  *
- * Unlike {@link invalidateCache} (which removes entries entirely), expired entries keep
- * serving the stale value with SWR — still bounded by the originally configured
- * `staleMaxAge` window — while the next access triggers a background refresh.
- * Without SWR, the next call re-resolves before returning.
+ * SWR may serve the stale value within its original stale window.
+ * Without SWR, the next call revalidates before returning.
+ * Pass the original lifetime options to preserve the remaining storage TTL.
+ * This function throws when `options.storage` is unset.
  *
- * Uses the same key derivation as `defineCachedFunction` / `resolveCacheKeys`.
- * Pass the same `maxAge` / `swr` / `staleMaxAge` options you cache with so the
- * remaining storage TTL is preserved.
- *
- * @param input - Object with `options` (cache options) and optional `args` (function arguments).
+ * @param input - Cache options and function arguments.
  *
  * @example
  * ```ts
- * // Mark a cached entry for background refresh on next access
  * await expireCache({
- *   options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, staleMaxAge: 300 },
+ *   options: { name: "fetchUser", getKey: (id: string) => id, maxAge: 60, swr: true, storage },
  *   args: ["user-123"],
  * });
  * ```
@@ -452,33 +402,86 @@ export async function expireCache<ArgsT extends unknown[] = any[]>(
   input: {
     options?: Pick<
       CacheOptions<any, ArgsT>,
-      "base" | "group" | "name" | "getKey" | "maxAge" | "swr" | "staleMaxAge"
+      "base" | "group" | "name" | "getKey" | "maxAge" | "swr" | "staleMaxAge" | "storage"
     >;
     args?: ArgsT;
   } = {},
 ): Promise<void> {
   const opts = input.options ?? {};
   const keys = await resolveCacheKeys(input);
-  const storage = useStorage();
+  const storage = requireStorage(opts, "expireCache");
   await Promise.all(
     keys.map(async (key) => {
       const entry = (await storage.get(key)) as CacheEntry | null;
       if (!entry || typeof entry !== "object" || entry.value === undefined) {
         return;
       }
-      await storage.set(key, { ...entry, stale: true }, _remainingTtl(entry, opts));
+      await storage.set(key, { ...entry, stale: true }, remainingTtl(entry, opts));
     }),
   );
 }
 
-// --- Internal helpers ---
+// Resolve names before merging defaults. Equal-source closures need explicit names.
+export function resolveName(name: string | undefined, fn: (...args: any[]) => any): string {
+  return name || fn.name || `anon_${hash(fn).slice(0, 16)}`;
+}
+
+// Copy options and remove `undefined` so defaults remain effective.
+export function definedOptions<T extends object>(opts: T): T {
+  const cleaned = { ...opts } as Record<string, unknown>;
+  for (const key of Object.keys(cleaned)) {
+    if (cleaned[key] === undefined) {
+      delete cleaned[key];
+    }
+  }
+  return cleaned as T;
+}
+
+// Purge helpers must use the write-side backend; no global fallback exists.
+function requireStorage(
+  options: { storage?: StorageOption } | undefined,
+  caller: string,
+): StorageInterface {
+  if (!options?.storage) {
+    throw new Error(`[ocache] ${caller}() requires \`options.storage\``);
+  }
+  return resolveStorage(options);
+}
+
+// Reject stalled work without cancelling it.
+// Attach both settle handlers to clear the timer and absorb late rejections.
+// Avoid `Promise.race` because its extra microtasks change SWR timing.
+function withDeadline<T>(work: Promise<T>, seconds: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error(`[cache] Resolver timed out after ${seconds}s.`);
+      // Match the platform timeout error name.
+      error.name = "TimeoutError";
+      reject(error);
+    }, seconds * 1000);
+    // Do not keep the process alive for a deadline timer.
+    if (timer && typeof timer === "object" && "unref" in timer) {
+      timer.unref();
+    }
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 function isHTTPEvent(input: unknown): input is HTTPEvent {
   return (input as any)?.req instanceof Request;
 }
 
-/** Normalizes a dynamic TTL: clamps negatives to 0, treats nullish/non-finite as "unset" (static fallback). */
-function _clampTtl(value: number | undefined): number | undefined {
+/** Clamps negative TTLs to zero and maps non-finite TTLs to `undefined`. */
+function clampTtl(value: number | undefined): number | undefined {
   return value == null || !Number.isFinite(value) ? undefined : Math.max(0, value);
 }
 
@@ -486,56 +489,86 @@ function getKey(...args: unknown[]) {
   return args.length > 0 ? hash(args) : "";
 }
 
-function _buildCacheKey(
+function buildCacheKey(
   key: string,
   opts: Pick<CacheOptions, "group" | "name">,
   base: string,
 ): string {
   const group = opts.group || "functions";
-  const name = opts.name || "_";
+  // Function names may contain cache-key separators.
+  const name = escapeKeySegment(opts.name || "_");
   return [base, group, name, key + ".json"].filter(Boolean).join(":").replace(/:\/$/, ":index");
 }
 
-function _normalizeBases(base: CacheOptions["base"]): [string, ...string[]] {
+// Hash changed segments because removing punctuation is lossy.
+export function escapeKeySegment(raw: string): string {
+  const escaped = escapeKey(raw);
+  return escaped === raw ? escaped : `${escaped.slice(0, 64)}.${hash(raw)}`;
+}
+
+// Use `escapeKeySegment` for segments in colon-delimited keys.
+export function escapeKey(key: string | string[]): string {
+  return String(key).replace(/\W/g, "");
+}
+
+function normalizeBases(base: CacheOptions["base"]): [string, ...string[]] {
   if (Array.isArray(base)) return base as [string, ...string[]];
   return [base ?? "/cache"];
 }
 
-async function _evictFromStorage(key: string, bases: string[], group: string, name: string) {
-  await Promise.all(
-    bases.map((b) => useStorage().set(_buildCacheKey(key, { group, name }, b), null)),
-  );
+async function evictFromStorage(
+  storage: StorageInterface,
+  key: string,
+  bases: string[],
+  group: string,
+  name: string,
+) {
+  await Promise.all(bases.map((b) => storage.set(buildCacheKey(key, { group, name }, b), null)));
 }
 
-/** Computes remaining storage TTL (seconds) so expiring an entry doesn't extend its original lifetime. */
-function _remainingTtl(
+// Never store an entry without an expiry or storage TTL.
+// Unbounded SWR uses backend capacity instead of a TTL.
+function storageTtl(
+  maxAge: number | undefined,
+  staleMaxAge: number | undefined,
+  swr: boolean | undefined,
+): { ttl: number } | undefined | false {
+  if (maxAge == null || maxAge <= 0) {
+    return false;
+  }
+  if (!swr) {
+    return { ttl: maxAge };
+  }
+  // A bounded TTL must cover both the fresh and stale windows.
+  return staleMaxAge != null && staleMaxAge >= 0 ? { ttl: maxAge + staleMaxAge } : undefined;
+}
+
+/** Returns the remaining storage TTL without extending the original lifetime. */
+function remainingTtl(
   entry: CacheEntry,
   opts: Pick<CacheOptions, "maxAge" | "swr" | "staleMaxAge">,
 ): { ttl: number } | undefined {
-  // Prefer the per-entry TTL persisted by `getMaxAge`, falling back to static options.
-  const maxAge = entry.maxAge ?? opts.maxAge;
-  const staleMaxAge = entry.staleMaxAge ?? opts.staleMaxAge;
-  if (!entry.mtime || maxAge == null || maxAge <= 0) {
+  // Use the write-path policy and prefer per-entry lifetimes.
+  const ttlOpts = storageTtl(
+    entry.maxAge ?? opts.maxAge,
+    entry.staleMaxAge ?? opts.staleMaxAge,
+    opts.swr,
+  );
+  if (!entry.mtime || !ttlOpts) {
     return undefined;
   }
-  // Mirrors the TTL window used on cache writes (see `get` in defineCachedFunction).
-  // `!opts.swr` (rather than `=== false`) so an unset `swr` aligns with the SWR-off
-  // default on the standalone `expireCache` path, which doesn't merge defaultCacheOptions.
-  const ttlWindow = !opts.swr
-    ? maxAge
-    : staleMaxAge != null && staleMaxAge >= 0
-      ? maxAge + staleMaxAge
-      : undefined;
-  if (ttlWindow === undefined) {
-    return undefined;
-  }
-  return { ttl: Math.max(Math.ceil((entry.mtime + ttlWindow * 1000 - Date.now()) / 1000), 1) };
+  return { ttl: Math.max(Math.ceil((entry.mtime + ttlOpts.ttl * 1000 - Date.now()) / 1000), 1) };
 }
 
-/** Strips storage-location fields from opts so integrity only reflects the cached computation. */
-function _integrityOpts(
+/**
+ * Removes storage-location options from the integrity input.
+ *
+ * A backend change does not change the cached computation.
+ * Hashing storage objects is also expensive and cannot capture closed-over configuration.
+ */
+function integrityOpts(
   opts: CacheOptions<any, any>,
-): Omit<CacheOptions, "base" | "group" | "name"> {
-  const { base: _, group: _g, name: _n, ...rest } = opts;
+): Omit<CacheOptions, "base" | "group" | "name" | "storage"> {
+  const { base: _, group: _g, name: _n, storage: _s, ...rest } = opts;
   return rest;
 }

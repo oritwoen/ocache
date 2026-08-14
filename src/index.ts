@@ -7,14 +7,13 @@ export {
   type CachedFunction,
 } from "./cache.ts";
 
-export { defineCachedHandler } from "./http.ts";
+export { defineCachedHandler } from "./http/index.ts";
 
 export {
   type StorageInterface,
+  type StorageOption,
   type MemoryStorageOptions,
   createMemoryStorage,
-  useStorage,
-  setStorage,
 } from "./storage.ts";
 
 export type {

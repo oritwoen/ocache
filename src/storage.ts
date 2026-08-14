@@ -3,29 +3,61 @@ export interface StorageInterface {
   set<T = unknown>(key: string, value: T, opts?: { ttl?: number }): void | Promise<void>;
 }
 
-/** Default entry ceiling for the built-in memory storage before LRU eviction kicks in. */
+/** Default entry limit for memory storage. */
 const DEFAULT_MEMORY_MAX_SIZE = 10_000;
+
+/** Default estimated byte limit for memory storage. */
+const DEFAULT_MEMORY_MAX_BYTES = 100 * 1024 * 1024;
 
 export interface MemoryStorageOptions {
   /**
-   * Maximum number of entries to keep. When exceeded, the least-recently-used
-   * entries are evicted. Defaults to `10 000`. Pass `Infinity` (or `0`) to
-   * disable the ceiling and grow unbounded.
+   * Maximum entry count before LRU eviction.
+   *
+   * Defaults to `10 000`.
+   * Set `Infinity` or `0` to disable this limit.
+   * Use {@link maxBytes} to limit attacker-influenced entry sizes.
    */
   maxSize?: number;
+
+  /**
+   * Maximum estimated bytes, including keys, before LRU eviction.
+   *
+   * Defaults to `100 MB`.
+   * Set `Infinity` or `0` to disable this limit.
+   * An oversized entry replaces its old value with no stored value.
+   */
+  maxBytes?: number;
+
+  /**
+   * Returns the complete byte charge for a value and its key.
+   *
+   * Memory storage calls this hook only when {@link maxBytes} is active.
+   * The built-in estimate does not count values deeper than eight levels.
+   * Provide `sizeOf` for custom deep shapes.
+   * Invalid results and errors use the built-in estimate.
+   */
+  sizeOf?: (value: unknown, key: string) => number;
 }
 
-/** Creates an in-memory storage backed by a `Map` with optional TTL support (in seconds) and LRU eviction. */
+/** Creates Map-based memory storage with TTLs in seconds and LRU eviction. */
 export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInterface {
   const rawMaxSize = opts.maxSize ?? DEFAULT_MEMORY_MAX_SIZE;
-  // A finite positive ceiling enables LRU eviction; Infinity / 0 / negative disable it.
+  const rawMaxBytes = opts.maxBytes ?? DEFAULT_MEMORY_MAX_BYTES;
   const maxSize = Number.isFinite(rawMaxSize) && rawMaxSize > 0 ? rawMaxSize : undefined;
-  const map = new Map<string, { value: unknown; expires?: number }>();
+  const maxBytes = Number.isFinite(rawMaxBytes) && rawMaxBytes > 0 ? rawMaxBytes : undefined;
+  const sizeOf = opts.sizeOf;
+  const map = new Map<string, { value: unknown; expires?: number; bytes: number }>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  // All removal paths must update this running byte total through `deleteEntry`.
+  let totalBytes = 0;
 
-  function _delete(key: string) {
-    map.delete(key);
-    _clearTimer(timers, key);
+  function deleteEntry(key: string) {
+    const entry = map.get(key);
+    if (entry) {
+      totalBytes -= entry.bytes;
+      map.delete(key);
+    }
+    clearTimer(timers, key);
   }
 
   return {
@@ -35,55 +67,139 @@ export function createMemoryStorage(opts: MemoryStorageOptions = {}): StorageInt
         return null;
       }
       if (entry.expires && Date.now() > entry.expires) {
-        _delete(key);
+        deleteEntry(key);
         return null;
       }
-      // Mark as most-recently-used by reinserting (Map preserves insertion order).
-      if (maxSize) {
+      // Move the entry to MRU without changing its byte charge.
+      if (maxSize || maxBytes) {
         map.delete(key);
         map.set(key, entry);
       }
       return entry.value as any;
     },
     set(key, value, opts) {
-      _clearTimer(timers, key);
+      // Remove the previous byte charge and timer before replacement.
+      deleteEntry(key);
       if (value === null || value === undefined) {
-        map.delete(key);
         return;
       }
-      // Delete first so reinsertion moves the key to the most-recent position.
-      map.delete(key);
+      const bytes = maxBytes ? entryBytes(key, value, sizeOf) : 0;
+      if (maxBytes && bytes > maxBytes) {
+        // Refuse oversized entries to prevent a single-write cache-flush attack.
+        return;
+      }
       const ttlMs = opts?.ttl ? opts.ttl * 1000 : undefined;
       map.set(key, {
         value,
         expires: ttlMs ? Date.now() + ttlMs : undefined,
+        bytes,
       });
+      totalBytes += bytes;
       if (ttlMs) {
         const timer = setTimeout(() => {
-          map.delete(key);
-          timers.delete(key);
+          deleteEntry(key);
         }, ttlMs);
-        // Allow the process to exit even if timers are pending
+        // Do not keep the process alive for cache timers.
         if (timer && typeof timer === "object" && "unref" in timer) {
           timer.unref();
         }
         timers.set(key, timer);
       }
-      // Evict least-recently-used entries once over the ceiling.
-      if (maxSize) {
-        while (map.size > maxSize) {
+      // Map iteration returns the least-recently-used key first.
+      if (maxSize || maxBytes) {
+        while ((maxSize && map.size > maxSize) || (maxBytes && totalBytes > maxBytes)) {
           const oldest = map.keys().next().value;
           if (oldest === undefined) {
             break;
           }
-          _delete(oldest);
+          deleteEntry(oldest);
         }
       }
     },
   };
 }
 
-function _clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: string) {
+// The depth limit covers the common `CacheEntry<ResponseCacheEntry>` shape.
+const ENTRY_OVERHEAD = 64;
+const PROPERTY_OVERHEAD = 8;
+const MAX_ESTIMATE_DEPTH = 8;
+
+function entryBytes(key: string, value: unknown, sizeOf: MemoryStorageOptions["sizeOf"]): number {
+  if (sizeOf) {
+    try {
+      const size = sizeOf(value, key);
+      if (Number.isFinite(size) && size >= 0) {
+        return size;
+      }
+    } catch {
+      // Use the built-in estimate.
+    }
+  }
+  try {
+    return estimateBytes(key) + ENTRY_OVERHEAD + estimateValue(value, 0, new Set());
+  } catch {
+    // A getter or proxy may throw; charge the known key and entry overhead.
+    return estimateBytes(key) + ENTRY_OVERHEAD;
+  }
+}
+
+// Charge two bytes per UTF-16 code unit; safe over-counting preserves the budget.
+function estimateBytes(str: string): number {
+  return str.length * 2;
+}
+
+// Track references and limit depth without allocating a JSON copy.
+function estimateValue(value: unknown, depth: number, seen: Set<object>): number {
+  switch (typeof value) {
+    case "string": {
+      return estimateBytes(value);
+    }
+    case "number":
+    case "bigint": {
+      return 8;
+    }
+    case "boolean": {
+      return 4;
+    }
+    case "object": {
+      break;
+    }
+    default: {
+      // Ignore values with no estimated retained payload.
+      return 0;
+    }
+  }
+  if (value === null || seen.has(value) || depth >= MAX_ESTIMATE_DEPTH) {
+    return 0;
+  }
+  seen.add(value);
+  // Use byte length for binary payloads.
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    return value.byteLength;
+  }
+  const next = depth + 1;
+  let total = 0;
+  // Object keys do not expose Array, Set, or Map contents.
+  if (Array.isArray(value) || value instanceof Set) {
+    for (const item of value as Iterable<unknown>) {
+      total += PROPERTY_OVERHEAD + estimateValue(item, next, seen);
+    }
+  } else if (value instanceof Map) {
+    for (const [k, v] of value) {
+      total += PROPERTY_OVERHEAD + estimateValue(k, next, seen) + estimateValue(v, next, seen);
+    }
+  } else {
+    for (const key of Object.keys(value)) {
+      total +=
+        PROPERTY_OVERHEAD +
+        estimateBytes(key) +
+        estimateValue((value as Record<string, unknown>)[key], next, seen);
+    }
+  }
+  return total;
+}
+
+function clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: string) {
   const existing = timers.get(key);
   if (existing !== undefined) {
     clearTimeout(existing);
@@ -91,17 +207,25 @@ function _clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, key: st
   }
 }
 
-let _storage: StorageInterface | undefined;
+/**
+ * A storage instance or a late-bound storage factory.
+ *
+ * The cache calls a factory once, on the first cache operation.
+ */
+export type StorageOption = StorageInterface | (() => StorageInterface);
 
-/** Returns the current storage instance. If none has been set via `setStorage`, lazily initializes an in-memory storage. */
-export function useStorage(): StorageInterface {
-  if (!_storage) {
-    _storage = createMemoryStorage();
+// The first options object selects storage.
+// Write the resolved instance to every options object for later purge operations.
+export function resolveStorage(
+  ...optsList: Array<{ storage?: StorageOption } | undefined>
+): StorageInterface {
+  const configured = optsList[0]?.storage;
+  const resolved = typeof configured === "function" ? configured() : configured;
+  const storage = resolved ?? createMemoryStorage();
+  for (const opts of optsList) {
+    if (opts) {
+      opts.storage = storage;
+    }
   }
-  return _storage;
-}
-
-/** Sets a custom storage implementation to be used by all cached functions. */
-export function setStorage(storage: StorageInterface): void {
-  _storage = storage;
+  return storage;
 }
