@@ -62,8 +62,12 @@ describe("#crypto arms", () => {
     // Multi-block, and a response-body-sized one.
     "x".repeat(1000),
     "abc".repeat(50_000),
-    // Multi-byte UTF-8: the digest is over the encoded bytes, not the code units.
+    // Multi-byte UTF-8: the digest is over the encoded bytes, not the code units. Both sides of
+    // the portable arm's ASCII fast path — a non-ASCII code unit after an ASCII run, and a long
+    // multi-byte string — have to reach the same encoder as `node:crypto` does.
     "héllo · 世界 · 🔑",
+    "x".repeat(200) + "é",
+    "世界".repeat(200),
   ];
 
   it("agree with `node:crypto` on every message-padding case", () => {
